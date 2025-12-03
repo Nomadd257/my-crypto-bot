@@ -13,6 +13,7 @@ globalThis.fetch = fetch;
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
 const { MACD, Stochastic, ATR } = require("technicalindicators"); // ATR kept for other uses if needed
+const config = require("../config");
 // =====================================================
 // MARKET ORDER BOT (CID + 1H EMA-10 Trend + 15m BOS + 15m Volume + OBV + TP + Trailing Stop + Dual Telegram Notifications)
 // =====================================================
@@ -25,7 +26,7 @@ const BINANCE_API_KEY = "RkTt37KfeAtlMpzJhsmK84rJPM2jLUjnzIg3F8ckdTEYNGUrJjIYBpo
 const BINANCE_API_SECRET = "9Mekox5DKhzi4BC22635uic3BpfnhovgjzQYpmfYqNb2E4PwZe1DHvaA73zUNmks";
 
 // --- TELEGRAM ---
-const TELEGRAM_BOT_TOKEN = "8247817335:AAEKf92ex9eiDZKoan1O8uzZ3ls5uEjJsQw";
+const TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN_BINANCE_MKT_ORDER_MULTI_USER;
 const GROUP_CHAT_ID = "-1003419090746"; // group
 const PERSONAL_CHAT_ID = "7476742687"; // personal chat
 

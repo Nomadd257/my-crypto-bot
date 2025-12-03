@@ -1,10 +1,11 @@
+const config = require("../config");
 const axios = require("axios");
 const technicalIndicators = require("technicalindicators");
 const { EMA, Stochastic, MACD, ATR, BollingerBands } = technicalIndicators;
 const fs = require("fs");
 
 // ===== CONFIG =====
-const TELEGRAM_BOT_TOKEN = "8252510514:AAGqtaXoBUiOwvBldruwtYddH-VcJlwvHyo";
+const TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN_BINANCE_FVG;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_CHAT_IDS = [
   "1718404728",

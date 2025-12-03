@@ -1,16 +1,7 @@
 // =====================================================
 // MULTI-USER MARKET ORDER BOT - ADMIN-CONTROLLED SIGNALS
 // =====================================================
-
-// --- Polyfill fetch for Node.js ---
-// import fetch from "node-fetch";
-// globalThis.fetch = fetch;
-
-// // --- Dependencies ---
-// import Binance from "node-binance-api";
-// import TelegramBot from "node-telegram-bot-api";
-// import fs from "fs";
-
+const config = require("../config");
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
@@ -24,7 +15,7 @@ globalThis.fetch = fetch;
 // =====================================================
 
 // --- TELEGRAM ---
-const TELEGRAM_BOT_TOKEN = "8247817335:AAEKf92ex9eiDZKoan1O8uzZ3ls5uEjJsQw";
+const TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN_BINANCE_MKT_ORDER_MULTI_USER;
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "7476742687";
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
