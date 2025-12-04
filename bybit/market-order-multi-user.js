@@ -2,14 +2,15 @@
 // Bybit v5 multi-user market bot (Derivatives-only) with robust execution and TP/SL
 // =====================================================
 
-import TelegramBot from "node-telegram-bot-api";
-import fs from "fs";
-import crypto from "crypto";
-import fetch from "node-fetch";
+const config = require("../config");
+const TelegramBot = require("node-telegram-bot-api");
+const fs = require("fs");
+const crypto = require("crypto");
+const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM ---
-const TELEGRAM_BOT_TOKEN = "7751375561:AAHbI58eOMywLiZkQvnj4C3zkYosVZ3pGoY";
+const TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN_BYBIT_MKT_ORDER_MULTI_USER;
 const GROUP_CHAT_ID = "-1003489385113";
 const PERSONAL_CHAT_ID = "7476742687";
 const ADMIN_ID = "7476742687";
@@ -23,27 +24,37 @@ const EMBEDDED_TEST_API_KEY = "zSp8QKUJ32DhKiKBCK";
 const EMBEDDED_TEST_API_SECRET = "cgjumc48T5bFwEmfz5haVC2lP7xxJaW18WIi";
 
 // --- SETTINGS ---
-const TRADE_PERCENT = 0.10;               // % of derivatives USDT balance to risk
+const TRADE_PERCENT = 0.1; // % of derivatives USDT balance to risk
 const LEVERAGE = 20;
 const TP_PCT = 3.0;
 const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 1.5;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MONITOR_INTERVAL_MS = 5000;
-const SIGNAL_EXPIRY_MS = 60 * 60 * 1000;  // 1 hour expiry
+const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour expiry
 
 // --- IN-MEMORY ---
 let activePositions = {}; // key = `${userId}:${symbol}`
-let pendingSignals = {};  // { symbol: { direction, expiresAt, intervalId } }
+let pendingSignals = {}; // { symbol: { direction, expiresAt, intervalId } }
 
 // --- LOGGING ---
-function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
 // --- TELEGRAM sender ---
 async function sendMessage(msg) {
-  try { await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" }); } catch (e) { log(`tg group send err: ${e?.message || e}`); }
+  try {
+    await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" });
+  } catch (e) {
+    log(`tg group send err: ${e?.message || e}`);
+  }
   if (PERSONAL_CHAT_ID) {
-    try { await bot.sendMessage(PERSONAL_CHAT_ID, msg, { parse_mode: "Markdown" }); } catch (e) { log(`tg personal send err: ${e?.message || e}`); }
+    try {
+      await bot.sendMessage(PERSONAL_CHAT_ID, msg, { parse_mode: "Markdown" });
+    } catch (e) {
+      log(`tg personal send err: ${e?.message || e}`);
+    }
   }
 }
 
@@ -55,11 +66,14 @@ function loadUsers() {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
-      return parsed.filter(u => u && u.active && u.apiKey && u.apiSecret).map(u => ({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret }));
+      return parsed
+        .filter((u) => u && u.active && u.apiKey && u.apiSecret)
+        .map((u) => ({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret }));
     }
     const users = [];
     for (const [key, val] of Object.entries(parsed)) {
-      if (val && val.active && val.apiKey && val.apiSecret) users.push({ id: String(key), apiKey: val.apiKey, apiSecret: val.apiSecret });
+      if (val && val.active && val.apiKey && val.apiSecret)
+        users.push({ id: String(key), apiKey: val.apiKey, apiSecret: val.apiSecret });
     }
     return users;
   } catch (e) {
@@ -85,15 +99,17 @@ function createClientsMap() {
 
 // --- BYBIT v5 signing helper ---
 function signV5(apiSecret, queryString) {
-  return crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
+  return crypto.createHmac("sha256", apiSecret).update(queryString).digest("hex");
 }
 
 function buildV5Query(params) {
   const usp = new URLSearchParams();
-  Object.keys(params).sort().forEach(k => {
-    if (params[k] === undefined || params[k] === null) return;
-    usp.append(k, String(params[k]));
-  });
+  Object.keys(params)
+    .sort()
+    .forEach((k) => {
+      if (params[k] === undefined || params[k] === null) return;
+      usp.append(k, String(params[k]));
+    });
   return usp.toString();
 }
 
@@ -118,30 +134,59 @@ async function bybitV5Public(path, params = {}) {
 
 // --- FETCH ROBUST KLINES ---
 async function fetchCandles(symbol, interval = "15m", limit = 200) {
-  const intervalMapV5 = { "1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","4h":"240","1d":"D" };
+  const intervalMapV5 = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "1d": "D",
+  };
   const v5Interval = intervalMapV5[interval] || "15";
   try {
     const res = await bybitV5Public("/public/linear/kline", { symbol, interval: v5Interval, limit });
     if (res?.result?.list) {
-      return res.result.list.map(c => ({ time: Number(c[0])*1000, open: Number(c[1]), high: Number(c[2]), low: Number(c[3]), close: Number(c[4]), volume: Number(c[5]) }));
+      return res.result.list.map((c) => ({
+        time: Number(c[0]) * 1000,
+        open: Number(c[1]),
+        high: Number(c[2]),
+        low: Number(c[3]),
+        close: Number(c[4]),
+        volume: Number(c[5]),
+      }));
     }
-  } catch(e){ log(`fetchCandles v5 error: ${e?.message||e}`); }
+  } catch (e) {
+    log(`fetchCandles v5 error: ${e?.message || e}`);
+  }
   // fallback
   try {
     const url = `https://api.bybit.com/v2/public/kline/list?symbol=${symbol}&interval=${v5Interval}&limit=${limit}`;
-    const r = await fetch(url); const j = await r.json();
-    if (j?.result) return j.result.map(c => ({ time: Number(c.open_time)*1000, open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close), volume: Number(c.volume) }));
-  } catch(e){ log(`fetchCandles fallback error: ${e?.message||e}`); }
+    const r = await fetch(url);
+    const j = await r.json();
+    if (j?.result)
+      return j.result.map((c) => ({
+        time: Number(c.open_time) * 1000,
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close),
+        volume: Number(c.volume),
+      }));
+  } catch (e) {
+    log(`fetchCandles fallback error: ${e?.message || e}`);
+  }
   return [];
 }
 
 // --- EMA / Volume / OBV helpers ---
 function calculateEMA(values, period) {
   if (!values || values.length < period) return null;
-  let sma = values.slice(0, period).reduce((a,b)=>a+b,0)/period;
+  let sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
   let ema = sma;
-  const k = 2/(period+1);
-  for(let i=period;i<values.length;i++) ema = values[i]*k + ema*(1-k);
+  const k = 2 / (period + 1);
+  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
   return ema;
 }
 
@@ -149,190 +194,266 @@ async function getEMATrend(symbol, period = 10) {
   try {
     const klines = await fetchCandles(symbol, "1h", period + 50);
     if (!klines || klines.length < period) return "neutral";
-    const closes = klines.map(k => k.close);
+    const closes = klines.map((k) => k.close);
     const ema = calculateEMA(closes, period);
-    if(ema===null) return "neutral";
-    const last = closes[closes.length-1];
-    if(last>ema) return "bullish";
-    if(last<ema) return "bearish";
+    if (ema === null) return "neutral";
+    const last = closes[closes.length - 1];
+    if (last > ema) return "bullish";
+    if (last < ema) return "bearish";
     return "neutral";
-  } catch(e){ log(`getEMATrend error: ${e?.message||e}`); return "neutral"; }
+  } catch (e) {
+    log(`getEMATrend error: ${e?.message || e}`);
+    return "neutral";
+  }
 }
 
 async function checkVolume15m(symbol) {
   try {
-    const candles = await fetchCandles(symbol,"15m",50);
-    if(!candles || candles.length<22) return false;
-    const last = candles[candles.length-2];
-    const prev20 = candles.slice(candles.length-22,candles.length-2);
-    const avg = prev20.reduce((s,c)=>s+c.volume,0)/prev20.length;
-    return last.volume>=avg;
-  } catch(e){ log(`checkVolume15m error: ${e?.message||e}`); return false; }
+    const candles = await fetchCandles(symbol, "15m", 50);
+    if (!candles || candles.length < 22) return false;
+    const last = candles[candles.length - 2];
+    const prev20 = candles.slice(candles.length - 22, candles.length - 2);
+    const avg = prev20.reduce((s, c) => s + c.volume, 0) / prev20.length;
+    return last.volume >= avg;
+  } catch (e) {
+    log(`checkVolume15m error: ${e?.message || e}`);
+    return false;
+  }
 }
 
-async function checkOBV15m(symbol,direction) {
+async function checkOBV15m(symbol, direction) {
   try {
-    const candles = await fetchCandles(symbol,"15m",60);
-    if(!candles || candles.length<4) return false;
-    const closed = candles.slice(0,-1);
-    let obv=0, series=[0];
-    for(let i=1;i<closed.length;i++){
-      const diff = closed[i].close - closed[i-1].close;
-      obv += diff>0?closed[i].volume:diff<0?-closed[i].volume:0;
+    const candles = await fetchCandles(symbol, "15m", 60);
+    if (!candles || candles.length < 4) return false;
+    const closed = candles.slice(0, -1);
+    let obv = 0,
+      series = [0];
+    for (let i = 1; i < closed.length; i++) {
+      const diff = closed[i].close - closed[i - 1].close;
+      obv += diff > 0 ? closed[i].volume : diff < 0 ? -closed[i].volume : 0;
       series.push(obv);
     }
-    const last=series[series.length-1], prev=series[series.length-2];
-    return direction==="long"?last>prev:last<prev;
-  } catch(e){ log(`checkOBV15m error: ${e?.message||e}`); return false; }
+    const last = series[series.length - 1],
+      prev = series[series.length - 2];
+    return direction === "long" ? last > prev : last < prev;
+  } catch (e) {
+    log(`checkOBV15m error: ${e?.message || e}`);
+    return false;
+  }
 }
 
 // --- MARKET ORDER EXECUTION WITH TP/SL ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
   const clientsMap = createClientsMap();
-  if(!clientsMap.size){ await sendMessage(`⚠️ No active users for ${symbol}`); return; }
+  if (!clientsMap.size) {
+    await sendMessage(`⚠️ No active users for ${symbol}`);
+    return;
+  }
 
-  for(const [userId, creds] of clientsMap.entries()){
+  for (const [userId, creds] of clientsMap.entries()) {
     const { apiKey, apiSecret } = creds;
-    try{
-      const kl = await fetchCandles(symbol,"1m",1);
+    try {
+      const kl = await fetchCandles(symbol, "1m", 1);
       const markPrice = kl?.[0]?.close || 0;
-      if(!markPrice){ await sendMessage(`⚠️ Cannot get price for ${symbol} for user ${userId}`); continue; }
+      if (!markPrice) {
+        await sendMessage(`⚠️ Cannot get price for ${symbol} for user ${userId}`);
+        continue;
+      }
 
       const balance = await getDerivativesUSDTBalance(apiKey, apiSecret);
-      if(!balance || balance<=0){ await sendMessage(`⚠️ User ${userId} has no USDT balance.`); continue; }
+      if (!balance || balance <= 0) {
+        await sendMessage(`⚠️ User ${userId} has no USDT balance.`);
+        continue;
+      }
 
-      const tradeValue = balance*TRADE_PERCENT;
-      const qty = Number(((tradeValue*LEVERAGE)/markPrice).toFixed(3));
-      if(!qty || qty<=0){ await sendMessage(`⚠️ Computed qty <=0 for ${symbol} user ${userId}`); continue; }
+      const tradeValue = balance * TRADE_PERCENT;
+      const qty = Number(((tradeValue * LEVERAGE) / markPrice).toFixed(3));
+      if (!qty || qty <= 0) {
+        await sendMessage(`⚠️ Computed qty <=0 for ${symbol} user ${userId}`);
+        continue;
+      }
 
-      const side = direction.toLowerCase()==="bullish"?"Buy":"Sell";
-      const res = await placeMarketOrderV5(apiKey,apiSecret,symbol,side,qty);
-      if(!res || res.retCode && res.retCode!==0){ await sendMessage(`❌ Order failed for ${symbol} user ${userId}: ${JSON.stringify(res)}`); continue; }
+      const side = direction.toLowerCase() === "bullish" ? "Buy" : "Sell";
+      const res = await placeMarketOrderV5(apiKey, apiSecret, symbol, side, qty);
+      if (!res || (res.retCode && res.retCode !== 0)) {
+        await sendMessage(`❌ Order failed for ${symbol} user ${userId}: ${JSON.stringify(res)}`);
+        continue;
+      }
 
-      activePositions[`${userId}:${symbol}`]={ userId, symbol, side: side==="Buy"?"BUY":"SELL", entryPrice: markPrice, qty, openedAt: Date.now() };
+      activePositions[`${userId}:${symbol}`] = {
+        userId,
+        symbol,
+        side: side === "Buy" ? "BUY" : "SELL",
+        entryPrice: markPrice,
+        qty,
+        openedAt: Date.now(),
+      };
       await sendMessage(`✅ ${side.toUpperCase()} EXECUTED for ${symbol} user ${userId} qty ${qty}`);
 
       // Place TP/SL orders
       await placeTPSL(apiKey, apiSecret, symbol, side, qty, markPrice);
-    } catch(e){ log(`executeMarketOrder error for ${userId}: ${e?.message||e}`); }
+    } catch (e) {
+      log(`executeMarketOrder error for ${userId}: ${e?.message || e}`);
+    }
   }
 }
 
 // --- PLACE TP/SL ORDERS ---
-async function placeTPSL(apiKey, apiSecret, symbol, side, qty, entryPrice){
-  try{
-    const tpPrice = side==="Buy"?entryPrice*(1+TP_PCT/100):entryPrice*(1-TP_PCT/100);
-    const slPrice = side==="Buy"?entryPrice*(1-SL_PCT/100):entryPrice*(1+SL_PCT/100);
+async function placeTPSL(apiKey, apiSecret, symbol, side, qty, entryPrice) {
+  try {
+    const tpPrice = side === "Buy" ? entryPrice * (1 + TP_PCT / 100) : entryPrice * (1 - TP_PCT / 100);
+    const slPrice = side === "Buy" ? entryPrice * (1 - SL_PCT / 100) : entryPrice * (1 + SL_PCT / 100);
 
     // Take Profit
-    await bybitV5SignedRequest(apiKey, apiSecret, "POST","/v5/order/create",{
-      symbol, side: side==="Buy"?"Sell":"Buy", orderType:"Limit", price: tpPrice.toFixed(2), qty, timeInForce:"PostOnly", reduceOnly:true
+    await bybitV5SignedRequest(apiKey, apiSecret, "POST", "/v5/order/create", {
+      symbol,
+      side: side === "Buy" ? "Sell" : "Buy",
+      orderType: "Limit",
+      price: tpPrice.toFixed(2),
+      qty,
+      timeInForce: "PostOnly",
+      reduceOnly: true,
     });
     // Stop Loss
-    await bybitV5SignedRequest(apiKey, apiSecret, "POST","/v5/order/create",{
-      symbol, side: side==="Buy"?"Sell":"Buy", orderType:"Stop", stopPrice: slPrice.toFixed(2), qty, timeInForce:"GoodTillCancel", reduceOnly:true
+    await bybitV5SignedRequest(apiKey, apiSecret, "POST", "/v5/order/create", {
+      symbol,
+      side: side === "Buy" ? "Sell" : "Buy",
+      orderType: "Stop",
+      stopPrice: slPrice.toFixed(2),
+      qty,
+      timeInForce: "GoodTillCancel",
+      reduceOnly: true,
     });
-  } catch(e){ log(`placeTPSL error: ${e?.message||e}`); }
+  } catch (e) {
+    log(`placeTPSL error: ${e?.message || e}`);
+  }
 }
 
 // --- FETCH DERIVATIVES USDT BALANCE ---
-async function getDerivativesUSDTBalance(apiKey, apiSecret){
-  try{
-    const res = await bybitV5SignedRequest(apiKey, apiSecret,"GET","/v5/account/wallet-balance",{coin:"USDT"});
-    if(res?.result?.USDT?.available_balance!==undefined) return parseFloat(res.result.USDT.available_balance);
-    if(res?.result?.list){ const item=res.result.list.find(x=>x.coin==="USDT"); if(item) return parseFloat(item.available_balance); }
+async function getDerivativesUSDTBalance(apiKey, apiSecret) {
+  try {
+    const res = await bybitV5SignedRequest(apiKey, apiSecret, "GET", "/v5/account/wallet-balance", { coin: "USDT" });
+    if (res?.result?.USDT?.available_balance !== undefined) return parseFloat(res.result.USDT.available_balance);
+    if (res?.result?.list) {
+      const item = res.result.list.find((x) => x.coin === "USDT");
+      if (item) return parseFloat(item.available_balance);
+    }
     return 0;
-  } catch(e){ log(`getDerivativesUSDTBalance error: ${e?.message||e}`); return 0; }
+  } catch (e) {
+    log(`getDerivativesUSDTBalance error: ${e?.message || e}`);
+    return 0;
+  }
 }
 
 // --- PLACE SINGLE MARKET ORDER ---
-async function placeMarketOrderV5(apiKey,apiSecret,symbol,side,qty){
-  try{
-    const params={ symbol, side, orderType:"Market", qty, timeInForce:"ImmediateOrCancel", reduceOnly:false };
-    const res = await bybitV5SignedRequest(apiKey,apiSecret,"POST","/v5/order/create",params);
+async function placeMarketOrderV5(apiKey, apiSecret, symbol, side, qty) {
+  try {
+    const params = { symbol, side, orderType: "Market", qty, timeInForce: "ImmediateOrCancel", reduceOnly: false };
+    const res = await bybitV5SignedRequest(apiKey, apiSecret, "POST", "/v5/order/create", params);
     return res;
-  } catch(e){ log(`placeMarketOrderV5 error: ${e?.message||e}`); return null; }
+  } catch (e) {
+    log(`placeMarketOrderV5 error: ${e?.message || e}`);
+    return null;
+  }
 }
 
 // --- SIGNAL PARSING ---
-function parseSignalText(text){
+function parseSignalText(text) {
   const t = text.toUpperCase();
-  if(!t.includes("CONFIRMED CHANGE IN DIRECTION")) return null;
-  const rx=/ON\s+([A-Z0-9]+USDT).*NOW[:\s]+(BULLISH|BEARISH)/i;
-  const m=text.match(rx);
-  if(m && m[1] && m[2]) return { symbol:m[1].toUpperCase(), direction:m[2].toUpperCase() };
-  const sym=text.match(/([A-Z0-9]+USDT)/i);
-  const dir=text.match(/\b(BULLISH|BEARISH)\b/i);
-  if(sym && dir) return { symbol:sym[1].toUpperCase(), direction:dir[1].toUpperCase() };
+  if (!t.includes("CONFIRMED CHANGE IN DIRECTION")) return null;
+  const rx = /ON\s+([A-Z0-9]+USDT).*NOW[:\s]+(BULLISH|BEARISH)/i;
+  const m = text.match(rx);
+  if (m && m[1] && m[2]) return { symbol: m[1].toUpperCase(), direction: m[2].toUpperCase() };
+  const sym = text.match(/([A-Z0-9]+USDT)/i);
+  const dir = text.match(/\b(BULLISH|BEARISH)\b/i);
+  if (sym && dir) return { symbol: sym[1].toUpperCase(), direction: dir[1].toUpperCase() };
   return null;
 }
 
 // --- TELEGRAM SIGNAL LISTENER ---
-bot.on("message",async(msg)=>{
-  try{
-    if(!msg.text) return;
-    const chatId=msg.chat.id.toString();
-    if(chatId!==GROUP_CHAT_ID && chatId!==PERSONAL_CHAT_ID) return;
+bot.on("message", async (msg) => {
+  try {
+    if (!msg.text) return;
+    const chatId = msg.chat.id.toString();
+    if (chatId !== GROUP_CHAT_ID && chatId !== PERSONAL_CHAT_ID) return;
 
-    const text=msg.text.trim();
-    if(text.toLowerCase().startsWith("/closeall") && msg.from?.id?.toString()===ADMIN_ID){
-      const symbolArg=text.split(" ")[1]?.toUpperCase()||"ALL";
-      const keys=Object.keys(activePositions);
-      if(!keys.length){ await sendMessage("⚠️ No active positions to close."); return; }
+    const text = msg.text.trim();
+    if (text.toLowerCase().startsWith("/closeall") && msg.from?.id?.toString() === ADMIN_ID) {
+      const symbolArg = text.split(" ")[1]?.toUpperCase() || "ALL";
+      const keys = Object.keys(activePositions);
+      if (!keys.length) {
+        await sendMessage("⚠️ No active positions to close.");
+        return;
+      }
       await sendMessage(`⚠️ Closing positions for all users (${symbolArg})...`);
-      const clientsMap=createClientsMap();
-      for(const k of keys){
-        const pos=activePositions[k];
-        if(symbolArg!=="ALL" && pos.symbol!==symbolArg) continue;
-        const creds=clientsMap.get(String(pos.userId));
-        if(!creds) continue;
-        await closeUserPositionMarket(creds.apiKey,creds.apiSecret,pos.userId,pos.symbol,pos.qty,pos.side==="BUY"?"Sell":"Buy");
+      const clientsMap = createClientsMap();
+      for (const k of keys) {
+        const pos = activePositions[k];
+        if (symbolArg !== "ALL" && pos.symbol !== symbolArg) continue;
+        const creds = clientsMap.get(String(pos.userId));
+        if (!creds) continue;
+        await closeUserPositionMarket(
+          creds.apiKey,
+          creds.apiSecret,
+          pos.userId,
+          pos.symbol,
+          pos.qty,
+          pos.side === "BUY" ? "Sell" : "Buy"
+        );
         delete activePositions[k];
       }
       await sendMessage("✅ Manual close-all completed.");
       return;
     }
 
-    const parsed=parseSignalText(text);
-    if(!parsed) return;
+    const parsed = parseSignalText(text);
+    if (!parsed) return;
 
-    const {symbol,direction}=parsed;
-    if(pendingSignals[symbol]) return;
+    const { symbol, direction } = parsed;
+    if (pendingSignals[symbol]) return;
 
-    pendingSignals[symbol]={ direction, expiresAt:Date.now()+SIGNAL_EXPIRY_MS };
+    pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
 
-    await sendMessage(`📢 CID signal received for *${symbol}* (${direction}).\n⏱️ *Expires in 1 hour*\n\nChecking EMA/BOS/Volume/OBV...`);
+    await sendMessage(
+      `📢 CID signal received for *${symbol}* (${direction}).\n⏱️ *Expires in 1 hour*\n\nChecking EMA/BOS/Volume/OBV...`
+    );
 
-    const intervalId=setInterval(async()=>{
-      const sig=pendingSignals[symbol];
-      if(!sig){ clearInterval(intervalId); return; }
-      if(Date.now()>sig.expiresAt){
+    const intervalId = setInterval(async () => {
+      const sig = pendingSignals[symbol];
+      if (!sig) {
+        clearInterval(intervalId);
+        return;
+      }
+      if (Date.now() > sig.expiresAt) {
         delete pendingSignals[symbol];
         clearInterval(intervalId);
         await sendMessage(`⌛ CID signal expired for *${symbol}*`);
         return;
       }
 
-      const trend=await getEMATrend(symbol,10);
-      const emaOk=(direction.toLowerCase()==="bullish" && trend==="bullish") || (direction.toLowerCase()==="bearish" && trend==="bearish");
-      const volOk=await checkVolume15m(symbol);
-      const obvOk=await checkOBV15m(symbol,direction.toLowerCase()==="bullish"?"long":"short");
+      const trend = await getEMATrend(symbol, 10);
+      const emaOk =
+        (direction.toLowerCase() === "bullish" && trend === "bullish") ||
+        (direction.toLowerCase() === "bearish" && trend === "bearish");
+      const volOk = await checkVolume15m(symbol);
+      const obvOk = await checkOBV15m(symbol, direction.toLowerCase() === "bullish" ? "long" : "short");
 
-      if(!emaOk) await sendMessage(`⏳ EMA (1H) check not passed yet for *${symbol}* (trend: ${trend})`);
-      if(!volOk) await sendMessage(`⏳ Volume (15m) check not passed yet for *${symbol}*`);
-      if(!obvOk) await sendMessage(`⏳ OBV (15m) check not passed yet for *${symbol}*`);
+      if (!emaOk) await sendMessage(`⏳ EMA (1H) check not passed yet for *${symbol}* (trend: ${trend})`);
+      if (!volOk) await sendMessage(`⏳ Volume (15m) check not passed yet for *${symbol}*`);
+      if (!obvOk) await sendMessage(`⏳ OBV (15m) check not passed yet for *${symbol}*`);
 
-      if(emaOk && volOk && obvOk){
+      if (emaOk && volOk && obvOk) {
         clearInterval(intervalId);
         delete pendingSignals[symbol];
         await sendMessage(`✅ All checks passed for *${symbol}*. Executing orders for all configured clients...`);
-        await executeMarketOrderForAllUsers(symbol,direction);
+        await executeMarketOrderForAllUsers(symbol, direction);
       }
-    },SIGNAL_CHECK_INTERVAL_MS);
+    }, SIGNAL_CHECK_INTERVAL_MS);
 
-    pendingSignals[symbol].intervalId=intervalId;
-
-  } catch(err){ log(`bot.on message error: ${err?.message||err}`); }
+    pendingSignals[symbol].intervalId = intervalId;
+  } catch (err) {
+    log(`bot.on message error: ${err?.message || err}`);
+  }
 });
 
 log("Bybit v5 multi-user market bot (Derivatives-only) started.");
@@ -342,11 +463,11 @@ async function closeUserPositionMarket(apiKey, apiSecret, userId, symbol, qty, s
   try {
     const params = {
       symbol,
-      side,           // "Buy" or "Sell"
+      side, // "Buy" or "Sell"
       orderType: "Market",
       qty,
       timeInForce: "ImmediateOrCancel",
-      reduceOnly: true
+      reduceOnly: true,
     };
     const res = await bybitV5SignedRequest(apiKey, apiSecret, "POST", "/v5/order/create", params);
     if (!res || (res.retCode && res.retCode !== 0)) {
@@ -383,7 +504,8 @@ async function monitorPositions() {
         if (TRAILING_STOP_PCT > 0) {
           if (side === "Buy") {
             const tsPrice = markPrice * (1 - TRAILING_STOP_PCT / 100);
-            if (tsPrice > entryPrice * (1 + 0.001)) { // minimal movement threshold
+            if (tsPrice > entryPrice * (1 + 0.001)) {
+              // minimal movement threshold
               await closeUserPositionMarket(creds.apiKey, creds.apiSecret, pos.userId, pos.symbol, pos.qty, "Sell");
             }
           } else {
@@ -395,7 +517,6 @@ async function monitorPositions() {
         }
 
         // Optional: TP/SL checks could also be implemented here for extra safety
-
       } catch (e) {
         log(`monitorPositions error for ${pos.userId} ${pos.symbol}: ${e?.message || e}`);
       }
