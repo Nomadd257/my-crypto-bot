@@ -164,39 +164,26 @@ async function fetchCandles(symbol, interval = "60", limit = 200) {
 }
 
 // --- EMA / Volume / OBV helpers ---
-function calculateEMA(prices, period) {
-  if (!prices || prices.length < period) return null;
-
-  const multiplier = 2 / (period + 1);
-
-  // Start EMA using simple moving average of first "period" candles
-  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-
-  // Continue EMA for remaining prices
-  for (let i = period; i < prices.length; i++) {
-    ema = (prices[i] - ema) * multiplier + ema;
-  }
-
+function calculateEMA(values, period) {
+  if (!Array.isArray(values) || values.length < period) return null;
+  let sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let ema = sma;
+  const k = 2 / (period + 1);
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);}
   return ema;
 }
 
 async function getEMATrend(symbol, period = 10) {
-  try {
-    const klines = await fetchCandles(symbol, "1h", period + 50);
-    if (!klines || klines.length < period) return "neutral";
-
-    const closes = klines.map((k) => k.close);
-    const ema = calculateEMA(closes, period);
-    if (ema === null) return "neutral";
-
-    const lastClose = closes[closes.length - 1];
-    if (lastClose > ema) return "bullish";
-    if (lastClose < ema) return "bearish";
-    return "neutral";
-  } catch (e) {
-    log(`getEMATrend error: ${e?.message || e}`);
-    return "neutral";
-  }
+  const klines = await fetchFuturesKlines(symbol, "1h", 200);
+  if (!klines || klines.length === 0) return null;
+  const closes = klines.map(k => k.close);
+  const ema = calculateEMA(closes, period);
+  if (ema === null) return null;
+  const lastClose = closes[closes.length - 1];
+  if (lastClose > ema) return "bullish";
+  if (lastClose < ema) return "bearish";
+  return "neutral";
 }
 
 async function checkVolume15m(symbol) {
