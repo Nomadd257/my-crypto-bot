@@ -175,7 +175,7 @@ function calculateEMA(values, period) {
 }
 
 async function getEMATrend(symbol, period = 10) {
-  const klines = await fetchFuturesKlines(symbol, "1h", 200);
+  const klines = await fetchBybitKlines(symbol, "1h", 200);
   if (!klines || klines.length === 0) return null;
   const closes = klines.map(k => k.close);
   const ema = calculateEMA(closes, period);
@@ -188,7 +188,7 @@ async function getEMATrend(symbol, period = 10) {
 
 async function checkVolume15m(symbol) {
   try {
-    const candles = await fetchCandles(symbol, "15m", 50);
+    const candles = await fetchBybitKlines(symbol, "15m", 50);
     if (!candles || candles.length < 22) return false;
 
     const last = candles[candles.length - 2];
@@ -204,7 +204,7 @@ async function checkVolume15m(symbol) {
 
 async function checkOBV15m(symbol, direction) {
   try {
-    const candles = await fetchCandles(symbol, "15m", 60);
+    const candles = await fetchBybitKlines(symbol, "15m", 60);
     if (!candles || candles.length < 4) return false;
 
     const closed = candles.slice(0, -1);
