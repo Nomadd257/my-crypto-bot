@@ -164,12 +164,19 @@ async function fetchCandles(symbol, interval = "60", limit = 200) {
 }
 
 // --- EMA / Volume / OBV helpers ---
-function calculateEMA(values, period) {
-  if (!values || values.length < period) return null;
-  let sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  let ema = sma;
-  const k = 2 / (period + 1);
-  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
+function calculateEMA(prices, period) {
+  if (!prices || prices.length < period) return null;
+
+  const multiplier = 2 / (period + 1);
+
+  // Start EMA using simple moving average of first "period" candles
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  // Continue EMA for remaining prices
+  for (let i = period; i < prices.length; i++) {
+    ema = (prices[i] - ema) * multiplier + ema;
+  }
+
   return ema;
 }
 
@@ -177,12 +184,14 @@ async function getEMATrend(symbol, period = 10) {
   try {
     const klines = await fetchCandles(symbol, "1h", period + 50);
     if (!klines || klines.length < period) return "neutral";
+
     const closes = klines.map((k) => k.close);
     const ema = calculateEMA(closes, period);
     if (ema === null) return "neutral";
-    const last = closes[closes.length - 1];
-    if (last > ema) return "bullish";
-    if (last < ema) return "bearish";
+
+    const lastClose = closes[closes.length - 1];
+    if (lastClose > ema) return "bullish";
+    if (lastClose < ema) return "bearish";
     return "neutral";
   } catch (e) {
     log(`getEMATrend error: ${e?.message || e}`);
@@ -194,10 +203,12 @@ async function checkVolume15m(symbol) {
   try {
     const candles = await fetchCandles(symbol, "15m", 50);
     if (!candles || candles.length < 22) return false;
+
     const last = candles[candles.length - 2];
     const prev20 = candles.slice(candles.length - 22, candles.length - 2);
-    const avg = prev20.reduce((s, c) => s + c.volume, 0) / prev20.length;
-    return last.volume >= avg;
+    const avgVolume = prev20.reduce((sum, c) => sum + c.volume, 0) / prev20.length;
+
+    return last.volume >= avgVolume;
   } catch (e) {
     log(`checkVolume15m error: ${e?.message || e}`);
     return false;
@@ -208,16 +219,19 @@ async function checkOBV15m(symbol, direction) {
   try {
     const candles = await fetchCandles(symbol, "15m", 60);
     if (!candles || candles.length < 4) return false;
+
     const closed = candles.slice(0, -1);
-    let obv = 0,
-      series = [0];
+    let obv = 0;
+    const series = [0];
+
     for (let i = 1; i < closed.length; i++) {
       const diff = closed[i].close - closed[i - 1].close;
       obv += diff > 0 ? closed[i].volume : diff < 0 ? -closed[i].volume : 0;
       series.push(obv);
     }
-    const last = series[series.length - 1],
-      prev = series[series.length - 2];
+
+    const last = series[series.length - 1];
+    const prev = series[series.length - 2];
     return direction === "long" ? last > prev : last < prev;
   } catch (e) {
     log(`checkOBV15m error: ${e?.message || e}`);
