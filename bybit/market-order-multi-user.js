@@ -132,52 +132,35 @@ async function bybitV5Public(path, params = {}) {
   return json;
 }
 
-// --- FETCH ROBUST KLINES ---
-async function fetchCandles(symbol, interval = "15m", limit = 200) {
-  const intervalMapV5 = {
-    "1m": "1",
-    "3m": "3",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "4h": "240",
-    "1d": "D",
-  };
-  const v5Interval = intervalMapV5[interval] || "15";
+// ===============================
+// FETCH BYBIT KLINE (v5 endpoint)
+// ===============================
+async function fetchCandles(symbol, interval = "60", limit = 200) {
   try {
-    const res = await bybitV5Public("/public/linear/kline", { symbol, interval: v5Interval, limit });
-    if (res?.result?.list) {
-      return res.result.list.map((c) => ({
-        time: Number(c[0]) * 1000,
-        open: Number(c[1]),
-        high: Number(c[2]),
-        low: Number(c[3]),
-        close: Number(c[4]),
-        volume: Number(c[5]),
-      }));
+    const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`;
+
+    const response = await fetch(url);
+    const text = await response.text();
+
+    // Sometimes Bybit returns HTML "Not Found" → Catch BEFORE parsing
+    if (!text.startsWith("{")) {
+      console.log(`❌ fetchCandles v5 error for ${symbol}: Non-JSON response`);
+      console.log("Returned text:", text);
+      return null;
     }
-  } catch (e) {
-    log(`fetchCandles v5 error: ${e?.message || e}`);
+
+    const data = JSON.parse(text);
+
+    if (data.retCode !== 0) {
+      console.log(`❌ fetchCandles v5 API error for ${symbol}:`, data);
+      return null;
+    }
+
+    return data.result.list; // Array of kline candles
+  } catch (err) {
+    console.error(`❌ fetchCandles v5 error for ${symbol}:`, err.message);
+    return null;
   }
-  // fallback
-  try {
-    const url = `https://api.bybit.com/v2/public/kline/list?symbol=${symbol}&interval=${v5Interval}&limit=${limit}`;
-    const r = await fetch(url);
-    const j = await r.json();
-    if (j?.result)
-      return j.result.map((c) => ({
-        time: Number(c.open_time) * 1000,
-        open: Number(c.open),
-        high: Number(c.high),
-        low: Number(c.low),
-        close: Number(c.close),
-        volume: Number(c.volume),
-      }));
-  } catch (e) {
-    log(`fetchCandles fallback error: ${e?.message || e}`);
-  }
-  return [];
 }
 
 // --- EMA / Volume / OBV helpers ---
