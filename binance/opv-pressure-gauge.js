@@ -1,131 +1,93 @@
-const axios = require("axios");
-const technicalIndicators = require("technicalindicators");
-const EMA = technicalIndicators.EMA;
+const axios = require('axios');
+const technicalIndicators = require('technicalindicators');
+const { EMA } = technicalIndicators;
 
 // ===== CONFIG =====
-const TELEGRAM_BOT_TOKEN = "8322504485:AAGycxBbdDIO54iQONd_SbOzfDYelUFv4Qc";
+const TELEGRAM_BOT_TOKEN = '8322504485:AAGycxBbdDIO54iQONd_SbOzfDYelUFv4Qc';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-const TELEGRAM_CHAT_ID = "7476742687"; // your personal chat ID
+const CHAT_ID = '7476742687'; // your personal chat ID
 
 const SYMBOLS = [
-  "BTCUSDT",
-  "ETHUSDT",
-  "LTCUSDT",
-  "XRPUSDT",
-  "APTUSDT",
-  "BNBUSDT",
-  "SOLUSDT",
-  "UNIUSDT",
-  "TRUMPUSDT",
-  "BCHUSDT",
-  "AAVEUSDT",
-  "ADAUSDT",
-  "TONUSDT",
-  "DOGEUSDT",
-  "LINKUSDT",
-  "MATICUSDT",
-  "ATOMUSDT",
-  "FILUSDT",
-  "XMRUSDT",
-  "NEARUSDT",
-  "ALGOUSDT",
-  "VETUSDT",
-  "SANDUSDT",
-  "AVAXUSDT",
-  "FTMUSDT",
-  "TRXUSDT",
+  "BTCUSDT", "ETHUSDT", "LTCUSDT", "XRPUSDT", "APTUSDT", "BNBUSDT", "SOLUSDT",
+  "UNIUSDT", "TRUMPUSDT", "BCHUSDT", "AAVEUSDT", "ADAUSDT", "TONUSDT",
+  "DOGEUSDT", "LINKUSDT", "MATICUSDT", "ATOMUSDT", "FILUSDT", "XMRUSDT",
+  "NEARUSDT", "ALGOUSDT", "VETUSDT", "SANDUSDT", "AVAXUSDT", "FTMUSDT", "TRXUSDT"
 ];
 
-const INTERVAL = "30m";
-const RUN_INTERVAL_MS = 30 * 60 * 1000; // 30 mins
+const RUN_INTERVAL_MS = 30 * 60 * 1000; // every 30 mins
 const EMA_PERIOD = 10;
-const FLAT_THRESHOLD_PCT = 0.1; // OBV too close to EMA: flat
+const FLAT_THRESHOLD_PCT = 0.2; // % distance from EMA to consider flat
 
 // ===== HELPERS =====
-async function sendTelegramAlert(message) {
+async function sendTelegramMessage(text) {
   try {
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: "Markdown",
+      chat_id: CHAT_ID,
+      text,
+      parse_mode: 'Markdown'
     });
   } catch (err) {
-    console.error(`sendMessage failed:`, err.response ? err.response.data : err.message);
+    console.error('Telegram send error:', err?.response?.data || err.message);
   }
 }
 
-async function fetchCandles(symbol, interval, limit = 100) {
+async function fetchCandles(symbol, interval = '30m', limit = 50) {
   const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await axios.get(url, { timeout: 15000 });
-  return res.data.map((c) => ({
+  return res.data.map(c => ({
     time: c[0],
     open: +c[1],
     high: +c[2],
     low: +c[3],
     close: +c[4],
-    volume: +c[5],
+    volume: +c[5]
   }));
 }
 
 function calculateOBV(candles) {
-  let obv = 0;
-  const obvArr = [];
+  if (!candles || candles.length < 2) return null;
+  const obv = [0];
   for (let i = 1; i < candles.length; i++) {
-    if (candles[i].close > candles[i - 1].close) obv += candles[i].volume;
-    else if (candles[i].close < candles[i - 1].close) obv -= candles[i].volume;
-    obvArr.push(obv);
+    if (candles[i].close > candles[i - 1].close) obv.push(obv[i - 1] + candles[i].volume);
+    else if (candles[i].close < candles[i - 1].close) obv.push(obv[i - 1] - candles[i].volume);
+    else obv.push(obv[i - 1]);
   }
-  return obvArr;
+  return obv;
 }
 
-function calculateEMA(values, period) {
-  const arr = EMA.calculate({ period, values });
-  return arr.length ? arr[arr.length - 1] : values[values.length - 1];
+function determinePressure(obvValues) {
+  if (!obvValues || obvValues.length < EMA_PERIOD + 1) return 'FLAT';
+  const emaVal = EMA.calculate({ period: EMA_PERIOD, values: obvValues });
+  const lastEMA = emaVal[emaVal.length - 1];
+  const lastOBV = obvValues[obvValues.length - 1];
+  const pctDist = Math.abs((lastOBV - lastEMA) / lastEMA) * 100;
+
+  if (pctDist < FLAT_THRESHOLD_PCT) return 'FLAT';
+  return lastOBV > lastEMA ? 'BULLISH' : 'BEARISH';
 }
 
 // ===== MAIN LOOP =====
-async function runOBVScanner() {
-  for (let i = 0; i < SYMBOLS.length; i++) {
-    const symbol = SYMBOLS[i];
+async function scanOBV() {
+  for (const symbol of SYMBOLS) {
     try {
-      const candles = await fetchCandles(symbol, INTERVAL, 100);
-      if (!candles || candles.length < EMA_PERIOD + 2) continue;
+      const candles = await fetchCandles(symbol, '30m', 50);
+      const obvValues = calculateOBV(candles);
+      const pressure = determinePressure(obvValues);
 
-      const closes = candles.map((c) => c.close);
-      const obvArr = calculateOBV(candles);
-      const obvLast = obvArr[obvArr.length - 1];
-      const obvEMA = calculateEMA(obvArr, EMA_PERIOD);
+      const message = `📊 OBV Signal Detected\n` +
+                      `Pair: ${symbol}\n` +
+                      `${pressure === 'BULLISH' ? 'Buying Pressure' : pressure === 'BEARISH' ? 'Selling Pressure' : 'Pressure'}: ${pressure === 'FLAT' ? 'Flat' : 'Increasing'}\n` +
+                      `Direction: ${pressure}\n` +
+                      `Timeframe: 30m\n` +
+                      `(OBV crossed ${pressure === 'BULLISH' ? 'above' : pressure === 'BEARISH' ? 'below' : 'near'} EMA${EMA_PERIOD})`;
 
-      const diffPct = (Math.abs(obvLast - obvEMA) / obvEMA) * 100;
-      let pressure = "Flat";
-      let direction = "NEUTRAL";
-
-      if (diffPct <= FLAT_THRESHOLD_PCT) {
-        pressure = "Flat";
-        direction = "NEUTRAL";
-      } else if (obvLast > obvEMA) {
-        pressure = "Increasing";
-        direction = "BULLISH";
-      } else if (obvLast < obvEMA) {
-        pressure = "Decreasing";
-        direction = "BEARISH";
-      }
-
-      if (direction !== "NEUTRAL") {
-        const message =
-          "📊 OBV Signal Detected\n" +
-          `Pair: ${symbol}\n` +
-          `${direction === "BULLISH" ? "Buying" : "Selling"} Pressure: ${pressure}\n` +
-          `Direction: ${direction}\n` +
-          `Timeframe: ${INTERVAL}\n` +
-          `(OBV crossed ${direction === "BULLISH" ? "above" : "below"} EMA${EMA_PERIOD})`;
-        await sendTelegramAlert(message);
-      }
+      await sendTelegramMessage(message);
     } catch (err) {
-      console.error(`Error scanning ${symbol}:`, err.response ? err.response.data : err.message);
+      console.error(`Error scanning ${symbol}:`, err?.message || err);
     }
   }
 }
 
-setInterval(runOBVScanner, RUN_INTERVAL_MS);
-runOBVScanner();
+// Run immediately and then every 30 mins
+scanOBV();
+setInterval(scanOBV, RUN_INTERVAL_MS);
