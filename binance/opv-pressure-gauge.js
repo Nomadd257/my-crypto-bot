@@ -5,7 +5,7 @@ const { EMA } = technicalIndicators;
 // ===== CONFIG =====
 const TELEGRAM_BOT_TOKEN = "8322504485:AAGycxBbdDIO54iQONd_SbOzfDYelUFv4Qc";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-const CHAT_ID = "7476742687"; // your personal chat ID
+const CHAT_ID = "7476742687";
 
 const SYMBOLS = [
   "BTCUSDT",
@@ -32,13 +32,16 @@ const SYMBOLS = [
   "VETUSDT",
   "SANDUSDT",
   "AVAXUSDT",
-  "FTMUSDT",
+  "XLMUSDT",
   "TRXUSDT",
 ];
 
-const RUN_INTERVAL_MS = 30 * 60 * 1000; // scan every 30 mins
+const RUN_INTERVAL_MS = 60 * 60 * 1000; // every 1 hour
 const EMA_PERIOD = 10;
 const FLAT_THRESHOLD_PCT = 0.2;
+
+// ===== STATE =====
+const lastSignal = {};
 
 // ===== HELPERS =====
 async function sendTelegramMessage(text) {
@@ -53,19 +56,18 @@ async function sendTelegramMessage(text) {
   }
 }
 
-async function fetchCandles(symbol, interval = "2h", limit = 60) {
+async function fetchCandles(symbol, interval = "1h", limit = 60) {
   const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await axios.get(url, { timeout: 15000 });
+
   return res.data.map((c) => ({
     time: c[0],
-    open: +c[1],
-    high: +c[2],
-    low: +c[3],
     close: +c[4],
     volume: +c[5],
   }));
 }
 
+// ===== OBV =====
 function calculateOBV(candles) {
   if (!candles || candles.length < 2) return null;
 
@@ -82,42 +84,57 @@ function calculateOBV(candles) {
   return obv;
 }
 
-function determinePressure(obvValues) {
-  if (!obvValues || obvValues.length < EMA_PERIOD + 1) return "FLAT";
+// ===== CROSS DETECTION =====
+function detectOBVCross(obvValues) {
+  if (!obvValues || obvValues.length < EMA_PERIOD + 2) return null;
 
   const emaArr = EMA.calculate({ period: EMA_PERIOD, values: obvValues });
-  const lastEMA = emaArr[emaArr.length - 1];
+
+  const prevOBV = obvValues[obvValues.length - 2];
   const lastOBV = obvValues[obvValues.length - 1];
+
+  const prevEMA = emaArr[emaArr.length - 2];
+  const lastEMA = emaArr[emaArr.length - 1];
 
   const pctDist = Math.abs((lastOBV - lastEMA) / lastEMA) * 100;
 
-  if (pctDist < FLAT_THRESHOLD_PCT) return "FLAT";
-  return lastOBV > lastEMA ? "BULLISH" : "BEARISH";
+  if (pctDist < FLAT_THRESHOLD_PCT) {
+    return { type: "FLAT" };
+  }
+
+  if (prevOBV <= prevEMA && lastOBV > lastEMA) {
+    return { type: "BULLISH" };
+  }
+
+  if (prevOBV >= prevEMA && lastOBV < lastEMA) {
+    return { type: "BEARISH" };
+  }
+
+  return null;
 }
 
 // ===== MAIN LOOP =====
 async function scanOBV() {
   for (const symbol of SYMBOLS) {
     try {
-      const candles = await fetchCandles(symbol, "2h", 60);
+      const candles = await fetchCandles(symbol, "1h", 60);
       const obvValues = calculateOBV(candles);
-      const pressure = determinePressure(obvValues);
+      const signal = detectOBVCross(obvValues);
 
-      const message =
-        `📊 *OBV Signal Detected*\n` +
-        `Pair: ${symbol}\n` +
-        `${
-          pressure === "BULLISH"
-            ? "Buying Pressure: Increasing"
-            : pressure === "BEARISH"
-            ? "Selling Pressure: Increasing"
-            : "Pressure: Flat"
-        }\n` +
-        `Direction: ${pressure}\n` +
-        `Timeframe: 2h\n` +
-        `(OBV ${
-          pressure === "BULLISH" ? "crossed above" : pressure === "BEARISH" ? "crossed below" : "near"
-        } EMA${EMA_PERIOD})`;
+      if (!signal) continue;
+
+      if (lastSignal[symbol] === signal.type) continue;
+      lastSignal[symbol] = signal.type;
+
+      let message = `📊 *OBV Signal Detected*\nPair: ${symbol}\n`;
+
+      if (signal.type === "BULLISH") {
+        message += `Buying Pressure: Increasing\nDirection: BULLISH\nTimeframe: 1h\n(OBV crossed above EMA${EMA_PERIOD})`;
+      } else if (signal.type === "BEARISH") {
+        message += `Selling Pressure: Increasing\nDirection: BEARISH\nTimeframe: 1h\n(OBV crossed below EMA${EMA_PERIOD})`;
+      } else {
+        message += `Pressure: Flat\nDirection: FLAT\nTimeframe: 1h\n(OBV near EMA${EMA_PERIOD})`;
+      }
 
       await sendTelegramMessage(message);
     } catch (err) {
@@ -126,6 +143,6 @@ async function scanOBV() {
   }
 }
 
-// Run immediately and then every 30 mins
+// ===== START =====
 scanOBV();
 setInterval(scanOBV, RUN_INTERVAL_MS);
