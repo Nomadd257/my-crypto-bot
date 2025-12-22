@@ -154,11 +154,14 @@ async function getEMATrend(symbol, period = 10) {
 
 // --- Volume check (15m) ---
 async function checkVolume_15m(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 50);
-  if (!candles || candles.length < 22) return false;
+  const candles = await fetchFuturesKlines(symbol, "15m", 30);
+  if (!candles || candles.length < 12) return false;
+
   const lastClosed = candles[candles.length - 2];
-  const previous20 = candles.slice(candles.length - 22, candles.length - 2);
-  const avgVol = previous20.reduce((s, c) => s + c.volume, 0) / previous20.length;
+  const previous10 = candles.slice(candles.length - 12, candles.length - 2);
+
+  const avgVol = previous10.reduce((s, c) => s + c.volume, 0) / previous10.length;
+
   return lastClosed.volume >= avgVol;
 }
 
