@@ -188,8 +188,11 @@ bot.on("message", async (msg) => {
     if ((direction === "BULLISH" && trend === "bullish") || (direction === "BEARISH" && trend === "bearish")) {
       clearInterval(timer);
       delete pendingSignals[symbol];
+
       await sendMessage(`✅ EMA Confirmed for ${symbol}\nExecuting trades...`);
-      // your executeMarketOrderForAllUsers(symbol, direction) function call goes here
+
+      // 🔥 THIS IS THE MISSING LINE
+      await executeMarketOrderForAllUsers(symbol, direction);
     }
   }, SIGNAL_CHECK_INTERVAL_MS);
 });
