@@ -30,21 +30,21 @@ const LEVERAGE = 20;
 const TP_PCT = 2.5;
 const SL_PCT = -1.5;
 const TRAILING_STOP_PCT = 1.5;
-const MONITOR_INTERVAL_MS = 5 * 1000;
-const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000;
+const CHECK_INTERVAL_MS = 60 * 1000;
+const MONITOR_INTERVAL_MS = 5000;
 
 // --- MEMORY ---
-let activePositions = {};
 let pendingSignals = {};
+let activePositions = {};
 let userClients = {};
 
 // --- LOG ---
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
-}
+const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
-// --- LOAD USERS ---
+// =====================================================
+// USERS
+// =====================================================
 function loadUsers() {
   if (!fs.existsSync(USERS_FILE)) return [];
   const data = JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
@@ -53,150 +53,165 @@ function loadUsers() {
     .map(([id, u]) => ({ id, apiKey: u.apiKey, apiSecret: u.apiSecret }));
 }
 
-// --- CREATE BINANCE CLIENTS ---
 function createBinanceClients() {
   userClients = {};
-  const users = loadUsers();
-  return users.map((u) => {
-    const client = new Binance().options({
+  return loadUsers().map((u) => {
+    const c = new Binance();
+    c.options({
       APIKEY: u.apiKey,
       APISECRET: u.apiSecret,
       useServerTime: true,
-      recvWindow: 60000,
     });
-    userClients[u.id] = client;
-    return { userId: u.id, client };
+    userClients[u.id] = c;
+    return { userId: u.id, client: c };
   });
 }
 
-// --- TELEGRAM SEND ---
-async function sendMessage(msg) {
-  try {
-    await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" });
-  } catch {}
-  try {
-    await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" });
-  } catch {}
+// =====================================================
+// EMA
+// =====================================================
+async function fetchCloses(symbol, limit = 200) {
+  const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=${limit}`);
+  const d = await r.json();
+  return d.map((x) => +x[4]);
 }
 
-// --- FETCH KLINES ---
-async function fetchFuturesKlines(symbol, interval = "1h", limit = 200) {
-  const res = await fetch(
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-  );
-  const data = await res.json();
-  return data.map((c) => ({ close: +c[4] }));
+function ema(values, p) {
+  const k = 2 / (p + 1);
+  let e = values.slice(0, p).reduce((a, b) => a + b) / p;
+  for (let i = p; i < values.length; i++) e = values[i] * k + e * (1 - k);
+  return e;
 }
 
-// --- EMA ---
-function calculateEMA(values, period) {
-  const k = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-async function getEMATrend(symbol, period = 10) {
-  const klines = await fetchFuturesKlines(symbol);
-  const closes = klines.map((k) => k.close);
-  const ema = calculateEMA(closes, period);
-  const last = closes[closes.length - 1];
-  if (last > ema) return "bullish";
-  if (last < ema) return "bearish";
-  return "neutral";
+async function getTrend(symbol) {
+  const closes = await fetchCloses(symbol);
+  const e = ema(closes, 10);
+  const last = closes.at(-1);
+  if (last > e) return "BULLISH";
+  if (last < e) return "BEARISH";
+  return null;
 }
 
 // =====================================================
-// 🚨 LIVE /CLOSEALL (ADMIN ONLY)
+// EXECUTION
 // =====================================================
-async function closeAllLivePositions(symbolFilter = "ALL") {
+async function executeMarketOrderForAllUsers(symbol, direction) {
   const clients = createBinanceClients();
-
   for (const { userId, client } of clients) {
     try {
-      const positions = await client.futuresPositionRisk();
+      await client.futuresLeverage(symbol, LEVERAGE);
 
-      for (const p of positions) {
-        const amt = parseFloat(p.positionAmt);
-        if (amt === 0) continue;
-        if (symbolFilter !== "ALL" && p.symbol !== symbolFilter) continue;
+      const bal = (await client.futuresBalance()).find((b) => b.asset === "USDT");
+      if (!bal || bal.availableBalance <= 0) continue;
 
-        const qty = Math.abs(amt);
-        const side = amt > 0 ? "SELL" : "BUY";
+      const price = +(await client.futuresMarkPrice(symbol)).markPrice;
+      const qty = ((bal.availableBalance * TRADE_PERCENT * LEVERAGE) / price).toFixed(3);
+      const side = direction === "BULLISH" ? "BUY" : "SELL";
 
-        try {
-          await client.futuresMarketOrder(p.symbol, side, qty, {
-            reduceOnly: true,
-          });
-        } catch (err) {
-          log(`❌ Error closing position for user ${userId} ${p.symbol}: ${err.message}`);
-          continue;
-        }
+      await client.futuresMarketOrder(symbol, side, qty);
 
-        await sendMessage(`🔴 *LIVE CLOSE*\nUser: ${userId}\nSymbol: ${p.symbol}\nQty: ${qty}\nSide: ${side}`);
-      }
-    } catch (err) {
-      log(`CloseAll error for ${userId}: ${err.message}`);
+      activePositions[symbol] ??= {};
+      activePositions[symbol][userId] = {
+        side,
+        entry: price,
+        qty,
+        high: price,
+        low: price,
+      };
+
+      bot.sendMessage(GROUP_CHAT_ID, `✅ *${side} EXECUTED*\n${symbol}\nUser: ${userId}`);
+    } catch (e) {
+      log(`Execution failed ${userId} ${symbol}: ${e.message}`);
     }
   }
 }
 
 // =====================================================
-// TELEGRAM HANDLER
+// MONITOR TP / SL / TRAILING
+// =====================================================
+async function monitorPositions() {
+  for (const symbol in activePositions) {
+    for (const userId in activePositions[symbol]) {
+      const pos = activePositions[symbol][userId];
+      const client = userClients[userId];
+      if (!client) continue;
+
+      const price = +(await client.futuresMarkPrice(symbol)).markPrice;
+
+      if (pos.side === "BUY") {
+        pos.high = Math.max(pos.high, price);
+        if (
+          ((price - pos.entry) / pos.entry) * 100 >= TP_PCT ||
+          ((pos.entry - price) / pos.entry) * 100 <= SL_PCT ||
+          price <= pos.high * (1 - TRAILING_STOP_PCT / 100)
+        ) {
+          await client.futuresMarketSell(symbol, pos.qty);
+          delete activePositions[symbol][userId];
+        }
+      } else {
+        pos.low = Math.min(pos.low, price);
+        if (
+          ((pos.entry - price) / pos.entry) * 100 >= TP_PCT ||
+          ((price - pos.entry) / pos.entry) * 100 <= SL_PCT ||
+          price >= pos.low * (1 + TRAILING_STOP_PCT / 100)
+        ) {
+          await client.futuresMarketBuy(symbol, pos.qty);
+          delete activePositions[symbol][userId];
+        }
+      }
+    }
+  }
+}
+setInterval(monitorPositions, MONITOR_INTERVAL_MS);
+
+// =====================================================
+// TELEGRAM
 // =====================================================
 bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  const text = msg.text.trim();
-  const fromAdmin = String(msg.from.id) === String(ADMIN_ID);
+  const t = msg.text?.trim();
+  if (!t) return;
 
-  // --- /closeall ---
-  if (fromAdmin && text.toLowerCase().startsWith("/closeall")) {
-    const parts = text.split(" ");
-    const symbol = parts[1] ? parts[1].toUpperCase() : "ALL";
+  // /closeall
+  if (msg.from.id == ADMIN_ID && t.startsWith("/closeall")) {
+    const sym = t.split(" ")[1] || "ALL";
+    const clients = createBinanceClients();
 
-    await sendMessage(`⚠️ *ADMIN CLOSEALL INITIATED*\nTarget: ${symbol}`);
-    await closeAllLivePositions(symbol);
-    return;
+    for (const { userId, client } of clients) {
+      const pos = await client.futuresPositionRisk();
+      for (const p of pos) {
+        if (p.positionAmt == 0) continue;
+        if (sym !== "ALL" && p.symbol !== sym) continue;
+        await client.futuresMarketOrder(p.symbol, p.positionAmt > 0 ? "SELL" : "BUY", Math.abs(p.positionAmt), {
+          reduceOnly: true,
+        });
+      }
+    }
+    return bot.sendMessage(GROUP_CHAT_ID, "🔴 CLOSEALL DONE");
   }
 
-  // --- CID SIGNAL ---
-  if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
+  // CID
+  if (!t.includes("CONFIRMED CHANGE IN DIRECTION")) return;
+  const m = t.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
+  if (!m) return;
 
-  const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
-  if (!match) return;
-
-  const symbol = match[1];
-  const direction = match[2];
-
+  const [_, symbol, direction] = m;
   if (pendingSignals[symbol]) return;
 
   pendingSignals[symbol] = Date.now() + SIGNAL_EXPIRY_MS;
-
-  await sendMessage(`📢 CID Signal: *${symbol}* (${direction})\nWaiting for EMA10 alignment...`);
+  bot.sendMessage(GROUP_CHAT_ID, `📢 CID ${symbol} (${direction}) — waiting for EMA10`);
 
   const timer = setInterval(async () => {
     if (Date.now() > pendingSignals[symbol]) {
-      delete pendingSignals[symbol];
       clearInterval(timer);
-      await sendMessage(`⌛ Signal expired for ${symbol}`);
-      return;
+      delete pendingSignals[symbol];
+      return bot.sendMessage(GROUP_CHAT_ID, `⌛ Signal expired for ${symbol}`);
     }
 
-    const trend = await getEMATrend(symbol, 10);
-    if ((direction === "BULLISH" && trend === "bullish") || (direction === "BEARISH" && trend === "bearish")) {
+    const trend = await getTrend(symbol);
+    if (trend === direction) {
       clearInterval(timer);
       delete pendingSignals[symbol];
-
-      await sendMessage(`✅ EMA Confirmed for ${symbol}\nExecuting trades...`);
-
-      // 🔥 THIS IS THE MISSING LINE
       await executeMarketOrderForAllUsers(symbol, direction);
     }
-  }, SIGNAL_CHECK_INTERVAL_MS);
+  }, CHECK_INTERVAL_MS);
 });
-
-// --- POSITION MONITOR ---
-// Keep your TP / SL / Trailing Stop monitoring as in your original code
-setInterval(() => {}, MONITOR_INTERVAL_MS);
