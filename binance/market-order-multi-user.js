@@ -28,23 +28,20 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const TP_PCT = 2.5;
-const SL_PCT = -1.5;
+const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 1.5;
+
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 1000;
 const MONITOR_INTERVAL_MS = 5000;
 
-// --- MEMORY ---
 let pendingSignals = {};
 let activePositions = {};
 let userClients = {};
 
-// --- LOG ---
 const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
-// =====================================================
-// USERS
-// =====================================================
+// ================= USERS =================
 function loadUsers() {
   if (!fs.existsSync(USERS_FILE)) return [];
   const data = JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
@@ -67,16 +64,19 @@ function createBinanceClients() {
   });
 }
 
-// =====================================================
-// EMA
-// =====================================================
-async function fetchCloses(symbol, limit = 200) {
-  const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=${limit}`);
-  const d = await r.json();
-  return d.map((x) => +x[4]);
+// ================= EMA =================
+async function fetchCloses(symbol) {
+  try {
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=200`);
+    const d = await r.json();
+    return d.map((x) => +x[4]);
+  } catch {
+    return null;
+  }
 }
 
 function ema(values, p) {
+  if (!values || values.length < p) return null;
   const k = 2 / (p + 1);
   let e = values.slice(0, p).reduce((a, b) => a + b) / p;
   for (let i = p; i < values.length; i++) e = values[i] * k + e * (1 - k);
@@ -85,6 +85,7 @@ function ema(values, p) {
 
 async function getTrend(symbol) {
   const closes = await fetchCloses(symbol);
+  if (!closes) return null;
   const e = ema(closes, 10);
   const last = closes.at(-1);
   if (last > e) return "BULLISH";
@@ -92,9 +93,12 @@ async function getTrend(symbol) {
   return null;
 }
 
-// =====================================================
-// EXECUTION
-// =====================================================
+// ================= EXECUTION =================
+async function getMarkPrice(client, symbol) {
+  const mp = await client.futuresMarkPrice(symbol);
+  return Number(mp.markPrice || mp.price || mp[0]?.markPrice);
+}
+
 async function executeMarketOrderForAllUsers(symbol, direction) {
   const clients = createBinanceClients();
   for (const { userId, client } of clients) {
@@ -104,10 +108,13 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
       const bal = (await client.futuresBalance()).find((b) => b.asset === "USDT");
       if (!bal || bal.availableBalance <= 0) continue;
 
-      const price = +(await client.futuresMarkPrice(symbol)).markPrice;
-      const qty = ((bal.availableBalance * TRADE_PERCENT * LEVERAGE) / price).toFixed(3);
-      const side = direction === "BULLISH" ? "BUY" : "SELL";
+      const price = await getMarkPrice(client, symbol);
+      if (!price) continue;
 
+      const rawQty = (bal.availableBalance * TRADE_PERCENT * LEVERAGE) / price;
+      const qty = Number(rawQty.toFixed(2)); // safe default
+
+      const side = direction === "BULLISH" ? "BUY" : "SELL";
       await client.futuresMarketOrder(symbol, side, qty);
 
       activePositions[symbol] ??= {};
@@ -119,16 +126,16 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         low: price,
       };
 
-      bot.sendMessage(GROUP_CHAT_ID, `✅ *${side} EXECUTED*\n${symbol}\nUser: ${userId}`);
+      await bot.sendMessage(GROUP_CHAT_ID, `✅ *${side} EXECUTED*\n${symbol}\nUser: ${userId}`, {
+        parse_mode: "Markdown",
+      });
     } catch (e) {
-      log(`Execution failed ${userId} ${symbol}: ${e.message}`);
+      log(`EXEC FAIL ${userId} ${symbol}: ${e.message}`);
     }
   }
 }
 
-// =====================================================
-// MONITOR TP / SL / TRAILING
-// =====================================================
+// ================= MONITOR =================
 async function monitorPositions() {
   for (const symbol in activePositions) {
     for (const userId in activePositions[symbol]) {
@@ -136,47 +143,32 @@ async function monitorPositions() {
       const client = userClients[userId];
       if (!client) continue;
 
-      const price = +(await client.futuresMarkPrice(symbol)).markPrice;
+      const price = await getMarkPrice(client, symbol);
+      if (!price) continue;
 
-      if (pos.side === "BUY") {
-        pos.high = Math.max(pos.high, price);
-        if (
-          ((price - pos.entry) / pos.entry) * 100 >= TP_PCT ||
-          ((pos.entry - price) / pos.entry) * 100 <= SL_PCT ||
-          price <= pos.high * (1 - TRAILING_STOP_PCT / 100)
-        ) {
-          await client.futuresMarketSell(symbol, pos.qty);
-          delete activePositions[symbol][userId];
-        }
-      } else {
-        pos.low = Math.min(pos.low, price);
-        if (
-          ((pos.entry - price) / pos.entry) * 100 >= TP_PCT ||
-          ((price - pos.entry) / pos.entry) * 100 <= SL_PCT ||
-          price >= pos.low * (1 + TRAILING_STOP_PCT / 100)
-        ) {
-          await client.futuresMarketBuy(symbol, pos.qty);
-          delete activePositions[symbol][userId];
-        }
+      const movePct =
+        pos.side === "BUY" ? ((price - pos.entry) / pos.entry) * 100 : ((pos.entry - price) / pos.entry) * 100;
+
+      if (movePct >= TP_PCT || movePct <= -SL_PCT) {
+        await client.futuresMarketOrder(symbol, pos.side === "BUY" ? "SELL" : "BUY", pos.qty, { reduceOnly: true });
+        delete activePositions[symbol][userId];
       }
     }
   }
 }
+
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// =====================================================
-// TELEGRAM
-// =====================================================
+// ================= TELEGRAM =================
 bot.on("message", async (msg) => {
   const t = msg.text?.trim();
   if (!t) return;
 
-  // /closeall
   if (msg.from.id == ADMIN_ID && t.startsWith("/closeall")) {
     const sym = t.split(" ")[1] || "ALL";
     const clients = createBinanceClients();
 
-    for (const { userId, client } of clients) {
+    for (const { client } of clients) {
       const pos = await client.futuresPositionRisk();
       for (const p of pos) {
         if (p.positionAmt == 0) continue;
@@ -186,10 +178,10 @@ bot.on("message", async (msg) => {
         });
       }
     }
+    activePositions = {};
     return bot.sendMessage(GROUP_CHAT_ID, "🔴 CLOSEALL DONE");
   }
 
-  // CID
   if (!t.includes("CONFIRMED CHANGE IN DIRECTION")) return;
   const m = t.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
   if (!m) return;
@@ -198,7 +190,7 @@ bot.on("message", async (msg) => {
   if (pendingSignals[symbol]) return;
 
   pendingSignals[symbol] = Date.now() + SIGNAL_EXPIRY_MS;
-  bot.sendMessage(GROUP_CHAT_ID, `📢 CID ${symbol} (${direction}) — waiting for EMA10`);
+  bot.sendMessage(GROUP_CHAT_ID, `📢 CID ${symbol} (${direction})`);
 
   const timer = setInterval(async () => {
     if (Date.now() > pendingSignals[symbol]) {
@@ -215,3 +207,5 @@ bot.on("message", async (msg) => {
     }
   }, CHECK_INTERVAL_MS);
 });
+
+log("🤖 BOT STARTED — LISTENING FOR SIGNALS");
