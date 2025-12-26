@@ -141,7 +141,7 @@ function calculateEMA(values, period) {
 }
 
 async function getEMATrend(symbol, period = 10) {
-  const klines = await fetchFuturesKlines(symbol, "1h", 200);
+  const klines = await fetchFuturesKlines(symbol, "15m", 200);
   if (!klines || klines.length === 0) return null;
   const closes = klines.map((k) => k.close);
   const ema = calculateEMA(closes, period);
@@ -512,7 +512,7 @@ bot.on("message", async (msg) => {
       const vol = await checkVolume_15m(symbol);
       const obvOk = await checkOBV_15m(symbol, direction === "BULLISH" ? "long" : "short");
 
-      if (!trendOk) await sendMessage(`⏳ EMA (1H) trend not passed for *${symbol}* (trend: ${trend})`);
+      if (!trendOk) await sendMessage(`⏳ EMA (15m) trend not passed for *${symbol}* (trend: ${trend})`);
       if (!vol) await sendMessage(`⏳ Volume (15m) not passed for *${symbol}*`);
       if (!obvOk) await sendMessage(`⏳ OBV (15m) not passed for *${symbol}*`);
 
