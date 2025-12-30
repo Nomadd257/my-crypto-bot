@@ -29,7 +29,7 @@ const TRADE_PERCENT = 0.1; // 10% of USDT balance
 const LEVERAGE = 20;
 const TP_PCT = 2.5;
 const SL_PCT = -1.5;
-const TRAILING_STOP_PCT = 1.5;
+const TRAILING_STOP_PCT = 2;
 const MONITOR_INTERVAL_MS = 5 * 1000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour as requested
@@ -150,38 +150,6 @@ async function getEMATrend(symbol, period = 10) {
   if (lastClose > ema) return "bullish";
   if (lastClose < ema) return "bearish";
   return "neutral";
-}
-
-// --- Volume check (15m) ---
-async function checkVolume_15m(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 50);
-  if (!candles || candles.length < 22) return false;
-  const lastClosed = candles[candles.length - 2];
-  const previous20 = candles.slice(candles.length - 22, candles.length - 2);
-  const avgVol = previous20.reduce((s, c) => s + c.volume, 0) / previous20.length;
-  return lastClosed.volume >= avgVol;
-}
-
-// --- OBV 15m check ---
-async function checkOBV_15m(symbol, direction) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 60);
-  if (!candles || candles.length < 4) return false;
-  const closed = candles.slice(0, -1);
-  let obv = 0;
-  const obvSeries = [0];
-  for (let i = 1; i < closed.length; i++) {
-    const prevClose = closed[i - 1].close;
-    const currClose = closed[i].close;
-    const currVol = closed[i].volume;
-    if (currClose > prevClose) obv += currVol;
-    else if (currClose < prevClose) obv -= currVol;
-    obvSeries.push(obv);
-  }
-  const lastOBV = obvSeries[obvSeries.length - 1];
-  const prevOBV = obvSeries[obvSeries.length - 2];
-  if (direction === "long") return lastOBV > prevOBV;
-  if (direction === "short") return lastOBV < prevOBV;
-  return false;
 }
 
 // --- Helper: floor quantity to step size safely ---
@@ -490,7 +458,7 @@ bot.on("message", async (msg) => {
     await sendMessage(
       `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
         SIGNAL_EXPIRY_MS / 60000
-      )} minutes\nChecking EMA + Volume + OBV...`
+      )} minutes\nChecking EMA (15m)...`
     );
 
     const timer = setInterval(async () => {
@@ -509,17 +477,15 @@ bot.on("message", async (msg) => {
       const trend = await getEMATrend(symbol, 10);
       const trendOk =
         trend && ((direction === "BULLISH" && trend === "bullish") || (direction === "BEARISH" && trend === "bearish"));
-      const vol = await checkVolume_15m(symbol);
-      const obvOk = await checkOBV_15m(symbol, direction === "BULLISH" ? "long" : "short");
 
-      if (!trendOk) await sendMessage(`⏳ EMA (15m) trend not passed for *${symbol}* (trend: ${trend})`);
-      if (!vol) await sendMessage(`⏳ Volume (15m) not passed for *${symbol}*`);
-      if (!obvOk) await sendMessage(`⏳ OBV (15m) not passed for *${symbol}*`);
+      if (!trendOk) {
+        await sendMessage(`⏳ EMA (15m) trend not passed for *${symbol}* (trend: ${trend})`);
+      }
 
-      if (trendOk && vol && obvOk) {
+      if (trendOk) {
         clearInterval(timer);
         delete pendingSignals[symbol];
-        await sendMessage(`✅ All Checks Passed for *${symbol}* — Executing Market Orders...`);
+        await sendMessage(`✅ EMA Confirmed for *${symbol}* — Executing Market Orders...`);
         await executeMarketOrderForAllUsers(symbol, direction);
       }
     }, SIGNAL_CHECK_INTERVAL_MS);
