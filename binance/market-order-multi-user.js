@@ -26,7 +26,7 @@ const USERS_FILE = "./users.json";
 
 // --- Settings ---
 const TRADE_PERCENT = 0.1; // 10% of USDT balance
-const LEVERAGE = 250;
+const LEVERAGE = 25;
 const TP_PCT = 1.5;
 const SL_PCT = -1.5;
 const TRAILING_STOP_PCT = 1.5;
