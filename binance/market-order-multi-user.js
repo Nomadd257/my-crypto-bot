@@ -25,11 +25,12 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const USERS_FILE = "./users.json";
 
 // --- Settings ---
+// --- Settings ---
 const TRADE_PERCENT = 0.1; // 10% of USDT balance
-const LEVERAGE = 25;
-const TP_PCT = 1.5;
+const LEVERAGE = 20;
+const TP_PCT = 2.5;
 const SL_PCT = -1.5;
-const TRAILING_STOP_PCT = 1.5;
+const TRAILING_STOP_PCT = 2;
 const MONITOR_INTERVAL_MS = 5 * 1000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour as requested
