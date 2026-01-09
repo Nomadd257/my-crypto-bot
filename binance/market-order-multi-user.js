@@ -25,12 +25,11 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const USERS_FILE = "./users.json";
 
 // --- Settings ---
-// --- Settings ---
 const TRADE_PERCENT = 0.1; // 10% of USDT balance
 const LEVERAGE = 20;
-const TP_PCT = 2.5;
+const TP_PCT = 1.5;
 const SL_PCT = -1.5;
-const TRAILING_STOP_PCT = 2;
+const TRAILING_STOP_PCT = 1.5;
 const MONITOR_INTERVAL_MS = 5 * 1000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour as requested
@@ -129,28 +128,16 @@ async function fetchFuturesKlines(symbol, interval = "1h", limit = 200) {
   }
 }
 
-// --- EMA calculation ---
-function calculateEMA(values, period) {
-  if (!Array.isArray(values) || values.length < period) return null;
-  let sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  let ema = sma;
-  const k = 2 / (period + 1);
-  for (let i = period; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
+// --- Volume Check 15m ---
+async function volumeCheck15m(symbol) {
+  const klines = await fetchFuturesKlines(symbol, "15m", 11);
+  if (!klines || klines.length < 11) return false;
 
-async function getEMATrend(symbol, period = 10) {
-  const klines = await fetchFuturesKlines(symbol, "15m", 200);
-  if (!klines || klines.length === 0) return null;
-  const closes = klines.map((k) => k.close);
-  const ema = calculateEMA(closes, period);
-  if (ema === null) return null;
-  const lastClose = closes[closes.length - 1];
-  if (lastClose > ema) return "bullish";
-  if (lastClose < ema) return "bearish";
-  return "neutral";
+  const volumes = klines.map((k) => k.volume);
+  const lastVolume = volumes.pop();
+  const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+
+  return lastVolume > avgVolume;
 }
 
 // --- Helper: floor quantity to step size safely ---
@@ -169,18 +156,6 @@ function floorToStep(qty, step) {
 // --- Execute Market Order for All Users ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
   try {
-    // Global EMA check (public data)
-    const requiredTrend = direction === "BULLISH" ? "bullish" : "bearish";
-    const trend = await getEMATrend(symbol, 10);
-    if (!trend) {
-      await sendMessage(`⚠️ EMA trend unavailable for ${symbol}. Aborting.`);
-      return;
-    }
-    if (trend !== requiredTrend) {
-      await sendMessage(`⚠️ EMA trend mismatch for ${symbol} (signal=${direction}, trend=${trend}). Skipping.`);
-      return;
-    }
-
     const clients = createBinanceClients();
     if (!clients.length) {
       await sendMessage(`⚠️ No active users found. Skipping execution.`);
@@ -208,13 +183,6 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         const balAmount = usdtBal ? parseFloat(usdtBal.balance || usdtBal.availableBalance || usdtBal.balance) : 0;
         if (!balAmount || balAmount <= 0) {
           log(`Skipping user ${userId}: USDT balance unavailable/zero.`);
-          continue;
-        }
-
-        // per-user EMA safety check (public data is OK but double-check is allowed)
-        const userTrend = await getEMATrend(symbol, 10);
-        if (!userTrend || userTrend !== requiredTrend) {
-          await sendMessage(`⚠️ Skipping user ${userId} for ${symbol} — EMA trend check failed (trend=${userTrend}).`);
           continue;
         }
 
@@ -422,23 +390,31 @@ bot.on("message", async (msg) => {
 
       const clients = createBinanceClients();
 
-      for (const sym of Object.keys(activePositions)) {
-        for (const userId of Object.keys(activePositions[sym])) {
-          if (symbolArg !== "ALL" && symbolArg !== sym) continue;
-          const pos = activePositions[sym][userId];
-          const client = userClients[userId];
-          if (!client) continue;
-          const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
-          try {
-            if (closeSide === "BUY") await client.futuresMarketBuy(sym, pos.qty);
-            else await client.futuresMarketSell(sym, pos.qty);
-            delete activePositions[sym][userId];
-            await sendMessage(
-              `🔴 *MANUAL CLOSE:* User ${userId}\nSymbol: ${sym}\nQty: ${pos.qty}\nAction: ${closeSide}`
-            );
-          } catch (err) {
-            await sendMessage(`❌ Failed to close User ${userId} on ${sym}: ${err?.message || err}`);
+      for (const { userId, client } of clients) {
+        try {
+          const positions = await client.futuresPositionRisk();
+
+          for (const p of positions) {
+            const amt = parseFloat(p.positionAmt);
+            if (amt === 0) continue;
+            if (symbolArg !== "ALL" && p.symbol !== symbolArg) continue;
+
+            const side = amt > 0 ? "SELL" : "BUY";
+            const qty = Math.abs(amt);
+
+            await client.futuresMarketOrder(p.symbol, side, qty, {
+              reduceOnly: true,
+            });
+
+            // clean memory
+            if (activePositions[p.symbol]) {
+              delete activePositions[p.symbol][userId];
+            }
+
+            await sendMessage(`🔴 *MANUAL CLOSE*\nUser: ${userId}\nSymbol: ${p.symbol}\nQty: ${qty}`);
           }
+        } catch (err) {
+          log(`Closeall error for ${userId}: ${err?.message || err}`);
         }
       }
       return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
@@ -459,7 +435,7 @@ bot.on("message", async (msg) => {
     await sendMessage(
       `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
         SIGNAL_EXPIRY_MS / 60000
-      )} minutes\nChecking EMA (15m)...`
+      )} minutes\nChecking Volume (15m)...`
     );
 
     const timer = setInterval(async () => {
@@ -475,20 +451,17 @@ bot.on("message", async (msg) => {
         return;
       }
 
-      const trend = await getEMATrend(symbol, 10);
-      const trendOk =
-        trend && ((direction === "BULLISH" && trend === "bullish") || (direction === "BEARISH" && trend === "bearish"));
+      const volumeOk = await volumeCheck15m(symbol);
 
-      if (!trendOk) {
-        await sendMessage(`⏳ EMA (15m) trend not passed for *${symbol}* (trend: ${trend})`);
+      if (!volumeOk) {
+        await sendMessage(`⏳ Volume (15m) not passed for *${symbol}*`);
+        return;
       }
 
-      if (trendOk) {
-        clearInterval(timer);
-        delete pendingSignals[symbol];
-        await sendMessage(`✅ EMA Confirmed for *${symbol}* — Executing Market Orders...`);
-        await executeMarketOrderForAllUsers(symbol, direction);
-      }
+      clearInterval(timer);
+      delete pendingSignals[symbol];
+      await sendMessage(`✅ Volume confirmed for *${symbol}* — Executing Market Orders...`);
+      await executeMarketOrderForAllUsers(symbol, direction);
     }, SIGNAL_CHECK_INTERVAL_MS);
   } catch (err) {
     log(`❌ bot.on message error: ${err?.message || err}`);
