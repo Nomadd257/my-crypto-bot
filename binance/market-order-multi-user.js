@@ -383,10 +383,12 @@ bot.on("message", async (msg) => {
     if (String(msg.from.id) === String(ADMIN_ID) && text.toLowerCase().startsWith("/closeall")) {
       const parts = text.split(" ");
       const symbolArg = parts[1] ? parts[1].toUpperCase() : null;
+
       if (!symbolArg) {
         return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
       }
-      bot.sendMessage(chatId, `📢 *Manual Close-All Triggered:* ${symbolArg}`, { parse_mode: "Markdown" });
+
+      await bot.sendMessage(chatId, `📢 *ADMIN CLOSEALL INITIATED*\nTarget: ${symbolArg}`, { parse_mode: "Markdown" });
 
       const clients = createBinanceClients();
 
@@ -399,25 +401,33 @@ bot.on("message", async (msg) => {
             if (amt === 0) continue;
             if (symbolArg !== "ALL" && p.symbol !== symbolArg) continue;
 
-            const side = amt > 0 ? "SELL" : "BUY";
             const qty = Math.abs(amt);
 
-            await client.futuresMarketOrder(p.symbol, side, qty, {
-              reduceOnly: true,
-            });
+            if (amt > 0) {
+              // CLOSE LONG
+              await client.futuresMarketSell(p.symbol, qty);
+            } else {
+              // CLOSE SHORT
+              await client.futuresMarketBuy(p.symbol, qty);
+            }
 
-            // clean memory
+            // Clean in-memory tracking
             if (activePositions[p.symbol]) {
               delete activePositions[p.symbol][userId];
+              if (Object.keys(activePositions[p.symbol]).length === 0) {
+                delete activePositions[p.symbol];
+              }
             }
 
             await sendMessage(`🔴 *MANUAL CLOSE*\nUser: ${userId}\nSymbol: ${p.symbol}\nQty: ${qty}`);
           }
         } catch (err) {
-          log(`Closeall error for ${userId}: ${err?.message || err}`);
+          log(`❌ Closeall error for user ${userId}: ${err?.message || err}`);
+          await sendMessage(`❌ Closeall failed for User ${userId}`);
         }
       }
-      return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
+
+      return bot.sendMessage(chatId, "✅ *Manual Close-All Completed*", { parse_mode: "Markdown" });
     }
 
     // --- CID Signals ---
