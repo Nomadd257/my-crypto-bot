@@ -480,44 +480,17 @@ async function checkPdhPdlRetest(symbol, type) {
 async function monitorPdhPdl() {
   for (const symbol of Object.keys(pdhPdlMonitors)) {
     const monitor = pdhPdlMonitors[symbol];
-    if (!monitor.active) continue;
+    if (!monitor.active || monitor.triggered) continue; // skip if already triggered
 
-    const counterTrend = await checkPdhPdl(symbol, monitor.type);
-    const retestBounce = await checkPdhPdlRetest(symbol, monitor.type);
+    const conditionMet = await checkPdhPdl(symbol, monitor.type);
+    if (!conditionMet) continue;
 
-    const klines = await fetchFuturesKlines(symbol, "1d", 2);
-    if (!klines || klines.length < 2) continue;
-    const prevHigh = klines[0].high;
-    const prevLow = klines[0].low;
-    const markPriceK = await fetchFuturesKlines(symbol, "1m", 1);
-    if (!markPriceK || !markPriceK.length) continue;
-    const currentPrice = markPriceK[0].close;
+    const direction = monitor.type === "PDH" ? "SELL" : "BUY";
+    await sendMessage(`📢 PDH/PDL Counter-Trend Triggered for *${symbol}* — Executing ${direction} trade!`);
 
-    if (!pdhPdlState[symbol]) pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
+    await executeMarketOrderForAllUsers(symbol, direction);
 
-    // Detect broke levels
-    if (currentPrice > prevHigh) pdhPdlState[symbol].brokePDH = true;
-    if (currentPrice < prevLow) pdhPdlState[symbol].brokePDL = true;
-
-    if (counterTrend) {
-      const direction = monitor.type === "PDH" ? "SELL" : "BUY";
-      await sendMessage(
-        `📢 *PDH/PDL Counter-Trend Trade*\nSymbol: *${symbol}*\nDirection: *${direction}*\nPrice: ${currentPrice}`
-      );
-      await executeMarketOrderForAllUsers(symbol, direction);
-      pdhPdlState[symbol].brokePDH = false;
-      pdhPdlState[symbol].brokePDL = false;
-    }
-
-    if (retestBounce) {
-      const direction = monitor.type === "PDH" ? "BUY" : "SELL";
-      await sendMessage(
-        `📢 *PDH/PDL Retest Bounce Trade*\nSymbol: *${symbol}*\nDirection: *${direction}*\nPrice: ${currentPrice}`
-      );
-      await executeMarketOrderForAllUsers(symbol, direction);
-      pdhPdlState[symbol].brokePDH = false;
-      pdhPdlState[symbol].brokePDL = false;
-    }
+    monitor.triggered = true; // mark as executed
   }
 }
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
