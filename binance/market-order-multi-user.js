@@ -27,9 +27,9 @@ const USERS_FILE = "./users.json";
 // --- Settings ---
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
-const TP_PCT = 1.5;
+const TP_PCT = 2;
 const SL_PCT = -1.5;
-const TRAILING_STOP_PCT = 1.5;
+const TRAILING_STOP_PCT = 2;
 const MONITOR_INTERVAL_MS = 5 * 1000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
