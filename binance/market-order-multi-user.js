@@ -240,201 +240,35 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
   }
 }
 
-// --- Monitor Positions & Trailing Stop ---
-async function monitorPositions() {
-  const clients = createBinanceClients();
-  for (const symbol of Object.keys(activePositions)) {
-    for (const userId of Object.keys(activePositions[symbol])) {
-      const pos = activePositions[symbol][userId];
-      const client = userClients[userId];
-      if (!client) {
-        delete activePositions[symbol][userId];
-        continue;
-      }
-      try {
-        const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
-        const positionAmt = p ? parseFloat(p.positionAmt || "0") : 0;
-        if (!p || positionAmt === 0) {
-          delete activePositions[symbol][userId];
-          continue;
-        }
-
-        let markPrice = null;
-        try {
-          const mp = await client.futuresMarkPrice(symbol);
-          if (mp && mp.markPrice) markPrice = parseFloat(mp.markPrice);
-        } catch (e) {}
-        if (!markPrice) {
-          const k = await fetchFuturesKlines(symbol, "1m", 1);
-          if (k && k.length) markPrice = k[0].close;
-        }
-        if (!markPrice) continue;
-
-        // Trailing stop
-        if (pos.side === "BUY") {
-          pos.highest = Math.max(pos.highest, markPrice);
-          const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail > pos.trailingStop) pos.trailingStop = trail;
-          if (markPrice <= pos.trailingStop) {
-            const qty = Math.abs(positionAmt);
-            await client.futuresMarketSell(symbol, qty);
-            await sendMessage(`🔒 [User ${userId}] Trailing Stop Triggered on *${symbol}*`);
-            delete activePositions[symbol][userId];
-            continue;
-          }
-        } else {
-          pos.lowest = Math.min(pos.lowest, markPrice);
-          const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop = trail;
-          if (markPrice >= pos.trailingStop) {
-            const qty = Math.abs(positionAmt);
-            await client.futuresMarketBuy(symbol, qty);
-            await sendMessage(`🔒 [User ${userId}] Trailing Stop Triggered on *${symbol}*`);
-            delete activePositions[symbol][userId];
-            continue;
-          }
-        }
-
-        // TP/SL
-        const move =
-          pos.side === "BUY"
-            ? ((markPrice - pos.entryPrice) / pos.entryPrice) * 100
-            : ((pos.entryPrice - markPrice) / pos.entryPrice) * 100;
-        if (move >= TP_PCT) {
-          const qty = Math.abs(positionAmt);
-          await sendMessage(`🎯 TAKE PROFIT HIT for User ${userId} on *${symbol}* (+${move.toFixed(2)}%)`);
-          if (pos.side === "BUY") await client.futuresMarketSell(symbol, qty);
-          else await client.futuresMarketBuy(symbol, qty);
-          delete activePositions[symbol][userId];
-          continue;
-        }
-        if (move <= SL_PCT) {
-          const qty = Math.abs(positionAmt);
-          await sendMessage(`🔻 STOP LOSS HIT for User ${userId} on *${symbol}* (${move.toFixed(2)}%)`);
-          if (pos.side === "BUY") await client.futuresMarketSell(symbol, qty);
-          else await client.futuresMarketBuy(symbol, qty);
-          delete activePositions[symbol][userId];
-          continue;
-        }
-      } catch (err) {
-        log(`monitorPositions error for ${userId} ${symbol}: ${err?.message || err}`);
-      }
-    }
-  }
-}
-setInterval(monitorPositions, MONITOR_INTERVAL_MS);
-
 // =========================
-// TELEGRAM HANDLER - PART 1
-// =========================
-bot.on("message", async (msg) => {
-  try {
-    if (!msg.text) return;
-    const chatId = msg.chat.id;
-    const text = msg.text.trim();
-    log(`Received message from ${msg.from.username || msg.from.id}: ${text}`);
-
-    // --- /closeall ---
-    if (String(msg.from.id) === String(ADMIN_ID) && text.toLowerCase().startsWith("/closeall")) {
-      const parts = text.split(" ");
-      const symbolArg = parts[1] ? parts[1].toUpperCase() : null;
-      if (!symbolArg)
-        return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
-      await bot.sendMessage(chatId, `📢 *ADMIN CLOSEALL INITIATED*\nTarget: ${symbolArg}`, { parse_mode: "Markdown" });
-      const clients = createBinanceClients();
-      for (const { userId, client } of clients) {
-        try {
-          const positions = await client.futuresPositionRisk();
-          for (const p of positions) {
-            const amt = parseFloat(p.positionAmt);
-            if (amt === 0) continue;
-            if (symbolArg !== "ALL" && p.symbol !== symbolArg) continue;
-            const qty = Math.abs(amt);
-            if (amt > 0) await client.futuresMarketSell(p.symbol, qty);
-            else await client.futuresMarketBuy(p.symbol, qty);
-            if (activePositions[p.symbol]) {
-              delete activePositions[p.symbol][userId];
-              if (Object.keys(activePositions[p.symbol]).length === 0) delete activePositions[p.symbol];
-            }
-            await sendMessage(`🔴 *MANUAL CLOSE EXECUTED*\nUser: ${userId}\nSymbol: ${p.symbol}\nQty: ${qty}`);
-          }
-        } catch (err) {
-          log(`❌ Closeall error for user ${userId}: ${err?.message || err}`);
-          await sendMessage(`❌ Closeall failed for User ${userId}`);
-        }
-      }
-      return bot.sendMessage(chatId, "✅ *Manual Close-All Completed*", { parse_mode: "Markdown" });
-    }
-
-    // --- CID Signals ---
-    if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
-
-    const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
-    if (!match) return;
-    const symbol = match[1].toUpperCase();
-    const direction = match[2].toUpperCase();
-
-    if (pendingSignals[symbol]) return; // skip if already pending
-    pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
-
-    await sendMessage(
-      `📢 *CID SIGNAL DETECTED*\nSymbol: *${symbol}*\nDirection: *${direction}*\n⏱ Expires in ${Math.round(
-        SIGNAL_EXPIRY_MS / 60000
-      )} minutes\nChecking 15m Volume...`
-    );
-
-    // --- CID volume check (separate from PDH/PDL) ---
-    const timer = setInterval(async () => {
-      const sig = pendingSignals[symbol];
-      if (!sig) {
-        clearInterval(timer);
-        return;
-      }
-      if (Date.now() > sig.expiresAt) {
-        clearInterval(timer);
-        delete pendingSignals[symbol];
-        await sendMessage(`⌛ CID signal expired for *${symbol}*`);
-        return;
-      }
-
-      const volumeOk = await volumeCheck15m(symbol);
-      if (!volumeOk) {
-        await sendMessage(`⏳ Volume (15m) NOT passed for *${symbol}*`);
-        return;
-      }
-
-      clearInterval(timer);
-      delete pendingSignals[symbol];
-      await sendMessage(`✅ Volume confirmed for *${symbol}* — Executing *CID Trade*...`);
-      await executeMarketOrderForAllUsers(symbol, direction);
-    }, SIGNAL_CHECK_INTERVAL_MS);
-  } catch (err) {
-    log(`❌ bot.on message error: ${err?.message || err}`);
-  }
-});
-
-// =========================
-// PDH / PDL MONITORING LOGIC
+// PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
 // =========================
 
-// --- Fetch directional volume for PDH/PDL trades ---
+// --- Directional Volume + Wick Spike Check for PDH/PDL ---
 async function directionalVolumeCheck(symbol, direction) {
   const klines = await fetchFuturesKlines(symbol, "15m", 11);
   if (!klines || klines.length < 11) return false;
 
-  // last candle
   const last = klines[klines.length - 1];
+  const prevVolumes = klines.slice(0, -1).map((k) => k.volume);
+  const avgVolume = prevVolumes.reduce((a, b) => a + b, 0) / prevVolumes.length;
 
-  const volumes = klines.slice(0, -1).map((k) => k.volume);
-  const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+  // Directional volume: bullish = close > open, bearish = close < open
+  let lastDirectionalVolume = 0;
+  if (direction === "BUY") lastDirectionalVolume = last.close > last.open ? last.volume : 0;
+  if (direction === "SELL") lastDirectionalVolume = last.close < last.open ? last.volume : 0;
 
-  // directional volume: bullish = close > open, bearish = close < open
-  const lastDirectionalVolume =
-    direction === "BUY" ? (last.close > last.open ? last.volume : 0) : last.close < last.open ? last.volume : 0;
+  // Wick spike detection (buy/sell spikes)
+  const lowerWick = last.open > last.close ? last.low - last.close : last.low - last.open;
+  const upperWick = last.close > last.open ? last.high - last.close : last.high - last.open;
+  const candleBody = Math.abs(last.close - last.open);
 
-  // execute only if directional volume > 1.5x average
-  return lastDirectionalVolume >= 1.5 * avgVolume;
+  // Buying spike: lower wick significant + high volume
+  const buyingSpike = direction === "BUY" && lowerWick > candleBody && last.volume >= 1.2 * avgVolume;
+  // Selling spike: upper wick significant + high volume
+  const sellingSpike = direction === "SELL" && upperWick > candleBody && last.volume >= 1.2 * avgVolume;
+
+  return lastDirectionalVolume >= 1.2 * avgVolume || buyingSpike || sellingSpike;
 }
 
 // --- Check PDH/PDL condition ---
@@ -500,15 +334,13 @@ async function monitorPdhPdl() {
     const monitor = pdhPdlMonitors[symbol];
     if (!monitor.active || monitor.triggered) continue; // skip if already triggered
 
-    // --- Directional volume check ---
     const direction = monitor.type === "PDH" ? "SELL" : "BUY";
     const volOk = await directionalVolumeCheck(symbol, direction);
     if (!volOk) {
-      log(`⏳ Directional volume not sufficient for ${symbol} (${direction})`);
+      log(`⏳ Directional/wick volume not sufficient for ${symbol} (${direction})`);
       continue;
     }
 
-    // --- Normal PDH/PDL check ---
     const conditionMet = await checkPdhPdl(symbol, monitor.type);
     if (!conditionMet) continue;
 
@@ -521,9 +353,8 @@ async function monitorPdhPdl() {
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 
 // =========================
-// TELEGRAM HANDLER - PART 2
+// TELEGRAM HANDLER - MONITOR COMMAND
 // =========================
-
 bot.on("message", async (msg) => {
   try {
     if (!msg.text) return;
@@ -545,7 +376,7 @@ bot.on("message", async (msg) => {
     pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
     pdhPdlState[symbol] = { brokePDH: false, brokePDL: false }; // initialize retest tracking
     await sendMessage(
-      `📡 Monitoring *${symbol}* for *${type}* condition with EMA3 (15m), directional volume filter, and retest bounce logic.`
+      `📡 Monitoring *${symbol}* for *${type}* condition with EMA3 (15m), directional/wick volume filter, and retest bounce logic.`
     );
   } catch (err) {
     log(`❌ bot.on /monitor error: ${err?.message || err}`);
@@ -569,8 +400,8 @@ bot.onText(/\/stopmonitor (.+)/, async (msg, match) => {
 // BOT COMMANDS SUMMARY
 // =========================
 //
-// /monitor SYMBOL PDH       → start monitoring a symbol for PDH Counter-Trend & Retest Bounce with directional volume
-// /monitor SYMBOL PDL       → start monitoring a symbol for PDL Counter-Trend & Retest Bounce with directional volume
+// /monitor SYMBOL PDH       → start monitoring a symbol for PDH Counter-Trend & Retest Bounce with directional/wick volume
+// /monitor SYMBOL PDL       → start monitoring a symbol for PDL Counter-Trend & Retest Bounce with directional/wick volume
 // /stopmonitor SYMBOL       → stop monitoring a symbol for PDH/PDL
 // /closeall SYMBOL          → admin closes all positions for that symbol
 // /closeall ALL             → admin closes all positions for all symbols
