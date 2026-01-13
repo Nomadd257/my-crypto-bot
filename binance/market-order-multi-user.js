@@ -298,8 +298,8 @@ bot.on("message", async (msg) => {
 // PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
 // =========================
 
-// --- Directional Volume + Wick Spike Check for PDH/PDL ---
-async function directionalVolumeCheck(symbol, direction) {
+// --- Liquidity Sweep + EMA Reclaim Check ---
+async function liquiditySweepCheck(symbol, direction) {
   const klines = await fetchFuturesKlines(symbol, "15m", 11);
   if (!klines || klines.length < 11) return false;
 
@@ -307,22 +307,26 @@ async function directionalVolumeCheck(symbol, direction) {
   const prevVolumes = klines.slice(0, -1).map((k) => k.volume);
   const avgVolume = prevVolumes.reduce((a, b) => a + b, 0) / prevVolumes.length;
 
-  // Directional volume: bullish = close > open, bearish = close < open
-  let lastDirectionalVolume = 0;
-  if (direction === "BUY") lastDirectionalVolume = last.close > last.open ? last.volume : 0;
-  if (direction === "SELL") lastDirectionalVolume = last.close < last.open ? last.volume : 0;
+  const ema = await ema3_15m(symbol);
+  if (!ema) return false;
 
-  // Wick spike detection (buy/sell spikes)
+  const candleBody = Math.abs(last.close - last.open);
   const lowerWick = last.open > last.close ? last.low - last.close : last.low - last.open;
   const upperWick = last.close > last.open ? last.high - last.close : last.high - last.open;
-  const candleBody = Math.abs(last.close - last.open);
 
-  // Buying spike: lower wick significant + high volume
-  const buyingSpike = direction === "BUY" && lowerWick > candleBody && last.volume >= 1.2 * avgVolume;
-  // Selling spike: upper wick significant + high volume
-  const sellingSpike = direction === "SELL" && upperWick > candleBody && last.volume >= 1.2 * avgVolume;
+  if (direction === "BUY") {
+    // Liquidity sweep down + reclaim above EMA
+    const sweepDown = lowerWick > candleBody && last.close > ema;
+    const volumeOk = last.volume >= 1.2 * avgVolume;
+    return sweepDown && volumeOk;
+  } else if (direction === "SELL") {
+    // Liquidity sweep up + reclaim below EMA
+    const sweepUp = upperWick > candleBody && last.close < ema;
+    const volumeOk = last.volume >= 1.2 * avgVolume;
+    return sweepUp && volumeOk;
+  }
 
-  return lastDirectionalVolume >= 1.2 * avgVolume || buyingSpike || sellingSpike;
+  return false;
 }
 
 // --- Check PDH/PDL condition ---
@@ -342,11 +346,9 @@ async function checkPdhPdl(symbol, type) {
 
   if (type === "PDH") {
     const zone = 0.002; // 0.2%
-
     return currentPrice <= prevHigh && currentPrice >= prevHigh * (1 - zone) && currentPrice < ema;
   } else if (type === "PDL") {
     const zone = 0.002; // 0.2%
-
     return currentPrice >= prevLow && currentPrice <= prevLow * (1 + zone) && currentPrice > ema;
   }
   return false;
@@ -393,9 +395,9 @@ async function monitorPdhPdl() {
     if (!monitor.active || monitor.triggered) continue; // skip if already triggered
 
     const direction = monitor.type === "PDH" ? "SELL" : "BUY";
-    const volOk = await directionalVolumeCheck(symbol, direction);
-    if (!volOk) {
-      log(`⏳ Directional/wick volume not sufficient for ${symbol} (${direction})`);
+    const sweepOk = await liquiditySweepCheck(symbol, direction);
+    if (!sweepOk) {
+      log(`⏳ Liquidity sweep + EMA reclaim not met for ${symbol} (${direction})`);
       continue;
     }
 
@@ -434,7 +436,7 @@ bot.on("message", async (msg) => {
     pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
     pdhPdlState[symbol] = { brokePDH: false, brokePDL: false }; // initialize retest tracking
     await sendMessage(
-      `📡 Monitoring *${symbol}* for *${type}* condition with EMA3 (15m), directional/wick volume filter, and retest bounce logic.`
+      `📡 Monitoring *${symbol}* for *${type}* condition with EMA3 (15m), liquidity sweep + EMA reclaim, and retest bounce logic.`
     );
   } catch (err) {
     log(`❌ bot.on /monitor error: ${err?.message || err}`);
@@ -458,8 +460,8 @@ bot.onText(/\/stopmonitor (.+)/, async (msg, match) => {
 // BOT COMMANDS SUMMARY
 // =========================
 //
-// /monitor SYMBOL PDH       → start monitoring a symbol for PDH Counter-Trend & Retest Bounce with directional/wick volume
-// /monitor SYMBOL PDL       → start monitoring a symbol for PDL Counter-Trend & Retest Bounce with directional/wick volume
+// /monitor SYMBOL PDH       → start monitoring a symbol for PDH Counter-Trend & Retest Bounce with liquidity sweep + EMA reclaim
+// /monitor SYMBOL PDL       → start monitoring a symbol for PDL Counter-Trend & Retest Bounce with liquidity sweep + EMA reclaim
 // /stopmonitor SYMBOL       → stop monitoring a symbol for PDH/PDL
 // /closeall SYMBOL          → admin closes all positions for that symbol
 // /closeall ALL             → admin closes all positions for all symbols
