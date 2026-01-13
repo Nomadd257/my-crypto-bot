@@ -241,6 +241,60 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 }
 
 // =========================
+// ADMIN /closeall COMMAND
+// =========================
+bot.on("message", async (msg) => {
+  try {
+    if (!msg.text) return;
+
+    const text = msg.text.trim();
+    const chatId = msg.chat.id;
+
+    if (String(msg.from.id) !== String(ADMIN_ID)) return;
+    if (!text.toLowerCase().startsWith("/closeall")) return;
+
+    const parts = text.split(" ");
+    const target = parts[1] ? parts[1].toUpperCase() : null;
+
+    if (!target) {
+      return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL");
+    }
+
+    await sendMessage(`📢 *ADMIN CLOSE-ALL STARTED*\nTarget: *${target}*`);
+
+    const clients = createBinanceClients();
+
+    for (const { userId, client } of clients) {
+      try {
+        const positions = await client.futuresPositionRisk();
+
+        for (const p of positions) {
+          const amt = parseFloat(p.positionAmt);
+          if (amt === 0) continue;
+          if (target !== "ALL" && p.symbol !== target) continue;
+
+          const qty = Math.abs(amt);
+          if (amt > 0) await client.futuresMarketSell(p.symbol, qty);
+          else await client.futuresMarketBuy(p.symbol, qty);
+
+          if (activePositions[p.symbol]) {
+            delete activePositions[p.symbol][userId];
+          }
+
+          await sendMessage(`🔴 *FORCED CLOSE*\nUser: ${userId}\nSymbol: ${p.symbol}\nQty: ${qty}`);
+        }
+      } catch (err) {
+        log(`❌ closeall error for ${userId}: ${err.message}`);
+      }
+    }
+
+    await bot.sendMessage(chatId, "✅ *Close-all completed*");
+  } catch (err) {
+    log(`❌ /closeall handler error: ${err.message}`);
+  }
+});
+
+// =========================
 // PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
 // =========================
 
@@ -287,9 +341,13 @@ async function checkPdhPdl(symbol, type) {
   if (!ema) return false;
 
   if (type === "PDH") {
-    return currentPrice <= prevHigh && currentPrice < ema;
+    const zone = 0.002; // 0.2%
+
+    return currentPrice <= prevHigh && currentPrice >= prevHigh * (1 - zone) && currentPrice < ema;
   } else if (type === "PDL") {
-    return currentPrice >= prevLow && currentPrice > ema;
+    const zone = 0.002; // 0.2%
+
+    return currentPrice >= prevLow && currentPrice <= prevLow * (1 + zone) && currentPrice > ema;
   }
   return false;
 }
