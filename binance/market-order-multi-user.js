@@ -535,37 +535,49 @@ setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 // TELEGRAM HANDLER - /monitor & /stopmonitor
 // =========================
 bot.on("message", async (msg) => {
-  try {
-    if (!msg.text) return;
-    const chatId = msg.chat.id;
-    const text = msg.text.trim();
-    if (!text.startsWith("/monitor")) return;
+  if (!msg.text) return;
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
 
-    const parts = text.split(" ");
-    if (parts.length !== 3) {
-      return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
-    }
+  // Only admin can trigger
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
 
-    const symbol = parts[1].toUpperCase();
-    const type = parts[2].toUpperCase();
-    if (type !== "PDH" && type !== "PDL") {
-      return bot.sendMessage(chatId, "❌ Type must be PDH or PDL", { parse_mode: "Markdown" });
-    }
+  if (!text.toLowerCase().startsWith("/monitor")) return;
 
-    pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
-    pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
-    await sendMessage(
-      `📡 Monitoring *${symbol}* for *${type}* condition with Liquidity Sweep + EMA reclaim + Aggression`
-    );
-  } catch (err) {
-    log(`❌ bot.on /monitor error: ${err?.message || err}`);
+  const parts = text.split(" ");
+  if (parts.length !== 3) {
+    return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
   }
+
+  const symbol = parts[1].toUpperCase();
+  const type = parts[2].toUpperCase();
+  if (type !== "PDH" && type !== "PDL") {
+    return bot.sendMessage(chatId, "❌ Type must be PDH or PDL", { parse_mode: "Markdown" });
+  }
+
+  pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
+  pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
+
+  await sendMessage(
+    `📡 Monitoring *${symbol}* for *${type}* condition with Liquidity Sweep + EMA reclaim + Aggression`
+  );
 });
 
 // --- Optional manual stop ---
-bot.onText(/\/stopmonitor (.+)/, async (msg, match) => {
+bot.on("message", async (msg) => {
+  if (!msg.text) return;
   const chatId = msg.chat.id;
-  const symbol = match[1].toUpperCase();
+  const text = msg.text.trim();
+
+  // Only admin can trigger
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+
+  if (!text.toLowerCase().startsWith("/stopmonitor")) return;
+
+  const parts = text.split(" ");
+  const symbol = parts[1]?.toUpperCase();
+  if (!symbol) return bot.sendMessage(chatId, "❌ Usage:\n/stopmonitor SYMBOL", { parse_mode: "Markdown" });
+
   if (pdhPdlMonitors[symbol]) {
     delete pdhPdlMonitors[symbol];
     delete pdhPdlState[symbol];
