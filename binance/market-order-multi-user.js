@@ -424,31 +424,26 @@ async function aggressionCheck(symbol) {
     let sellVolume = 0;
 
     for (const t of trades) {
-      // 'isBuyerMaker' === true → maker is buyer, so aggressive sell
+      // isBuyerMaker === true → aggressive sell
       if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
       else buyVolume += parseFloat(t.qty);
     }
 
-    const totalVolume = buyVolume + sellVolume;
-    if (totalVolume === 0) return false;
+    const total = buyVolume + sellVolume;
+    if (!total) return false;
 
-    const buyAggression = buyVolume / totalVolume;
-    const sellAggression = sellVolume / totalVolume;
-
-    // Trigger if either side is dominant (>60%)
-    return buyAggression >= 0.6 || sellAggression >= 0.6;
+    return buyVolume / total >= 0.6 || sellVolume / total >= 0.6;
   } catch (err) {
     log(`❌ aggressionCheck error for ${symbol}: ${err?.message || err}`);
     return false;
   }
 }
 
-// --- EMA reclaim 15m check ---
+// --- EMA reclaim 15m (EMA-3 approximation) ---
 async function ema3_15m(symbol) {
   const klines = await fetchFuturesKlines(symbol, "15m", 3);
   if (!klines || klines.length < 3) return null;
-  const sumClose = klines.reduce((acc, k) => acc + k.close, 0);
-  return sumClose / 3;
+  return klines.reduce((s, k) => s + k.close, 0) / 3;
 }
 
 // --- Liquidity Sweep + EMA Reclaim + Aggression ---
@@ -465,25 +460,28 @@ async function liquidityEmaAggressionCheck(symbol, direction) {
   return true;
 }
 
-// --- Check PDH/PDL condition ---
+// --- Check PDH / PDL retest zone ---
 async function checkPdhPdl(symbol, type) {
-  const klines = await fetchFuturesKlines(symbol, "1d", 2);
-  if (!klines || klines.length < 2) return false;
+  const d = await fetchFuturesKlines(symbol, "1d", 2);
+  if (!d || d.length < 2) return false;
 
-  const prevHigh = klines[0].high;
-  const prevLow = klines[0].low;
+  const prevHigh = d[0].high;
+  const prevLow = d[0].low;
 
-  const markPriceK = await fetchFuturesKlines(symbol, "1m", 1);
-  if (!markPriceK || !markPriceK.length) return false;
-  const currentPrice = markPriceK[0].close;
+  const m = await fetchFuturesKlines(symbol, "1m", 1);
+  if (!m || !m.length) return false;
 
-  const zone = RETEST_ZONE_PCT; // use global 0.2% by default
-  if (type === "PDH") return currentPrice <= prevHigh && currentPrice >= prevHigh * (1 - zone);
-  else if (type === "PDL") return currentPrice >= prevLow && currentPrice <= prevLow * (1 + zone);
+  const price = m[0].close;
+  const zone = RETEST_ZONE_PCT;
+
+  if (type === "PDH") return price <= prevHigh && price >= prevHigh * (1 - zone);
+
+  if (type === "PDL") return price >= prevLow && price <= prevLow * (1 + zone);
+
   return false;
 }
 
-// --- Monitor PDH/PDL ---
+// --- Monitor PDH / PDL ---
 async function monitorPdhPdl() {
   for (const symbol of Object.keys(pdhPdlMonitors)) {
     const monitor = pdhPdlMonitors[symbol];
@@ -492,63 +490,60 @@ async function monitorPdhPdl() {
     const direction = monitor.type === "PDH" ? "SELL" : "BUY";
 
     const valid = await liquidityEmaAggressionCheck(symbol, direction);
-    if (!valid) {
-      log(`⏳ Liquidity/EMA/Aggression not met for ${symbol} (${direction})`);
-      continue;
-    }
+    if (!valid) continue;
 
-    const conditionMet = await checkPdhPdl(symbol, monitor.type);
-    if (!conditionMet) continue;
+    const zoneOk = await checkPdhPdl(symbol, monitor.type);
+    if (!zoneOk) continue;
 
-    // Execute trade
-    await sendMessage(`📢 PDH/PDL Counter-Trend Triggered for *${symbol}* — Executing ${direction} trade!`);
+    await sendMessage(
+      `📢 *PDH/PDL Triggered*\n` +
+        `Symbol: *${symbol}*\n` +
+        `Action: *${direction}*\n` +
+        `Conditions: Liquidity Sweep + EMA reclaim + Aggression`
+    );
+
     await executeMarketOrderForAllUsers(symbol, direction);
-
     monitor.triggered = true;
 
-    // Schedule 30-min updates while price remains near PDH/PDL
-    const updateInterval = setInterval(async () => {
+    // --- 30-min updates while price remains near PDH/PDL ---
+    const interval = setInterval(async () => {
       const stillNear = await checkPdhPdl(symbol, monitor.type);
-      if (!stillNear) {
-        clearInterval(updateInterval);
-        return;
-      }
+      if (!stillNear) return clearInterval(interval);
 
-      // Calculate total volume and trade amount over last 30 mins
-      const klines1m = await fetchFuturesKlines(symbol, "1m", 30);
-      if (!klines1m) return;
-      const totalVolume = klines1m.reduce((sum, k) => sum + k.volume, 0);
-      const markPrice = klines1m[klines1m.length - 1].close;
-      const tradeAmount = totalVolume * markPrice;
+      const k = await fetchFuturesKlines(symbol, "1m", 30);
+      if (!k) return;
+
+      const vol = k.reduce((s, c) => s + c.volume, 0);
+      const price = k[k.length - 1].close;
 
       await sendMessage(
-        `ℹ️ Update: *${symbol}* near ${monitor.type}\nVolume(last 30m): ${totalVolume.toFixed(
-          2
-        )}\nTrade Amount: $${tradeAmount.toFixed(2)}`
+        `ℹ️ *${symbol}* near ${monitor.type}\n` +
+          `Volume (30m): ${vol.toFixed(2)}\n` +
+          `Trade Amount: $${(vol * price).toFixed(2)}`
       );
     }, 30 * 60 * 1000);
   }
 }
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 
-// =========================
-// TELEGRAM HANDLER - /monitor & /stopmonitor (FIXED)
-// =========================
+// =====================================================
+// TELEGRAM COMMANDS — /monitor & /stopmonitor (FINAL)
+// =====================================================
 bot.on("message", async (msg) => {
   if (!msg.text) return;
 
   const chatId = msg.chat.id;
-  const text = msg.text.trim().toLowerCase();
+  const text = msg.text.trim();
+  const lower = text.toLowerCase();
 
-  // Admin only
+  // ADMIN ONLY
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
 
-  // -----------------
+  // -------------------------
   // /monitor SYMBOL PDH|PDL
-  // -----------------
-  if (text.startsWith("/monitor")) {
+  // -------------------------
+  if (lower.startsWith("/monitor")) {
     const parts = text.split(/\s+/);
-
     if (parts.length !== 3) {
       return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
     }
@@ -556,20 +551,22 @@ bot.on("message", async (msg) => {
     const symbol = parts[1].toUpperCase();
     const type = parts[2].toUpperCase();
 
-    if (type !== "PDH" && type !== "PDL") {
-      return bot.sendMessage(chatId, "❌ Type must be PDH or PDL", { parse_mode: "Markdown" });
+    if (!["PDH", "PDL"].includes(type)) {
+      return bot.sendMessage(chatId, "❌ Type must be PDH or PDL");
     }
 
     pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
     pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
 
-    return sendMessage(`📡 Monitoring *${symbol}* for *${type}* condition`);
+    return sendMessage(
+      `📡 Monitoring *${symbol}* for *${type}* condition ` + `with Liquidity Sweep + EMA reclaim + Aggression`
+    );
   }
 
-  // -----------------
+  // -------------------------
   // /stopmonitor SYMBOL
-  // -----------------
-  if (text.startsWith("/stopmonitor")) {
+  // -------------------------
+  if (lower.startsWith("/stopmonitor")) {
     const parts = text.split(/\s+/);
     const symbol = parts[1]?.toUpperCase();
 
