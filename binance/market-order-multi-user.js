@@ -47,18 +47,20 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// --- Load Users ---
+// --- Utility: load users ---
 function loadUsers() {
   try {
     if (!fs.existsSync(USERS_FILE)) return [];
     const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
     if (!raw) return [];
     const parsed = JSON.parse(raw);
+
     if (Array.isArray(parsed)) {
       return parsed
         .filter((u) => u && u.active && u.apiKey && u.apiSecret)
         .map((u) => ({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret }));
     }
+
     const users = [];
     for (const [key, val] of Object.entries(parsed)) {
       if (val && val.active && val.apiKey && val.apiSecret) {
@@ -72,22 +74,24 @@ function loadUsers() {
   }
 }
 
-// --- Create Binance clients ---
+// --- Create Binance clients for all users ---
 function createBinanceClients() {
   const userList = loadUsers();
-  const clients = [];
   userClients = {};
   for (const u of userList) {
     try {
       const clientInstance = new Binance();
-      clientInstance.options({ APIKEY: u.apiKey, APISECRET: u.apiSecret, useServerTime: true, recvWindow: 60000 });
-      clients.push({ userId: u.id, client: clientInstance });
+      clientInstance.options({
+        APIKEY: u.apiKey,
+        APISECRET: u.apiSecret,
+        useServerTime: true,
+        recvWindow: 60000,
+      });
       userClients[u.id] = clientInstance;
     } catch (err) {
       log(`❌ createBinanceClients failed for ${u.id}: ${err?.message || err}`);
     }
   }
-  return clients;
 }
 
 // --- Telegram send helper ---
@@ -119,137 +123,86 @@ async function fetchFuturesKlines(symbol, interval = "1h", limit = 200) {
   }
 }
 
-// --- Volume Check 15m for CID signals ---
-async function volumeCheck15m(symbol) {
-  const klines = await fetchFuturesKlines(symbol, "15m", 11); // last 11 candles
-  if (!klines || klines.length < 11) return false;
-
-  const volumes = klines.map((k) => k.volume);
-  const lastVolume = volumes.pop();
-  const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-
-  return lastVolume > avgVolume;
-}
-
-// --- EMA3 15m ---
+// --- EMA calculation for reclaim ---
 async function ema3_15m(symbol) {
-  const klines = await fetchFuturesKlines(symbol, "15m", 3);
-  if (!klines || klines.length < 3) return null;
-  const sumClose = klines.reduce((acc, k) => acc + k.close, 0);
-  return sumClose / 3;
-}
-
-// --- Floor quantity ---
-function floorToStep(qty, step) {
-  const s = Number(step);
-  if (!s || isNaN(s) || s <= 0) return qty;
-  const factor = Math.round(1 / s);
-  const floored = Math.floor(qty * factor) / factor;
-  const prec = (s.toString().split(".")[1] || "").length;
-  return Number(floored.toFixed(prec));
-}
-
-// --- Execute Market Order for all users ---
-async function executeMarketOrderForAllUsers(symbol, direction) {
-  const clients = createBinanceClients();
-  if (!clients.length) {
-    await sendMessage(`⚠️ No active users found. Skipping execution.`);
-    return;
+  const candles = await fetchFuturesKlines(symbol, "15m", 50);
+  if (!candles || candles.length < 3) return null;
+  const closes = candles.map((c) => c.close);
+  let ema = closes.slice(0, 3).reduce((a, b) => a + b, 0) / 3;
+  const k = 2 / (3 + 1);
+  for (let i = 3; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
   }
+  return ema;
+}
 
-  for (const { userId, client } of clients) {
-    try {
-      try {
-        await client.futuresPositionSideDual(false);
-      } catch (e) {}
+// --- Volume check for CID (last 10 candles) ---
+async function checkVolume_15m(symbol) {
+  const candles = await fetchFuturesKlines(symbol, "15m", 11); // last 11 candles: 1 last closed + 10 previous
+  if (!candles || candles.length < 11) return false;
+
+  const lastClosed = candles[candles.length - 2]; // last fully closed candle
+  const previous10 = candles.slice(candles.length - 11, candles.length - 1); // previous 10 candles
+
+  const avgVol = previous10.reduce((sum, c) => sum + c.volume, 0) / previous10.length;
+  return lastClosed.volume >= avgVol;
+}
+
+// --- Execute Market Order for All Users ---
+async function executeMarketOrderForAllUsers(symbol, direction) {
+  try {
+    const clients = createBinanceClients();
+    if (!Object.keys(userClients).length) {
+      await sendMessage(`⚠️ No active users. Skipping ${symbol}`);
+      return;
+    }
+
+    for (const userId in userClients) {
+      const client = userClients[userId];
       try {
         await client.futuresLeverage(symbol, LEVERAGE);
-      } catch (e) {
-        log(`warn: set leverage failed ${userId} ${symbol}`);
-      }
-      const balances = await client.futuresBalance();
-      const usdtBal = Array.isArray(balances) ? balances.find((b) => b.asset === "USDT") : null;
-      const balAmount = usdtBal ? parseFloat(usdtBal.balance || usdtBal.availableBalance || usdtBal.balance) : 0;
-      if (!balAmount || balAmount <= 0) {
-        log(`Skipping ${userId}: USDT balance zero`);
-        continue;
-      }
+        const balances = await client.futuresBalance();
+        const usdtBal = balances.find((b) => b.asset === "USDT");
+        const balAmount = usdtBal ? parseFloat(usdtBal.balance) : 0;
+        if (!balAmount) continue;
 
-      let markPrice = null;
-      try {
-        const mp = await client.futuresMarkPrice(symbol);
-        if (mp && mp.markPrice) markPrice = parseFloat(mp.markPrice);
-      } catch (e) {}
-      if (!markPrice) {
-        const k = await fetchFuturesKlines(symbol, "1m", 1);
-        if (k && k.length) markPrice = k[0].close;
-      }
-      if (!markPrice) {
-        await sendMessage(`⚠️ Could not get market price for ${symbol} for ${userId}. Skipping.`);
-        continue;
-      }
+        const mark = await client.futuresMarkPrice(symbol);
+        const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
+        if (!markPrice) continue;
 
-      const tradeValue = balAmount * TRADE_PERCENT;
-      const rawQty = (tradeValue * LEVERAGE) / markPrice;
+        const tradeValue = balAmount * TRADE_PERCENT;
+        const rawQty = (tradeValue * LEVERAGE) / markPrice;
+        const qty = Math.max(parseFloat(rawQty.toFixed(6)), 0.001); // safe step
 
-      let lotStep = 0.001;
-      try {
-        const info = await client.futuresExchangeInfo();
-        if (info && info.symbols) {
-          const sym = info.symbols.find((s) => s.symbol === symbol);
-          if (sym && Array.isArray(sym.filters)) {
-            const lot = sym.filters.find((f) => f.filterType === "LOT_SIZE");
-            if (lot && lot.stepSize) lotStep = parseFloat(lot.stepSize);
-          }
-        }
-      } catch (e) {
-        log(`warn: futuresExchangeInfo failed ${userId} ${symbol}`);
-      }
-      let qty = floorToStep(rawQty, lotStep);
-      if (!qty || qty <= 0) {
-        log(`Computed qty <=0 for ${userId} ${symbol}`);
-        continue;
-      }
-
-      const side = direction === "BULLISH" || direction === "BUY" ? "BUY" : "SELL";
-      try {
+        const side = direction === "BULLISH" ? "BUY" : "SELL";
         if (side === "BUY") await client.futuresMarketBuy(symbol, qty);
         else await client.futuresMarketSell(symbol, qty);
-      } catch (e) {
-        try {
-          if (side === "BUY") await client.futuresMarketOrder(symbol, "BUY", qty);
-          else await client.futuresMarketOrder(symbol, "SELL", qty);
-        } catch (e2) {
-          log(`❌ Order failed ${userId} ${symbol}`);
-          await sendMessage(`❌ Unable to place order for ${userId} on ${symbol}`);
-          continue;
-        }
-      }
 
-      await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-      if (!activePositions[symbol]) activePositions[symbol] = {};
-      activePositions[symbol][userId] = {
-        side,
-        entryPrice: markPrice,
-        qty,
-        openedAt: Date.now(),
-        trailingStop: null,
-        highest: markPrice,
-        lowest: markPrice,
-      };
-    } catch (err) {
-      log(`❌ executeMarketOrderForAllUsers inner error ${userId}: ${err?.message || err}`);
+        await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+        if (!activePositions[symbol]) activePositions[symbol] = {};
+        activePositions[symbol][userId] = {
+          side,
+          entryPrice: markPrice,
+          qty,
+          openedAt: Date.now(),
+          trailingStop: null,
+          highest: markPrice,
+          lowest: markPrice,
+        };
+      } catch (err) {
+        log(`❌ executeMarketOrderForAllUsers error for ${userId} ${symbol}: ${err?.message || err}`);
+      }
     }
+  } catch (err) {
+    log(`❌ executeMarketOrderForAllUsers outer error: ${err?.message || err}`);
   }
 }
 
-// --- Monitor positions & trailing stops ---
+// --- Monitor Positions (FULL: TP / SL / Trailing Stop) ---
 async function monitorPositions() {
-  const clients = createBinanceClients();
-  for (const symbol of Object.keys(activePositions)) {
-    for (const userId of Object.keys(activePositions[symbol])) {
-      const pos = activePositions[symbol][userId];
-      const client = userClients[userId]; // using map
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
       if (!client) {
         delete activePositions[symbol][userId];
         continue;
@@ -263,22 +216,14 @@ async function monitorPositions() {
           continue;
         }
 
-        // get mark price
         let markPrice = null;
         try {
           const mp = await client.futuresMarkPrice(symbol);
-          if (mp && mp.markPrice) markPrice = parseFloat(mp.markPrice);
-          else if (mp && mp[0] && mp[0].markPrice) markPrice = parseFloat(mp[0].markPrice);
-        } catch (e) {
-          /* fallback */
-        }
-        if (!markPrice) {
-          const k = await fetchFuturesKlines(symbol, "1m", 1);
-          if (k && k.length) markPrice = k[0].close;
-        }
+          markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
+        } catch (e) {}
         if (!markPrice) continue;
 
-        // trailing stop logic
+        // --- Trailing Stop ---
         if (pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, markPrice);
           const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
@@ -303,7 +248,7 @@ async function monitorPositions() {
           }
         }
 
-        // TP / SL checks
+        // --- TP / SL ---
         const move =
           pos.side === "BUY"
             ? ((markPrice - pos.entryPrice) / pos.entryPrice) * 100
@@ -327,17 +272,102 @@ async function monitorPositions() {
           continue;
         }
       } catch (err) {
-        log(`monitorPositions error for ${userId} ${symbol}: ${err?.message || err}`);
+        log(`❌ monitorPositions error for ${userId} ${symbol}: ${err?.message || err}`);
       }
     }
   }
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// =========================
+// --- /closeall command ---
+bot.on("message", async (msg) => {
+  try {
+    if (!msg.text) return;
+    const chatId = msg.chat.id;
+    const text = msg.text.trim();
+    if (String(msg.from.id) !== String(ADMIN_ID)) return;
+
+    if (text.toLowerCase().startsWith("/closeall")) {
+      const parts = text.split(" ");
+      const symbolArg = parts[1]?.toUpperCase() || null;
+      if (!symbolArg) {
+        return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
+      }
+      bot.sendMessage(chatId, `📢 *Manual Close-All Triggered:* ${symbolArg}`, { parse_mode: "Markdown" });
+
+      for (const sym of Object.keys(activePositions)) {
+        for (const userId of Object.keys(activePositions[sym])) {
+          if (symbolArg !== "ALL" && symbolArg !== sym) continue;
+          const pos = activePositions[sym][userId];
+          const client = userClients[userId];
+          if (!client) continue;
+          const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
+          try {
+            if (closeSide === "BUY") await client.futuresMarketBuy(sym, pos.qty);
+            else await client.futuresMarketSell(sym, pos.qty);
+            delete activePositions[sym][userId];
+            await sendMessage(
+              `🔴 *MANUAL CLOSE:* User ${userId}\nSymbol: ${sym}\nQty: ${pos.qty}\nAction: ${closeSide}`
+            );
+          } catch (err) {
+            await sendMessage(`❌ Failed to close User ${userId} on ${sym}: ${err?.message || err}`);
+          }
+        }
+      }
+      return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
+    }
+
+    // --- CID signal parser ---
+    if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
+
+    const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
+    if (!match) return;
+
+    const symbol = match[1].toUpperCase();
+    const direction = match[2].toUpperCase();
+    if (pendingSignals[symbol]) return;
+
+    pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
+    await sendMessage(
+      `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
+        SIGNAL_EXPIRY_MS / 60000
+      )} minutes\nChecking EMA + Volume...`
+    );
+
+    const timer = setInterval(async () => {
+      const sig = pendingSignals[symbol];
+      if (!sig) {
+        clearInterval(timer);
+        return;
+      }
+      if (Date.now() > sig.expiresAt) {
+        clearInterval(timer);
+        delete pendingSignals[symbol];
+        await sendMessage(`⌛ CID signal expired for *${symbol}*`);
+        return;
+      }
+
+      const ema = await ema3_15m(symbol);
+      const volOk = await checkVolume_15m(symbol);
+      if (!ema) await sendMessage(`⏳ EMA reclaim not passed for *${symbol}*`);
+      if (!volOk) await sendMessage(`⏳ Volume (15m) not passed for *${symbol}*`);
+
+      if (ema && volOk) {
+        clearInterval(timer);
+        delete pendingSignals[symbol];
+        await sendMessage(`✅ All Checks Passed for *${symbol}* — Executing Market Orders...`);
+        await executeMarketOrderForAllUsers(symbol, direction);
+      }
+    }, SIGNAL_CHECK_INTERVAL_MS);
+  } catch (err) {
+    log(`❌ bot.on message error: ${err?.message || err}`);
+  }
+});
+
+// =====================================================
 // PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
 // Liquidity Sweep + EMA Reclaim + Aggression (buy/sell imbalance)
-// =========================
+// =====================================================
 
 // --- Aggression check based on buy/sell orders ---
 async function aggressionCheck(symbol) {
@@ -369,6 +399,14 @@ async function aggressionCheck(symbol) {
   }
 }
 
+// --- EMA reclaim 15m check ---
+async function ema3_15m(symbol) {
+  const klines = await fetchFuturesKlines(symbol, "15m", 3);
+  if (!klines || klines.length < 3) return null;
+  const sumClose = klines.reduce((acc, k) => acc + k.close, 0);
+  return sumClose / 3;
+}
+
 // --- Liquidity Sweep + EMA Reclaim + Aggression ---
 async function liquidityEmaAggressionCheck(symbol, direction) {
   const sweep = await liquiditySweepCheck(symbol, direction);
@@ -395,7 +433,7 @@ async function checkPdhPdl(symbol, type) {
   if (!markPriceK || !markPriceK.length) return false;
   const currentPrice = markPriceK[0].close;
 
-  const zone = 0.002; // 0.2% zone
+  const zone = RETEST_ZONE_PCT; // use global 0.2% by default
   if (type === "PDH") return currentPrice <= prevHigh && currentPrice >= prevHigh * (1 - zone);
   else if (type === "PDL") return currentPrice >= prevLow && currentPrice <= prevLow * (1 + zone);
   return false;
@@ -450,7 +488,7 @@ async function monitorPdhPdl() {
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 
 // =========================
-// TELEGRAM HANDLER - /monitor
+// TELEGRAM HANDLER - /monitor & /stopmonitor
 // =========================
 bot.on("message", async (msg) => {
   try {
