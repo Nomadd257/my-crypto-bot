@@ -148,50 +148,89 @@ async function checkVolumeImbalance(symbol) {
   }
 }
 
-// --- Execute market orders for all users ---
+// --- Execute Market Order for All Users (Robust + Debug) ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
-  createBinanceClients();
-  if (!Object.keys(userClients).length) {
-    await sendMessage(`⚠️ No active users for ${symbol}`);
-    return;
-  }
+  try {
+    // Create Binance clients
+    createBinanceClients();
 
-  for (const userId in userClients) {
-    const client = userClients[userId];
-    try {
-      await client.futuresLeverage(symbol, LEVERAGE);
-      const balances = await client.futuresBalance();
-      const usdtBal = balances.find((b) => b.asset === "USDT");
-      const balAmount = usdtBal ? parseFloat(usdtBal.balance) : 0;
-      if (!balAmount) continue;
-
-      const mark = await client.futuresMarkPrice(symbol);
-      const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
-      if (!markPrice) continue;
-
-      const tradeValue = balAmount * TRADE_PERCENT;
-      const qtyRaw = (tradeValue * LEVERAGE) / markPrice;
-      const qty = Math.max(parseFloat(qtyRaw.toFixed(6)), 0.001);
-
-      const side = direction.toUpperCase() === "BULLISH" ? "BUY" : "SELL";
-      if (side === "BUY") await client.futuresMarketBuy(symbol, qty);
-      else await client.futuresMarketSell(symbol, qty);
-
-      await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-
-      if (!activePositions[symbol]) activePositions[symbol] = {};
-      activePositions[symbol][userId] = {
-        side,
-        entryPrice: markPrice,
-        qty,
-        openedAt: Date.now(),
-        trailingStop: null,
-        highest: markPrice,
-        lowest: markPrice,
-      };
-    } catch (err) {
-      log(`❌ executeMarketOrderForAllUsers error for ${userId} ${symbol}: ${err?.message || err}`);
+    const users = Object.keys(userClients);
+    if (!users.length) {
+      await sendMessage(`⚠️ No active users found for ${symbol}`);
+      log("No Binance clients available.");
+      return;
     }
+
+    log(`Executing ${direction} orders for ${symbol} for users: ${users.join(", ")}`);
+
+    for (const userId of users) {
+      const client = userClients[userId];
+      if (!client) {
+        log(`❌ No client found for user ${userId}`);
+        continue;
+      }
+
+      try {
+        // Set leverage
+        await client.futuresLeverage(symbol, LEVERAGE);
+
+        // Get USDT balance
+        const balances = await client.futuresBalance();
+        const usdtBalObj = balances.find((b) => b.asset === "USDT");
+        const usdtBal = usdtBalObj ? parseFloat(usdtBalObj.balance) : 0;
+        if (usdtBal <= 0) {
+          log(`⚠️ User ${userId} has 0 USDT balance, skipping.`);
+          continue;
+        }
+
+        // Get current mark price
+        const mark = await client.futuresMarkPrice(symbol);
+        const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
+        if (!markPrice) {
+          log(`⚠️ Could not fetch mark price for ${symbol}, skipping user ${userId}`);
+          continue;
+        }
+
+        // Calculate trade quantity
+        const tradeValue = usdtBal * TRADE_PERCENT;
+        const rawQty = (tradeValue * LEVERAGE) / markPrice;
+        const qty = Math.max(parseFloat(rawQty.toFixed(6)), 0.001);
+
+        // Determine side
+        const side = direction.toUpperCase() === "BULLISH" ? "BUY" : "SELL";
+
+        log(`User ${userId} | Side: ${side} | Qty: ${qty} | MarkPrice: ${markPrice}`);
+
+        // Place market order
+        try {
+          if (side === "BUY") {
+            await client.futuresMarketBuy(symbol, qty);
+          } else {
+            await client.futuresMarketSell(symbol, qty);
+          }
+          await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+
+          // Track active position
+          if (!activePositions[symbol]) activePositions[symbol] = {};
+          activePositions[symbol][userId] = {
+            side,
+            entryPrice: markPrice,
+            qty,
+            openedAt: Date.now(),
+            trailingStop: null,
+            highest: markPrice,
+            lowest: markPrice,
+          };
+        } catch (orderErr) {
+          log(`❌ Order failed for User ${userId} on ${symbol}: ${orderErr?.message || orderErr}`);
+          await sendMessage(`❌ Order failed for User ${userId} on *${symbol}*: ${orderErr?.message || orderErr}`);
+        }
+      } catch (userErr) {
+        log(`❌ Error preparing trade for User ${userId} on ${symbol}: ${userErr?.message || userErr}`);
+      }
+    }
+  } catch (err) {
+    log(`❌ executeMarketOrderForAllUsers outer error: ${err?.message || err}`);
   }
 }
 
