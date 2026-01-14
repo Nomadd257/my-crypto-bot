@@ -30,37 +30,28 @@ const LEVERAGE = 20;
 const TP_PCT = 2;
 const SL_PCT = -1.5;
 const TRAILING_STOP_PCT = 2;
-const MONITOR_INTERVAL_MS = 5 * 1000;
-const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
-const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+const MONITOR_INTERVAL_MS = 5000;
+const SIGNAL_CHECK_INTERVAL_MS = 60000;
+const SIGNAL_EXPIRY_MS = 3600000; // 1 hour
 const RETEST_ZONE_PCT = 0.2; // 0.2% retest zone
 
 // --- In-memory ---
 let activePositions = {};
 let pendingSignals = {};
 let userClients = {};
-let pdhPdlMonitors = {};
-let pdhPdlState = {}; // Track brokePDH / brokePDL for retests
 
 // --- Logging ---
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// --- Utility: load users ---
+// --- Load users ---
 function loadUsers() {
   try {
     if (!fs.existsSync(USERS_FILE)) return [];
     const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-
-    if (Array.isArray(parsed)) {
-      return parsed
-        .filter((u) => u && u.active && u.apiKey && u.apiSecret)
-        .map((u) => ({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret }));
-    }
-
     const users = [];
     for (const [key, val] of Object.entries(parsed)) {
       if (val && val.active && val.apiKey && val.apiSecret) {
@@ -74,22 +65,17 @@ function loadUsers() {
   }
 }
 
-// --- Create Binance clients for all users ---
+// --- Create Binance clients ---
 function createBinanceClients() {
-  const userList = loadUsers();
+  const users = loadUsers();
   userClients = {};
-  for (const u of userList) {
+  for (const u of users) {
     try {
-      const clientInstance = new Binance();
-      clientInstance.options({
-        APIKEY: u.apiKey,
-        APISECRET: u.apiSecret,
-        useServerTime: true,
-        recvWindow: 60000,
-      });
-      userClients[u.id] = clientInstance;
+      const client = new Binance();
+      client.options({ APIKEY: u.apiKey, APISECRET: u.apiSecret, useServerTime: true, recvWindow: 60000 });
+      userClients[u.id] = client;
     } catch (err) {
-      log(`❌ createBinanceClients failed for ${u.id}: ${err?.message || err}`);
+      log(`❌ Binance client creation failed for ${u.id}: ${err?.message || err}`);
     }
   }
 }
@@ -108,8 +94,8 @@ async function sendMessage(msg) {
   }
 }
 
-// --- Fetch Binance Futures klines ---
-async function fetchFuturesKlines(symbol, interval = "1h", limit = 200) {
+// --- Fetch Futures klines ---
+async function fetchFuturesKlines(symbol, interval = "15m", limit = 50) {
   try {
     const res = await fetch(
       `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
@@ -123,82 +109,93 @@ async function fetchFuturesKlines(symbol, interval = "1h", limit = 200) {
   }
 }
 
-// --- EMA calculation for reclaim ---
+// --- EMA 3 close for reclaim ---
 async function ema3_15m(symbol) {
   const candles = await fetchFuturesKlines(symbol, "15m", 50);
   if (!candles || candles.length < 3) return null;
   const closes = candles.map((c) => c.close);
   let ema = closes.slice(0, 3).reduce((a, b) => a + b, 0) / 3;
   const k = 2 / (3 + 1);
-  for (let i = 3; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-  }
+  for (let i = 3; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
 }
 
-// --- Volume check for CID (last 10 candles) ---
-async function checkVolume_15m(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 11); // last 11 candles: 1 last closed + 10 previous
-  if (!candles || candles.length < 11) return false;
-
-  const lastClosed = candles[candles.length - 2]; // last fully closed candle
-  const previous10 = candles.slice(candles.length - 11, candles.length - 1); // previous 10 candles
-
-  const avgVol = previous10.reduce((sum, c) => sum + c.volume, 0) / previous10.length;
-  return lastClosed.volume >= avgVol;
-}
-
-// --- Execute Market Order for All Users ---
-async function executeMarketOrderForAllUsers(symbol, direction) {
+// --- Volume Imbalance Check (aggression) ---
+async function checkVolumeImbalance(symbol) {
   try {
-    const clients = createBinanceClients();
-    if (!Object.keys(userClients).length) {
-      await sendMessage(`⚠️ No active users. Skipping ${symbol}`);
-      return;
+    const tradesRes = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
+    if (!tradesRes.ok) return false;
+    const trades = await tradesRes.json();
+
+    let buyVolume = 0;
+    let sellVolume = 0;
+    for (const t of trades) {
+      if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
+      else buyVolume += parseFloat(t.qty);
     }
 
-    for (const userId in userClients) {
-      const client = userClients[userId];
-      try {
-        await client.futuresLeverage(symbol, LEVERAGE);
-        const balances = await client.futuresBalance();
-        const usdtBal = balances.find((b) => b.asset === "USDT");
-        const balAmount = usdtBal ? parseFloat(usdtBal.balance) : 0;
-        if (!balAmount) continue;
+    const totalVolume = buyVolume + sellVolume;
+    if (totalVolume === 0) return false;
 
-        const mark = await client.futuresMarkPrice(symbol);
-        const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
-        if (!markPrice) continue;
+    const buyAggression = buyVolume / totalVolume;
+    const sellAggression = sellVolume / totalVolume;
 
-        const tradeValue = balAmount * TRADE_PERCENT;
-        const rawQty = (tradeValue * LEVERAGE) / markPrice;
-        const qty = Math.max(parseFloat(rawQty.toFixed(6)), 0.001); // safe step
-
-        const side = direction === "BULLISH" ? "BUY" : "SELL";
-        if (side === "BUY") await client.futuresMarketBuy(symbol, qty);
-        else await client.futuresMarketSell(symbol, qty);
-
-        await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-        if (!activePositions[symbol]) activePositions[symbol] = {};
-        activePositions[symbol][userId] = {
-          side,
-          entryPrice: markPrice,
-          qty,
-          openedAt: Date.now(),
-          trailingStop: null,
-          highest: markPrice,
-          lowest: markPrice,
-        };
-      } catch (err) {
-        log(`❌ executeMarketOrderForAllUsers error for ${userId} ${symbol}: ${err?.message || err}`);
-      }
-    }
+    // Pass if either buy or sell aggression is >= 60%
+    return buyAggression >= 0.6 || sellAggression >= 0.6;
   } catch (err) {
-    log(`❌ executeMarketOrderForAllUsers outer error: ${err?.message || err}`);
+    log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message || err}`);
+    return false;
   }
 }
 
-// --- Monitor Positions (FULL: TP / SL / Trailing Stop) ---
+// --- Execute market orders for all users ---
+async function executeMarketOrderForAllUsers(symbol, direction) {
+  createBinanceClients();
+  if (!Object.keys(userClients).length) {
+    await sendMessage(`⚠️ No active users for ${symbol}`);
+    return;
+  }
+
+  for (const userId in userClients) {
+    const client = userClients[userId];
+    try {
+      await client.futuresLeverage(symbol, LEVERAGE);
+      const balances = await client.futuresBalance();
+      const usdtBal = balances.find((b) => b.asset === "USDT");
+      const balAmount = usdtBal ? parseFloat(usdtBal.balance) : 0;
+      if (!balAmount) continue;
+
+      const mark = await client.futuresMarkPrice(symbol);
+      const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
+      if (!markPrice) continue;
+
+      const tradeValue = balAmount * TRADE_PERCENT;
+      const qtyRaw = (tradeValue * LEVERAGE) / markPrice;
+      const qty = Math.max(parseFloat(qtyRaw.toFixed(6)), 0.001);
+
+      const side = direction.toUpperCase() === "BULLISH" ? "BUY" : "SELL";
+      if (side === "BUY") await client.futuresMarketBuy(symbol, qty);
+      else await client.futuresMarketSell(symbol, qty);
+
+      await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+
+      if (!activePositions[symbol]) activePositions[symbol] = {};
+      activePositions[symbol][userId] = {
+        side,
+        entryPrice: markPrice,
+        qty,
+        openedAt: Date.now(),
+        trailingStop: null,
+        highest: markPrice,
+        lowest: markPrice,
+      };
+    } catch (err) {
+      log(`❌ executeMarketOrderForAllUsers error for ${userId} ${symbol}: ${err?.message || err}`);
+    }
+  }
+}
+
+// --- Monitor Positions (TP / SL / Trailing Stop) ---
 async function monitorPositions() {
   for (const [symbol, users] of Object.entries(activePositions)) {
     for (const [userId, pos] of Object.entries(users)) {
@@ -207,6 +204,7 @@ async function monitorPositions() {
         delete activePositions[symbol][userId];
         continue;
       }
+
       try {
         const positions = await client.futuresPositionRisk();
         const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
@@ -216,14 +214,11 @@ async function monitorPositions() {
           continue;
         }
 
-        let markPrice = null;
-        try {
-          const mp = await client.futuresMarkPrice(symbol);
-          markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
-        } catch (e) {}
+        const mp = await client.futuresMarkPrice(symbol);
+        const markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
         if (!markPrice) continue;
 
-        // --- Trailing Stop ---
+        // Trailing Stop
         if (pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, markPrice);
           const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
@@ -248,7 +243,7 @@ async function monitorPositions() {
           }
         }
 
-        // --- TP / SL ---
+        // TP / SL
         const move =
           pos.side === "BUY"
             ? ((markPrice - pos.entryPrice) / pos.entryPrice) * 100
@@ -262,7 +257,6 @@ async function monitorPositions() {
           delete activePositions[symbol][userId];
           continue;
         }
-
         if (move <= SL_PCT) {
           const qty = Math.abs(positionAmt);
           await sendMessage(`🔻 STOP LOSS HIT for User ${userId} on *${symbol}* (${move.toFixed(2)}%)`);
@@ -281,89 +275,85 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
 // --- /closeall command ---
 bot.on("message", async (msg) => {
-  try {
-    if (!msg.text) return;
-    const chatId = msg.chat.id;
-    const text = msg.text.trim();
-    if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  if (!msg.text) return;
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
 
-    if (text.toLowerCase().startsWith("/closeall")) {
-      const parts = text.split(" ");
-      const symbolArg = parts[1]?.toUpperCase() || null;
-      if (!symbolArg) {
-        return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
-      }
-      bot.sendMessage(chatId, `📢 *Manual Close-All Triggered:* ${symbolArg}`, { parse_mode: "Markdown" });
+  const chatId = msg.chat.id;
+  const text = msg.text.trim().toLowerCase();
 
-      for (const sym of Object.keys(activePositions)) {
-        for (const userId of Object.keys(activePositions[sym])) {
-          if (symbolArg !== "ALL" && symbolArg !== sym) continue;
-          const pos = activePositions[sym][userId];
-          const client = userClients[userId];
-          if (!client) continue;
-          const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
-          try {
-            if (closeSide === "BUY") await client.futuresMarketBuy(sym, pos.qty);
-            else await client.futuresMarketSell(sym, pos.qty);
-            delete activePositions[sym][userId];
-            await sendMessage(
-              `🔴 *MANUAL CLOSE:* User ${userId}\nSymbol: ${sym}\nQty: ${pos.qty}\nAction: ${closeSide}`
-            );
-          } catch (err) {
-            await sendMessage(`❌ Failed to close User ${userId} on ${sym}: ${err?.message || err}`);
-          }
+  if (text.startsWith("/closeall")) {
+    const parts = text.split(" ");
+    const symArg = parts[1]?.toUpperCase() || null;
+    if (!symArg)
+      return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
+
+    bot.sendMessage(chatId, `📢 *Manual Close-All Triggered:* ${symArg}`, { parse_mode: "Markdown" });
+
+    for (const sym of Object.keys(activePositions)) {
+      for (const userId of Object.keys(activePositions[sym])) {
+        if (symArg !== "ALL" && symArg !== sym) continue;
+        const pos = activePositions[sym][userId];
+        const client = userClients[userId];
+        if (!client) continue;
+        const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
+        try {
+          if (closeSide === "BUY") await client.futuresMarketBuy(sym, pos.qty);
+          else await client.futuresMarketSell(sym, pos.qty);
+          delete activePositions[sym][userId];
+          await sendMessage(`🔴 *MANUAL CLOSE:* User ${userId}\nSymbol: ${sym}\nQty: ${pos.qty}\nAction: ${closeSide}`);
+        } catch (err) {
+          await sendMessage(`❌ Failed to close User ${userId} on ${sym}: ${err?.message || err}`);
         }
       }
-      return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
     }
-
-    // --- CID signal parser ---
-    if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
-
-    const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
-    if (!match) return;
-
-    const symbol = match[1].toUpperCase();
-    const direction = match[2].toUpperCase();
-    if (pendingSignals[symbol]) return;
-
-    pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
-    await sendMessage(
-      `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
-        SIGNAL_EXPIRY_MS / 60000
-      )} minutes\nChecking EMA + Volume...`
-    );
-
-    const timer = setInterval(async () => {
-      const sig = pendingSignals[symbol];
-      if (!sig) {
-        clearInterval(timer);
-        return;
-      }
-      if (Date.now() > sig.expiresAt) {
-        clearInterval(timer);
-        delete pendingSignals[symbol];
-        await sendMessage(`⌛ CID signal expired for *${symbol}*`);
-        return;
-      }
-
-      const ema = await ema3_15m(symbol);
-      const volOk = await checkVolume_15m(symbol);
-      if (!ema) await sendMessage(`⏳ EMA reclaim not passed for *${symbol}*`);
-      if (!volOk) await sendMessage(`⏳ Volume (15m) not passed for *${symbol}*`);
-
-      if (ema && volOk) {
-        clearInterval(timer);
-        delete pendingSignals[symbol];
-        await sendMessage(`✅ All Checks Passed for *${symbol}* — Executing Market Orders...`);
-        await executeMarketOrderForAllUsers(symbol, direction);
-      }
-    }, SIGNAL_CHECK_INTERVAL_MS);
-  } catch (err) {
-    log(`❌ bot.on message error: ${err?.message || err}`);
+    return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
   }
 });
 
+// --- CID signal parser ---
+bot.on("message", async (msg) => {
+  if (!msg.text) return;
+  const text = msg.text.trim();
+  if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
+
+  const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
+  if (!match) return;
+
+  const symbol = match[1].toUpperCase();
+  const direction = match[2].toUpperCase();
+
+  if (pendingSignals[symbol]) return;
+  pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
+  await sendMessage(
+    `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
+      SIGNAL_EXPIRY_MS / 60000
+    )} minutes\nChecking Volume Imbalance...`
+  );
+
+  const timer = setInterval(async () => {
+    const sig = pendingSignals[symbol];
+    if (!sig) {
+      clearInterval(timer);
+      return;
+    }
+    if (Date.now() > sig.expiresAt) {
+      clearInterval(timer);
+      delete pendingSignals[symbol];
+      await sendMessage(`⌛ CID signal expired for *${symbol}*`);
+      return;
+    }
+
+    const volOk = await checkVolumeImbalance(symbol);
+    if (!volOk) await sendMessage(`⏳ Volume Imbalance not passed for *${symbol}*`);
+
+    if (volOk) {
+      clearInterval(timer);
+      delete pendingSignals[symbol];
+      await sendMessage(`✅ Volume Imbalance Passed for *${symbol}* — Executing Market Orders...`);
+      await executeMarketOrderForAllUsers(symbol, direction);
+    }
+  }, SIGNAL_CHECK_INTERVAL_MS);
+});
 // =====================================================
 // PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
 // Liquidity Sweep + EMA Reclaim + Aggression (buy/sell imbalance)
