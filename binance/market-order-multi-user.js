@@ -532,57 +532,57 @@ async function monitorPdhPdl() {
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 
 // =========================
-// TELEGRAM HANDLER - /monitor & /stopmonitor
+// TELEGRAM HANDLER - /monitor & /stopmonitor (FIXED)
 // =========================
 bot.on("message", async (msg) => {
   if (!msg.text) return;
-  const chatId = msg.chat.id;
-  const text = msg.text.trim();
 
-  // Only admin can trigger
+  const chatId = msg.chat.id;
+  const text = msg.text.trim().toLowerCase();
+
+  // Admin only
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
 
-  if (!text.toLowerCase().startsWith("/monitor")) return;
+  // -----------------
+  // /monitor SYMBOL PDH|PDL
+  // -----------------
+  if (text.startsWith("/monitor")) {
+    const parts = text.split(/\s+/);
 
-  const parts = text.split(" ");
-  if (parts.length !== 3) {
-    return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
+    if (parts.length !== 3) {
+      return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
+    }
+
+    const symbol = parts[1].toUpperCase();
+    const type = parts[2].toUpperCase();
+
+    if (type !== "PDH" && type !== "PDL") {
+      return bot.sendMessage(chatId, "❌ Type must be PDH or PDL", { parse_mode: "Markdown" });
+    }
+
+    pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
+    pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
+
+    return sendMessage(`📡 Monitoring *${symbol}* for *${type}* condition`);
   }
 
-  const symbol = parts[1].toUpperCase();
-  const type = parts[2].toUpperCase();
-  if (type !== "PDH" && type !== "PDL") {
-    return bot.sendMessage(chatId, "❌ Type must be PDH or PDL", { parse_mode: "Markdown" });
-  }
+  // -----------------
+  // /stopmonitor SYMBOL
+  // -----------------
+  if (text.startsWith("/stopmonitor")) {
+    const parts = text.split(/\s+/);
+    const symbol = parts[1]?.toUpperCase();
 
-  pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
-  pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
+    if (!symbol) {
+      return bot.sendMessage(chatId, "❌ Usage:\n/stopmonitor SYMBOL", { parse_mode: "Markdown" });
+    }
 
-  await sendMessage(
-    `📡 Monitoring *${symbol}* for *${type}* condition with Liquidity Sweep + EMA reclaim + Aggression`
-  );
-});
-
-// --- Optional manual stop ---
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  const chatId = msg.chat.id;
-  const text = msg.text.trim();
-
-  // Only admin can trigger
-  if (String(msg.from.id) !== String(ADMIN_ID)) return;
-
-  if (!text.toLowerCase().startsWith("/stopmonitor")) return;
-
-  const parts = text.split(" ");
-  const symbol = parts[1]?.toUpperCase();
-  if (!symbol) return bot.sendMessage(chatId, "❌ Usage:\n/stopmonitor SYMBOL", { parse_mode: "Markdown" });
-
-  if (pdhPdlMonitors[symbol]) {
-    delete pdhPdlMonitors[symbol];
-    delete pdhPdlState[symbol];
-    await sendMessage(`🛑 Stopped monitoring *${symbol}* for PDH/PDL conditions.`);
-  } else {
-    await sendMessage(`ℹ️ No active monitor found for *${symbol}*.`);
+    if (pdhPdlMonitors[symbol]) {
+      delete pdhPdlMonitors[symbol];
+      delete pdhPdlState[symbol];
+      return sendMessage(`🛑 Stopped monitoring *${symbol}*`);
+    } else {
+      return sendMessage(`ℹ️ No active monitor found for *${symbol}*`);
+    }
   }
 });
