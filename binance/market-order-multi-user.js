@@ -45,19 +45,35 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// --- Load users ---
+// --- Load users from JSON ---
 function loadUsers() {
   try {
     if (!fs.existsSync(USERS_FILE)) return [];
     const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
     if (!raw) return [];
     const parsed = JSON.parse(raw);
+
     const users = [];
-    for (const [key, val] of Object.entries(parsed)) {
-      if (val && val.active && val.apiKey && val.apiSecret) {
-        users.push({ id: String(key), apiKey: val.apiKey, apiSecret: val.apiSecret });
+
+    // If parsed is an object with user IDs as keys
+    if (typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [key, val] of Object.entries(parsed)) {
+        if (val && val.active && val.apiKey && val.apiSecret) {
+          users.push({ id: key, apiKey: val.apiKey, apiSecret: val.apiSecret });
+        }
       }
     }
+
+    // Optional: if parsed is an array (legacy)
+    else if (Array.isArray(parsed)) {
+      parsed.forEach((u) => {
+        if (u && u.active && u.apiKey && u.apiSecret) {
+          // Use their actual id if present, otherwise skip
+          if (u.id) users.push({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret });
+        }
+      });
+    }
+
     return users;
   } catch (err) {
     log(`❌ loadUsers error: ${err?.message || err}`);
@@ -65,19 +81,25 @@ function loadUsers() {
   }
 }
 
-// --- Create Binance clients ---
+// --- Create Binance clients for all users ---
 function createBinanceClients() {
   const users = loadUsers();
   userClients = {};
   for (const u of users) {
     try {
       const client = new Binance();
-      client.options({ APIKEY: u.apiKey, APISECRET: u.apiSecret, useServerTime: true, recvWindow: 60000 });
-      userClients[u.id] = client;
+      client.options({
+        APIKEY: u.apiKey,
+        APISECRET: u.apiSecret,
+        useServerTime: true,
+        recvWindow: 60000,
+      });
+      userClients[u.id] = client; // <-- user ID stays correct
     } catch (err) {
       log(`❌ Binance client creation failed for ${u.id}: ${err?.message || err}`);
     }
   }
+  log(`✅ Binance clients created for users: ${Object.keys(userClients).join(", ")}`);
 }
 
 // --- Telegram send helper ---
@@ -120,32 +142,42 @@ async function ema3_15m(symbol) {
   return ema;
 }
 
-// --- Volume Imbalance Check (aggression) ---
-async function checkVolumeImbalance(symbol) {
-  try {
-    const tradesRes = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
-    if (!tradesRes.ok) return false;
-    const trades = await tradesRes.json();
+// --- Volume imbalance check (CID, last 3 candles + optional current) ---
+async function checkVolumeImbalanceCID(symbol) {
+  const candles = await fetchFuturesKlines(symbol, "15m", 4); // last 3 closed + 1 current
+  if (!candles || candles.length < 4) return false;
 
-    let buyVolume = 0;
-    let sellVolume = 0;
+  const lastClosedCandles = candles.slice(candles.length - 4, candles.length - 1); // last 3 closed
+  const currentCandle = candles[candles.length - 1]; // current forming candle
+
+  let buyVolume = 0;
+  let sellVolume = 0;
+
+  // Sum buy/sell volume for last 3 closed candles
+  for (const c of lastClosedCandles) {
+    const res = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
+    if (!res.ok) continue;
+    const trades = await res.json();
     for (const t of trades) {
-      if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
-      else buyVolume += parseFloat(t.qty);
+      if (t.isBuyerMaker) sellVolume += parseFloat(t.qty); // aggressive sell
+      else buyVolume += parseFloat(t.qty); // aggressive buy
     }
-
-    const totalVolume = buyVolume + sellVolume;
-    if (totalVolume === 0) return false;
-
-    const buyAggression = buyVolume / totalVolume;
-    const sellAggression = sellVolume / totalVolume;
-
-    // Pass if either buy or sell aggression is >= 60%
-    return buyAggression >= 0.6 || sellAggression >= 0.6;
-  } catch (err) {
-    log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message || err}`);
-    return false;
   }
+
+  // Optional: include current forming candle
+  for (const t of (await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`)).json()) {
+    if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
+    else buyVolume += parseFloat(t.qty);
+  }
+
+  const totalVolume = buyVolume + sellVolume;
+  if (totalVolume === 0) return false;
+
+  const buyAggression = buyVolume / totalVolume;
+  const sellAggression = sellVolume / totalVolume;
+
+  // Trigger if either side is dominant (>60%)
+  return { buyAggression, sellAggression };
 }
 
 // --- Execute Market Order for All Users (fixed precision) ---
