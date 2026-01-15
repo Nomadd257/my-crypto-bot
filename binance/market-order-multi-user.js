@@ -39,6 +39,8 @@ const RETEST_ZONE_PCT = 0.2; // 0.2% retest zone
 let activePositions = {};
 let pendingSignals = {};
 let userClients = {};
+let pdhPdlMonitors = {};
+let pdhPdlState = {};
 
 // --- Logging ---
 function log(msg) {
@@ -52,28 +54,20 @@ function loadUsers() {
     const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-
     const users = [];
-
-    // If parsed is an object with user IDs as keys
     if (typeof parsed === "object" && !Array.isArray(parsed)) {
       for (const [key, val] of Object.entries(parsed)) {
         if (val && val.active && val.apiKey && val.apiSecret) {
           users.push({ id: key, apiKey: val.apiKey, apiSecret: val.apiSecret });
         }
       }
-    }
-
-    // Optional: if parsed is an array (legacy)
-    else if (Array.isArray(parsed)) {
+    } else if (Array.isArray(parsed)) {
       parsed.forEach((u) => {
-        if (u && u.active && u.apiKey && u.apiSecret) {
-          // Use their actual id if present, otherwise skip
-          if (u.id) users.push({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret });
+        if (u && u.active && u.apiKey && u.apiSecret && u.id) {
+          users.push({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret });
         }
       });
     }
-
     return users;
   } catch (err) {
     log(`❌ loadUsers error: ${err?.message || err}`);
@@ -81,7 +75,7 @@ function loadUsers() {
   }
 }
 
-// --- Create Binance clients for all users ---
+// --- Create Binance clients ---
 function createBinanceClients() {
   const users = loadUsers();
   userClients = {};
@@ -94,7 +88,7 @@ function createBinanceClients() {
         useServerTime: true,
         recvWindow: 60000,
       });
-      userClients[u.id] = client; // <-- user ID stays correct
+      userClients[u.id] = client;
     } catch (err) {
       log(`❌ Binance client creation failed for ${u.id}: ${err?.message || err}`);
     }
@@ -107,12 +101,12 @@ async function sendMessage(msg) {
   try {
     await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" });
   } catch (e) {
-    log(`tg group send error: ${e?.message || e}`);
+    log(`tg group error: ${e?.message || e}`);
   }
   try {
     await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" });
   } catch (e) {
-    log(`tg admin send error: ${e?.message || e}`);
+    log(`tg admin error: ${e?.message || e}`);
   }
 }
 
@@ -131,56 +125,42 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 50) {
   }
 }
 
-// --- EMA 3 close for reclaim ---
+// --- EMA 3 close (simple) ---
 async function ema3_15m(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 50);
+  const candles = await fetchFuturesKlines(symbol, "15m", 3);
   if (!candles || candles.length < 3) return null;
-  const closes = candles.map((c) => c.close);
-  let ema = closes.slice(0, 3).reduce((a, b) => a + b, 0) / 3;
-  const k = 2 / (3 + 1);
-  for (let i = 3; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
-  return ema;
+  return candles.reduce((s, c) => s + c.close, 0) / 3;
 }
 
-// --- Volume imbalance check (CID, last 3 candles + optional current) ---
-async function checkVolumeImbalanceCID(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 4); // last 3 closed + 1 current
-  if (!candles || candles.length < 4) return false;
+// --- CID Volume Imbalance ---
+async function checkVolumeImbalance(symbol) {
+  const candles = await fetchFuturesKlines(symbol, "15m", 4);
+  if (!candles || candles.length < 4) return { passed: false, buyAggression: 0, sellAggression: 0 };
+  let buy = 0,
+    sell = 0;
 
-  const lastClosedCandles = candles.slice(candles.length - 4, candles.length - 1); // last 3 closed
-  const currentCandle = candles[candles.length - 1]; // current forming candle
-
-  let buyVolume = 0;
-  let sellVolume = 0;
-
-  // Sum buy/sell volume for last 3 closed candles
-  for (const c of lastClosedCandles) {
+  for (const c of candles.slice(0, 3)) {
     const res = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
     if (!res.ok) continue;
     const trades = await res.json();
-    for (const t of trades) {
-      if (t.isBuyerMaker) sellVolume += parseFloat(t.qty); // aggressive sell
-      else buyVolume += parseFloat(t.qty); // aggressive buy
-    }
+    for (const t of trades) t.isBuyerMaker ? (sell += parseFloat(t.qty)) : (buy += parseFloat(t.qty));
   }
 
-  // Optional: include current forming candle
-  for (const t of (await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`)).json()) {
-    if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
-    else buyVolume += parseFloat(t.qty);
+  const resCurrent = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
+  if (resCurrent.ok) {
+    const trades = await resCurrent.json();
+    for (const t of trades) t.isBuyerMaker ? (sell += parseFloat(t.qty)) : (buy += parseFloat(t.qty));
   }
 
-  const totalVolume = buyVolume + sellVolume;
-  if (totalVolume === 0) return false;
+  const total = buy + sell;
+  if (!total) return { passed: false, buyAggression: 0, sellAggression: 0 };
+  const buyAgg = buy / total;
+  const sellAgg = sell / total;
 
-  const buyAggression = buyVolume / totalVolume;
-  const sellAggression = sellVolume / totalVolume;
-
-  // Trigger if either side is dominant (>60%)
-  return { buyAggression, sellAggression };
+  return { passed: buyAgg >= 0.6 || sellAgg >= 0.6, buyAggression: buyAgg, sellAggression: sellAgg };
 }
 
-// --- Execute Market Order for All Users (fixed precision) ---
+// --- Execute Market Orders ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
   createBinanceClients();
   if (!Object.keys(userClients).length) {
@@ -191,48 +171,40 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
   for (const userId in userClients) {
     const client = userClients[userId];
     try {
-      // --- Set leverage ---
       await client.futuresLeverage(symbol, LEVERAGE);
-
-      // --- Get USDT balance ---
       const balances = await client.futuresBalance();
       const usdtBal = balances.find((b) => b.asset === "USDT");
       const balAmount = usdtBal ? parseFloat(usdtBal.balance) : 0;
       if (!balAmount) continue;
 
-      // --- Get mark price ---
       const mark = await client.futuresMarkPrice(symbol);
       const markPrice = mark.markPrice ? parseFloat(mark.markPrice) : parseFloat(mark[0]?.markPrice || 0);
       if (!markPrice) continue;
 
-      // --- Calculate raw quantity ---
       const tradeValue = balAmount * TRADE_PERCENT;
       const rawQty = (tradeValue * LEVERAGE) / markPrice;
 
-      // --- Get precision/step size for symbol ---
       const info = await client.futuresExchangeInfo();
       const s = info.symbols.find((x) => x.symbol === symbol);
       if (!s) continue;
-      const lot = s.filters.find((f) => f.filterType === "LOT_SIZE");
-      const step = parseFloat(lot.stepSize);
-      let precision = 0;
-      let stepCopy = step;
-      while (stepCopy < 1) {
-        stepCopy *= 10;
+      const step = parseFloat(s.filters.find((f) => f.filterType === "LOT_SIZE").stepSize);
+      let precision = 0,
+        tmp = step;
+      while (tmp < 1) {
+        tmp *= 10;
         precision++;
       }
-
-      // --- Round quantity to allowed step ---
       const qty = Math.max(parseFloat(rawQty.toFixed(precision)), step);
 
-      // --- Place order ---
-      const side = direction.toUpperCase() === "BULLISH" ? "BUY" : "SELL";
+      let side;
+      if (["BUY", "BULLISH"].includes(direction.toUpperCase())) side = "BUY";
+      else side = "SELL";
+
       if (side === "BUY") await client.futuresMarketBuy(symbol, qty);
       else await client.futuresMarketSell(symbol, qty);
 
       await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
 
-      // --- Track position ---
       if (!activePositions[symbol]) activePositions[symbol] = {};
       activePositions[symbol][userId] = {
         side,
@@ -327,259 +299,173 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- /closeall command ---
+// --- /closeall command (ALL or single symbol) ---
 bot.on("message", async (msg) => {
   if (!msg.text) return;
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
 
   const chatId = msg.chat.id;
-  const text = msg.text.trim().toLowerCase();
-
-  if (text.startsWith("/closeall")) {
-    const parts = text.split(" ");
-    const symArg = parts[1]?.toUpperCase() || null;
-    if (!symArg)
-      return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
-
-    bot.sendMessage(chatId, `📢 *Manual Close-All Triggered:* ${symArg}`, { parse_mode: "Markdown" });
-
-    for (const sym of Object.keys(activePositions)) {
-      for (const userId of Object.keys(activePositions[sym])) {
-        if (symArg !== "ALL" && symArg !== sym) continue;
-        const pos = activePositions[sym][userId];
-        const client = userClients[userId];
-        if (!client) continue;
-        const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
-        try {
-          if (closeSide === "BUY") await client.futuresMarketBuy(sym, pos.qty);
-          else await client.futuresMarketSell(sym, pos.qty);
-          delete activePositions[sym][userId];
-          await sendMessage(`🔴 *MANUAL CLOSE:* User ${userId}\nSymbol: ${sym}\nQty: ${pos.qty}\nAction: ${closeSide}`);
-        } catch (err) {
-          await sendMessage(`❌ Failed to close User ${userId} on ${sym}: ${err?.message || err}`);
-        }
-      }
-    }
-    return bot.sendMessage(chatId, "✅ Manual Close-All Completed.", { parse_mode: "Markdown" });
-  }
-});
-
-// --- CID signal parser ---
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
   const text = msg.text.trim();
-  if (!text.toUpperCase().includes("CONFIRMED CHANGE IN DIRECTION")) return;
 
-  const match = text.match(/ON\s+([A-Z]+USDT).*NOW\s+(BULLISH|BEARISH)/i);
-  if (!match) return;
+  if (!text.toLowerCase().startsWith("/closeall")) return;
 
-  const symbol = match[1].toUpperCase();
-  const direction = match[2].toUpperCase();
+  const parts = text.split(" ");
+  const symArg = parts[1]?.toUpperCase();
 
-  if (pendingSignals[symbol]) return;
-  pendingSignals[symbol] = { direction, expiresAt: Date.now() + SIGNAL_EXPIRY_MS };
-  await sendMessage(
-    `📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(
-      SIGNAL_EXPIRY_MS / 60000
-    )} minutes\nChecking Volume Imbalance...`
-  );
+  if (!symArg) {
+    return bot.sendMessage(chatId, "❌ Usage:\n/closeall BTCUSDT\n/closeall ALL", { parse_mode: "Markdown" });
+  }
 
-  const timer = setInterval(async () => {
-    const sig = pendingSignals[symbol];
-    if (!sig) {
-      clearInterval(timer);
-      return;
+  await sendMessage(`📢 *Manual Close Triggered:* ${symArg}`);
+
+  for (const userId of Object.keys(userClients)) {
+    const client = userClients[userId];
+    if (!client) continue;
+
+    try {
+      const positions = await client.futuresPositionRisk();
+      if (!Array.isArray(positions)) continue;
+
+      for (const p of positions) {
+        const symbol = p.symbol;
+        const positionAmt = parseFloat(p.positionAmt);
+
+        if (positionAmt === 0) continue;
+        if (symArg !== "ALL" && symArg !== symbol) continue;
+
+        const qty = Math.abs(positionAmt);
+        const closeSide = positionAmt > 0 ? "SELL" : "BUY";
+
+        if (closeSide === "SELL") {
+          await client.futuresMarketSell(symbol, qty);
+        } else {
+          await client.futuresMarketBuy(symbol, qty);
+        }
+
+        // Cleanup local tracking
+        if (activePositions[symbol]?.[userId]) {
+          delete activePositions[symbol][userId];
+          if (!Object.keys(activePositions[symbol]).length) {
+            delete activePositions[symbol];
+          }
+        }
+
+        await sendMessage(`🔴 *MANUAL CLOSE*\nUser: ${userId}\nSymbol: ${symbol}\nQty: ${qty}\nAction: ${closeSide}`);
+      }
+    } catch (err) {
+      await sendMessage(`❌ Failed to close positions for User ${userId}: ${err?.message || err}`);
     }
-    if (Date.now() > sig.expiresAt) {
-      clearInterval(timer);
-      delete pendingSignals[symbol];
-      await sendMessage(`⌛ CID signal expired for *${symbol}*`);
-      return;
-    }
+  }
 
-    const volOk = await checkVolumeImbalance(symbol);
-    if (!volOk) await sendMessage(`⏳ Volume Imbalance not passed for *${symbol}*`);
-
-    if (volOk) {
-      clearInterval(timer);
-      delete pendingSignals[symbol];
-      await sendMessage(`✅ Volume Imbalance Passed for *${symbol}* — Executing Market Orders...`);
-      await executeMarketOrderForAllUsers(symbol, direction);
-    }
-  }, SIGNAL_CHECK_INTERVAL_MS);
+  await bot.sendMessage(chatId, "✅ Manual Close Completed.", {
+    parse_mode: "Markdown",
+  });
 });
-// =====================================================
-// PART 2: PDH / PDL MONITORING & TELEGRAM HANDLERS
-// Liquidity Sweep + EMA Reclaim + Aggression (buy/sell imbalance)
-// =====================================================
 
-// --- Aggression check based on buy/sell orders ---
+// --- Placeholder for liquiditySweepCheck ---
+async function liquiditySweepCheck(symbol, direction) {
+  // TODO: Implement real logic
+  return true;
+}
+
+// --- Aggression Check ---
 async function aggressionCheck(symbol) {
   try {
     const tradesRes = await fetch(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=50`);
     if (!tradesRes.ok) return false;
     const trades = await tradesRes.json();
-
-    let buyVolume = 0;
-    let sellVolume = 0;
-
-    for (const t of trades) {
-      // isBuyerMaker === true → aggressive sell
-      if (t.isBuyerMaker) sellVolume += parseFloat(t.qty);
-      else buyVolume += parseFloat(t.qty);
-    }
-
-    const total = buyVolume + sellVolume;
+    let buy = 0,
+      sell = 0;
+    for (const t of trades) t.isBuyerMaker ? (sell += parseFloat(t.qty)) : (buy += parseFloat(t.qty));
+    const total = buy + sell;
     if (!total) return false;
-
-    return buyVolume / total >= 0.6 || sellVolume / total >= 0.6;
+    return buy / total >= 0.6 || sell / total >= 0.6;
   } catch (err) {
     log(`❌ aggressionCheck error for ${symbol}: ${err?.message || err}`);
     return false;
   }
 }
 
-// --- EMA reclaim 15m (EMA-3 approximation) ---
-async function ema3_15m(symbol) {
-  const klines = await fetchFuturesKlines(symbol, "15m", 3);
-  if (!klines || klines.length < 3) return null;
-  return klines.reduce((s, k) => s + k.close, 0) / 3;
-}
-
-// --- Liquidity Sweep + EMA Reclaim + Aggression ---
+// --- EMA + Liquidity + Aggression ---
 async function liquidityEmaAggressionCheck(symbol, direction) {
   const sweep = await liquiditySweepCheck(symbol, direction);
   if (!sweep) return false;
-
   const ema = await ema3_15m(symbol);
   if (!ema) return false;
-
   const aggression = await aggressionCheck(symbol);
   if (!aggression) return false;
-
   return true;
 }
 
-// --- Check PDH / PDL retest zone ---
+// --- PDH / PDL Check ---
 async function checkPdhPdl(symbol, type) {
   const d = await fetchFuturesKlines(symbol, "1d", 2);
   if (!d || d.length < 2) return false;
-
-  const prevHigh = d[0].high;
-  const prevLow = d[0].low;
-
+  const prevHigh = d[0].high,
+    prevLow = d[0].low;
   const m = await fetchFuturesKlines(symbol, "1m", 1);
   if (!m || !m.length) return false;
-
   const price = m[0].close;
   const zone = RETEST_ZONE_PCT;
-
   if (type === "PDH") return price <= prevHigh && price >= prevHigh * (1 - zone);
-
   if (type === "PDL") return price >= prevLow && price <= prevLow * (1 + zone);
-
   return false;
 }
 
-// --- Monitor PDH / PDL ---
+// --- Monitor PDH/PDL ---
 async function monitorPdhPdl() {
   for (const symbol of Object.keys(pdhPdlMonitors)) {
     const monitor = pdhPdlMonitors[symbol];
     if (!monitor.active || monitor.triggered) continue;
-
     const direction = monitor.type === "PDH" ? "SELL" : "BUY";
-
     const valid = await liquidityEmaAggressionCheck(symbol, direction);
     if (!valid) continue;
-
     const zoneOk = await checkPdhPdl(symbol, monitor.type);
     if (!zoneOk) continue;
 
     await sendMessage(
-      `📢 *PDH/PDL Triggered*\n` +
-        `Symbol: *${symbol}*\n` +
-        `Action: *${direction}*\n` +
-        `Conditions: Liquidity Sweep + EMA reclaim + Aggression`
+      `📡 Monitoring *${symbol}* for *${monitor.type}* condition with Liquidity Sweep + EMA reclaim + Aggression`
     );
-
     await executeMarketOrderForAllUsers(symbol, direction);
     monitor.triggered = true;
 
-    // --- 30-min updates while price remains near PDH/PDL ---
     const interval = setInterval(async () => {
       const stillNear = await checkPdhPdl(symbol, monitor.type);
       if (!stillNear) return clearInterval(interval);
-
       const k = await fetchFuturesKlines(symbol, "1m", 30);
       if (!k) return;
-
       const vol = k.reduce((s, c) => s + c.volume, 0);
       const price = k[k.length - 1].close;
-
       await sendMessage(
-        `ℹ️ *${symbol}* near ${monitor.type}\n` +
-          `Volume (30m): ${vol.toFixed(2)}\n` +
-          `Trade Amount: $${(vol * price).toFixed(2)}`
+        `ℹ️ *${symbol}* near ${monitor.type}\nVolume (30m): ${vol.toFixed(2)}\nTrade Amount: $${(vol * price).toFixed(
+          2
+        )}`
       );
     }, 30 * 60 * 1000);
   }
 }
 setInterval(monitorPdhPdl, MONITOR_INTERVAL_MS);
 
-// =====================================================
-// TELEGRAM COMMANDS — /monitor & /stopmonitor (FINAL)
-// =====================================================
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-
+// --- TELEGRAM COMMANDS: /monitor & /stopmonitor ---
+bot.onText(/\/monitor(?:@\w+)?\s+([A-Z]+USDT)\s+(PDH|PDL)/i, async (msg, match) => {
   const chatId = msg.chat.id;
-  const text = msg.text.trim();
-  const lower = text.toLowerCase();
-
-  // ADMIN ONLY
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const symbol = match[1].toUpperCase();
+  const type = match[2].toUpperCase();
+  pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
+  pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
+  await sendMessage(
+    `📡 Monitoring *${symbol}* for *${type}* condition with Liquidity Sweep + EMA reclaim + Aggression`
+  );
+});
 
-  // -------------------------
-  // /monitor SYMBOL PDH|PDL
-  // -------------------------
-  if (lower.startsWith("/monitor")) {
-    const parts = text.split(/\s+/);
-    if (parts.length !== 3) {
-      return bot.sendMessage(chatId, "❌ Usage:\n/monitor SYMBOL PDH\n/monitor SYMBOL PDL", { parse_mode: "Markdown" });
-    }
-
-    const symbol = parts[1].toUpperCase();
-    const type = parts[2].toUpperCase();
-
-    if (!["PDH", "PDL"].includes(type)) {
-      return bot.sendMessage(chatId, "❌ Type must be PDH or PDL");
-    }
-
-    pdhPdlMonitors[symbol] = { type, active: true, triggered: false };
-    pdhPdlState[symbol] = { brokePDH: false, brokePDL: false };
-
-    return sendMessage(
-      `📡 Monitoring *${symbol}* for *${type}* condition ` + `with Liquidity Sweep + EMA reclaim + Aggression`
-    );
-  }
-
-  // -------------------------
-  // /stopmonitor SYMBOL
-  // -------------------------
-  if (lower.startsWith("/stopmonitor")) {
-    const parts = text.split(/\s+/);
-    const symbol = parts[1]?.toUpperCase();
-
-    if (!symbol) {
-      return bot.sendMessage(chatId, "❌ Usage:\n/stopmonitor SYMBOL", { parse_mode: "Markdown" });
-    }
-
-    if (pdhPdlMonitors[symbol]) {
-      delete pdhPdlMonitors[symbol];
-      delete pdhPdlState[symbol];
-      return sendMessage(`🛑 Stopped monitoring *${symbol}*`);
-    } else {
-      return sendMessage(`ℹ️ No active monitor found for *${symbol}*`);
-    }
-  }
+bot.onText(/\/stopmonitor(?:@\w+)?\s+([A-Z]+USDT)/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const symbol = match[1].toUpperCase();
+  if (pdhPdlMonitors[symbol]) {
+    delete pdhPdlMonitors[symbol];
+    delete pdhPdlState[symbol];
+    await sendMessage(`🛑 Stopped monitoring *${symbol}* for PDH/PDL conditions.`);
+  } else await sendMessage(`ℹ️ No active monitor found for *${symbol}*.`);
 });
