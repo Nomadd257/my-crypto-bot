@@ -11,230 +11,229 @@ const fs = require("fs");
 const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
-// --- TELEGRAM DETAILS ---
+// =====================================================
+// TELEGRAM DETAILS (AS REQUESTED)
+// =====================================================
 const TELEGRAM_BOT_TOKEN = "8247817335:AAEKf92ex9eiDZKoan1O8uzZ3ls5uEjJsQw";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "7476742687";
+
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// --- USERS FILE ---
+// =====================================================
+// FILES
+// =====================================================
 const USERS_FILE = "./users.json";
 
-// --- Settings ---
-const TRADE_PERCENT = 0.10;        // 10% of USDT balance
+// =====================================================
+// SETTINGS
+// =====================================================
+const TRADE_PERCENT = 0.10;
 const LEVERAGE = 20;
-const TP_PCT = 2.0;
-const SL_PCT = 1.5;                // positive number
-const TRAILING_STOP_PCT = 2.0;
-const MONITOR_INTERVAL_MS = 5000;
-const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
-const COIN_LIST = ["AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT","BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT","AAVEUSDT","ADAUSDT","TONUSDT"];
-const MAX_TRADES = 4;
-const SYMBOL_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
-let BOT_PAUSED = false;
 
-// --- Trading sessions in UTC ---
+const TP_PCT = 2.0;
+const SL_PCT = 1.5;
+const TRAILING_STOP_PCT = 2.0;
+
+const MAX_TRADES = 4;
+const SYMBOL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
+const MONITOR_INTERVAL_MS = 5000;
+
+const COIN_LIST = [
+  "AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT",
+  "BNBUSDT","SOLUSDT","UNIUSDT","BCHUSDT","AAVEUSDT",
+  "ADAUSDT","TONUSDT"
+];
+
+// =====================================================
+// TRADING SESSIONS (UTC)
+// =====================================================
 const SESSIONS = [
   { name: "Asia", start: 0, end: 9 },
   { name: "London", start: 7, end: 16 },
   { name: "New York", start: 12, end: 21 }
 ];
 
-// --- In-memory ---
-let activePositions = {};   // { symbol: { userId: { side, entryPrice, qty, highest, lowest, trailingStop, openedAt } } }
-let symbolCooldowns = {};   // { symbol: timestamp }
-let userClients = {};       // { userId: client }
+// =====================================================
+// STATE
+// =====================================================
+let BOT_PAUSED = false;
+let activePositions = {};     // { symbol: { userId: position } }
+let symbolCooldowns = {};     // { symbol: timestamp }
+let userClients = {};         // { userId: binanceClient }
 
-// --- Logging ---
-function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
-
-// --- Load Users ---
-function loadUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    const users = [];
-    if (Array.isArray(parsed)) {
-      for (const u of parsed) if(u.active && u.apiKey && u.apiSecret) users.push({id:String(u.id),apiKey:u.apiKey,apiSecret:u.apiSecret});
-    } else {
-      for (const [k,v] of Object.entries(parsed)) if(v.active && v.apiKey && v.apiSecret) users.push({id:String(k),apiKey:v.apiKey,apiSecret:v.apiSecret});
-    }
-    return users;
-  } catch(err) { log(`❌ loadUsers error: ${err?.message||err}`); return []; }
+// =====================================================
+// LOGGING
+// =====================================================
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-const users = loadUsers();
-log('Loaded users: $ {JSON.stringify(users, null, 2)}');
-
-// --- Create Binance clients ---
-function createBinanceClients() {
-  const userList = loadUsers();
-  userClients = {};
-  for (const u of userList) {
-    try {
-      const client = new Binance();
-      client.options({ APIKEY:u.apiKey, APISECRET:u.apiSecret, useServerTime:true, recvWindow:60000 });
-      userClients[u.id] = client;
-    } catch(err){ log(`❌ createBinanceClients failed for ${u.id}: ${err?.message||err}`); }
-  }
-  return Object.entries(userClients).map(([userId, client])=>({ userId, client }));
+// =====================================================
+// TELEGRAM HELPERS
+// =====================================================
+async function sendMessage(msg) {
+  try { await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" }); } catch {}
+  try { await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" }); } catch {}
 }
 
-// --- Telegram send ---
-async function sendMessage(msg){
-  try{ await bot.sendMessage(GROUP_CHAT_ID,msg,{parse_mode:"Markdown"}); } catch{}
-  try{ await bot.sendMessage(ADMIN_ID,msg,{parse_mode:"Markdown"}); } catch{}
-}
-
-// --- Session check ---
-function isSessionActive(){
+// =====================================================
+// SESSION CHECK
+// =====================================================
+function isSessionActive() {
   const h = new Date().getUTCHours();
-  return SESSIONS.some(s=>h>=s.start && h<s.end);
+  return SESSIONS.some(s => h >= s.start && h < s.end);
 }
 
-// --- Fetch Futures Klines ---
-async function fetchFuturesKlines(symbol, interval="15m", limit=3){
-  try{
-    const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-    if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return data.map(c=>({time:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4],volume:+c[5]}));
-  } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
-}
-
-// --- Calculate VWAP ---
-async function calculateVWAP(symbol, interval="15m", limit=20){
-  const candles = await fetchFuturesKlines(symbol,interval,limit);
-  if(!candles) return null;
-  let cumPV=0, cumVol=0;
-  for(const c of candles){
-    const tp = (c.high+c.low+c.close)/3;
-    cumPV += tp*c.volume;
-    cumVol += c.volume;
-  }
-  return cumVol ? cumPV/cumVol : null;
-}
-
-// --- Last candle volume imbalance ---
-async function checkVolumeImbalance(symbol,direction){
-  try{
-    const candles = await fetchFuturesKlines(symbol,"15m",2);
-    if(!candles || candles.length<2) return false;
-    const last = candles[candles.length-2];
-    const nextCandle = candles[candles.length-1];
-    const tradesRes = await fetch(`https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${last.time}&endTime=${nextCandle.time}`);
-    if(!tradesRes.ok) return false;
-    const trades = await tradesRes.json();
-    let buyVol=0,sellVol=0;
-    for(const t of trades){ if(t.m) sellVol+=parseFloat(t.q); else buyVol+=parseFloat(t.q); }
-    const total = buyVol+sellVol;
-    if(total===0) return false;
-    if(direction==="BUY") return buyVol/total>=0.6;
-    if(direction==="SELL") return sellVol/total>=0.6;
-    return false;
-  } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }
-}
-
-// --- Floor qty ---
-function floorToStep(qty,step){
-  const s=Number(step); if(!s||s<=0) return qty;
-  const factor=Math.round(1/s);
-  return Number((Math.floor(qty*factor)/factor).toFixed((s.toString().split(".")[1]||"").length));
-}
-
-// --- Execute market orders for all users ---
-async function executeMarketOrderForAllUsers(symbol, direction) {
-  const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
-  if (!clients.length) {
-    await sendMessage(`⚠️ No active users.`);
+// =====================================================
+// LOAD USERS + CREATE CLIENTS (CRITICAL FIX)
+// =====================================================
+function initializeUsers() {
+  if (!fs.existsSync(USERS_FILE)) {
+    log("❌ users.json not found");
     return;
   }
 
-  await sendMessage(`📢 Executing ${direction} on *${symbol}* for all users...`);
+  const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
+  if (!raw) {
+    log("❌ users.json is empty");
+    return;
+  }
 
-  for (const { userId, client } of clients) {
+  const parsed = JSON.parse(raw);
+  userClients = {};
+
+  for (const u of parsed) {
+    if (!u.active || !u.apiKey || !u.apiSecret) continue;
+
+    const client = new Binance().options({
+      APIKEY: u.apiKey,
+      APISECRET: u.apiSecret,
+      useServerTime: true,
+      recvWindow: 60000
+    });
+
+    userClients[String(u.id)] = client;
+    log(`✅ User ${u.id} initialized`);
+  }
+
+  log(`👥 Active users loaded: ${Object.keys(userClients).length}`);
+}
+
+// =====================================================
+// MARKET DATA
+// =====================================================
+async function fetchFuturesKlines(symbol, interval="15m", limit=3) {
+  const res = await fetch(
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+  );
+  const data = await res.json();
+  return data.map(c => ({
+    time: c[0],
+    open: +c[1],
+    high: +c[2],
+    low: +c[3],
+    close: +c[4],
+    volume: +c[5]
+  }));
+}
+
+// =====================================================
+// VWAP
+// =====================================================
+async function calculateVWAP(symbol) {
+  const candles = await fetchFuturesKlines(symbol, "15m", 20);
+  let pv = 0, vol = 0;
+  for (const c of candles) {
+    const tp = (c.high + c.low + c.close) / 3;
+    pv += tp * c.volume;
+    vol += c.volume;
+  }
+  return vol ? pv / vol : null;
+}
+
+// =====================================================
+// VOLUME IMBALANCE (LAST CANDLE)
+// =====================================================
+async function checkVolumeImbalance(symbol, direction) {
+  const candles = await fetchFuturesKlines(symbol, "15m", 2);
+  const last = candles[0];
+  const next = candles[1];
+
+  const res = await fetch(
+    `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${last.time}&endTime=${next.time}`
+  );
+  const trades = await res.json();
+
+  let buy = 0, sell = 0;
+  for (const t of trades) {
+    t.m ? sell += +t.q : buy += +t.q;
+  }
+
+  const total = buy + sell;
+  if (!total) return false;
+
+  if (direction === "BUY") return buy / total >= 0.6;
+  if (direction === "SELL") return sell / total >= 0.6;
+  return false;
+}
+
+// =====================================================
+// ORDER EXECUTION (FIXED)
+// =====================================================
+async function executeMarketOrderForAllUsers(symbol, direction) {
+  const users = Object.entries(userClients);
+
+  if (!users.length) {
+    await sendMessage("⚠️ No active users.");
+    return;
+  }
+
+  await sendMessage(`📢 Executing *${direction}* on *${symbol}* for all users...`);
+
+  for (const [userId, client] of users) {
     try {
-      // Set leverage
-      await client.futuresLeverage(symbol, LEVERAGE).catch(() => {});
+      await client.futuresLeverage(symbol, LEVERAGE).catch(()=>{});
 
-      // Get USDT balance
       const balances = await client.futuresBalance();
-      const usdtBal = balances.find(b => b.asset === "USDT");
-      const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
-      if (!bal || bal <= 0) continue;
+      const usdt = balances.find(b => b.asset === "USDT");
+      if (!usdt || +usdt.balance <= 0) continue;
 
-      // Get mark price
-      let markPrice = 0;
-      try {
-        const mp = await client.futuresMarkPrice(symbol);
-        markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
-      } catch (err) {
-        log(`⚠️ markPrice fetch error for ${symbol}: ${err?.message || err}`);
+      const mark = await client.futuresMarkPrice(symbol);
+      const price = +mark.markPrice;
+      if (!price) continue;
+
+      const qty = ((+usdt.balance * TRADE_PERCENT) * LEVERAGE) / price;
+
+      if (direction === "BUY") {
+        await client.futuresMarketBuy(symbol, qty);
+      } else {
+        await client.futuresMarketSell(symbol, qty);
       }
 
-      if (!markPrice || markPrice <= 0) {
-        // fallback to last 1m candle close
-        const k = await fetchFuturesKlines(symbol, "1m", 1);
-        markPrice = k && k.length ? k[0].close : 0;
-      }
+      if (!activePositions[symbol]) activePositions[symbol] = {};
+      activePositions[symbol][userId] = {
+        side: direction,
+        entry: price,
+        qty,
+        highest: price,
+        lowest: price
+      };
 
-      if (!markPrice || markPrice <= 0) {
-        log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`);
-        continue;
-      }
-
-      // Calculate quantity
-      const tradeValue = bal * TRADE_PERCENT;
-      const rawQty = (tradeValue * LEVERAGE) / markPrice;
-
-      // Get lot size step
-      let lotStep = 0.001;
-      try {
-        const info = await client.futuresExchangeInfo();
-        const s = info.symbols.find(s => s.symbol === symbol);
-        if (s) lotStep = parseFloat(s.filters.find(f => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
-      } catch {}
-
-      const qty = floorToStep(rawQty, lotStep);
-      if (!qty || qty <= 0) continue;
-
-      // --- PLACE ORDER ---
-      try {
-        if (direction === "BUY") {
-          await client.futuresMarketBuy(symbol, qty);
-        } else {
-          await client.futuresMarketSell(symbol, qty);
-        }
-
-        // Record active position
-        if (!activePositions[symbol]) activePositions[symbol] = {};
-        activePositions[symbol][userId] = {
-          side: direction,
-          entryPrice: markPrice,
-          qty,
-          openedAt: Date.now(),
-          trailingStop: null,
-          highest: markPrice,
-          lowest: markPrice
-        };
-
-        await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-      } catch (err) {
-        log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
-      }
-
+      await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId}`);
     } catch (err) {
-      log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
+      log(`❌ Order error ${userId} ${symbol}: ${err.message}`);
     }
   }
 
-  // Set cooldown for the symbol
   symbolCooldowns[symbol] = Date.now();
 }
 
-// --- Monitor positions ---
+// =====================================================
+// MONITOR POSITIONS (TP / SL / TRAILING)
+// =====================================================
 async function monitorPositions(){
   for(const [symbol,users] of Object.entries(activePositions)){
     for(const [userId,pos] of Object.entries(users)){
@@ -280,62 +279,65 @@ async function monitorPositions(){
 }
 setInterval(monitorPositions,MONITOR_INTERVAL_MS);
 
-// --- Full-auto scanning loop ---
-setInterval(async()=>{
-  if(BOT_PAUSED){
-    log("⏸️ Bot is paused.");
-    return;
-  }
 
-  if(!isSessionActive()){
-    log("⏳ No active trading session.");
-    return;
-  }
+// =====================================================
+// FULL AUTO SCANNER
+// =====================================================
+setInterval(async () => {
+  if (BOT_PAUSED) return;
+  if (!isSessionActive()) return;
 
-  let openTrades = Object.values(activePositions).reduce((acc,users)=>acc+Object.keys(users).length,0);
-  for(const symbol of COIN_LIST){
-    if(openTrades>=MAX_TRADES) break;
+  let openTrades = Object.values(activePositions)
+    .reduce((a,b)=>a+Object.keys(b).length,0);
 
-    const lastTradeTime = symbolCooldowns[symbol]||0;
-    if(Date.now()-lastTradeTime<SYMBOL_COOLDOWN_MS) continue;
+  for (const symbol of COIN_LIST) {
+    if (openTrades >= MAX_TRADES) break;
+    if (Date.now() - (symbolCooldowns[symbol] || 0) < SYMBOL_COOLDOWN_MS) continue;
 
-    for(const dir of ["BUY","SELL"]){
-      const volOk = await checkVolumeImbalance(symbol,dir);
+    for (const dir of ["BUY","SELL"]) {
+      if (!(await checkVolumeImbalance(symbol, dir))) continue;
+
       const vwap = await calculateVWAP(symbol);
-      if(!volOk || !vwap) continue;
+      const last = (await fetchFuturesKlines(symbol, "15m", 1))[0];
 
-      // Directional VWAP check
-      const lastCandle = (await fetchFuturesKlines(symbol,"15m",1))[0];
-      if(dir==="BUY" && lastCandle.close<vwap) continue;
-      if(dir==="SELL" && lastCandle.close>vwap) continue;
+      if (dir === "BUY" && last.close < vwap) continue;
+      if (dir === "SELL" && last.close > vwap) continue;
 
-      await executeMarketOrderForAllUsers(symbol,dir);
+      await executeMarketOrderForAllUsers(symbol, dir);
       openTrades++;
-      break; // only one direction per symbol at a time
+      break;
     }
   }
-
 }, SIGNAL_CHECK_INTERVAL_MS);
 
-// --- Telegram commands ---
-bot.onText(/\/pause/, async (msg)=>{
+// =====================================================
+// TELEGRAM COMMANDS
+// =====================================================
+bot.onText(/\/pause/, () => {
   BOT_PAUSED = true;
-  await sendMessage("⏸️ Bot has been paused.");
+  sendMessage("⏸️ Bot paused");
 });
-bot.onText(/\/resume/, async (msg)=>{
+
+bot.onText(/\/resume/, () => {
   BOT_PAUSED = false;
-  await sendMessage("▶️ Bot has resumed operation.");
+  sendMessage("▶️ Bot resumed");
 });
-bot.onText(/\/closeall/, async (msg)=>{
-  for(const [symbol,users] of Object.entries(activePositions)){
-    for(const [userId,pos] of Object.entries(users)){
-      const client = userClients[userId]; if(!client) continue;
-      try{
-        if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty);
-        else await client.futuresMarketBuy(symbol,pos.qty);
-      }catch{}
+
+bot.onText(/\/closeall/, async () => {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
+      if (!client) continue;
+      pos.side === "BUY"
+        ? await client.futuresMarketSell(symbol, pos.qty)
+        : await client.futuresMarketBuy(symbol, pos.qty);
     }
   }
   activePositions = {};
-  await sendMessage("🛑 All positions have been closed.");
+  sendMessage("🛑 All positions closed");
 });
+
+// =====================================================
+// STARTUP
+// =====================================================
+initializeUsers();
