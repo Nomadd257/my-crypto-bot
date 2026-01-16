@@ -180,55 +180,109 @@ async function checkVolumeImbalance(symbol, direction) {
   return false;
 }
 
-// =====================================================
-// ORDER EXECUTION (FIXED)
-// =====================================================
+// --- Execute market orders for all users (FIXED & ROBUST) ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
-  const users = Object.entries(userClients);
+  try {
+    // 🔑 ALWAYS recreate clients at execution time
+    const clients = createBinanceClients();
 
-  if (!users.length) {
-    await sendMessage("⚠️ No active users.");
-    return;
-  }
-
-  await sendMessage(`📢 Executing *${direction}* on *${symbol}* for all users...`);
-
-  for (const [userId, client] of users) {
-    try {
-      await client.futuresLeverage(symbol, LEVERAGE).catch(()=>{});
-
-      const balances = await client.futuresBalance();
-      const usdt = balances.find(b => b.asset === "USDT");
-      if (!usdt || +usdt.balance <= 0) continue;
-
-      const mark = await client.futuresMarkPrice(symbol);
-      const price = +mark.markPrice;
-      if (!price) continue;
-
-      const qty = ((+usdt.balance * TRADE_PERCENT) * LEVERAGE) / price;
-
-      if (direction === "BUY") {
-        await client.futuresMarketBuy(symbol, qty);
-      } else {
-        await client.futuresMarketSell(symbol, qty);
-      }
-
-      if (!activePositions[symbol]) activePositions[symbol] = {};
-      activePositions[symbol][userId] = {
-        side: direction,
-        entry: price,
-        qty,
-        highest: price,
-        lowest: price
-      };
-
-      await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId}`);
-    } catch (err) {
-      log(`❌ Order error ${userId} ${symbol}: ${err.message}`);
+    if (!clients.length) {
+      await sendMessage(`⚠️ No active users found. Check users.json`);
+      return;
     }
-  }
 
-  symbolCooldowns[symbol] = Date.now();
+    await sendMessage(`📢 Executing ${direction} on *${symbol}* for all users...`);
+
+    for (const { userId, client } of clients) {
+      try {
+        // Ensure one-way mode & leverage
+        try { await client.futuresPositionSideDual(false); } catch {}
+        try { await client.futuresLeverage(symbol, LEVERAGE); } catch {}
+
+        // Fetch USDT balance
+        const balances = await client.futuresBalance();
+        const usdtBal = balances.find(b => b.asset === "USDT");
+        const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
+        if (!bal || bal <= 0) continue;
+
+        // Fetch mark price
+        let markPrice = null;
+        try {
+          const mp = await client.futuresMarkPrice(symbol);
+          markPrice = mp.markPrice
+            ? parseFloat(mp.markPrice)
+            : parseFloat(mp[0]?.markPrice || 0);
+        } catch {}
+
+        // Fallback to last candle close
+        if (!markPrice) {
+          const k = await fetchFuturesKlines(symbol, "1m", 1);
+          if (k && k.length) markPrice = k[0].close;
+        }
+
+        if (!markPrice || markPrice <= 0) continue;
+
+        // Calculate quantity
+        const tradeValue = bal * TRADE_PERCENT;
+        const rawQty = (tradeValue * LEVERAGE) / markPrice;
+
+        // Get lot size
+        let lotStep = 0.001;
+        try {
+          const info = await client.futuresExchangeInfo();
+          const s = info.symbols.find(x => x.symbol === symbol);
+          if (s) {
+            const lot = s.filters.find(f => f.filterType === "LOT_SIZE");
+            if (lot?.stepSize) lotStep = parseFloat(lot.stepSize);
+          }
+        } catch {}
+
+        const qty = floorToStep(rawQty, lotStep);
+        if (!qty || qty <= 0) continue;
+
+        // 🔥 PLACE ORDER (with fallback)
+        try {
+          if (direction === "BUY") {
+            await client.futuresMarketBuy(symbol, qty);
+          } else {
+            await client.futuresMarketSell(symbol, qty);
+          }
+        } catch (e) {
+          // Fallback method (older SDKs)
+          if (direction === "BUY") {
+            await client.futuresMarketOrder(symbol, "BUY", qty);
+          } else {
+            await client.futuresMarketOrder(symbol, "SELL", qty);
+          }
+        }
+
+        // Store active position
+        if (!activePositions[symbol]) activePositions[symbol] = {};
+        activePositions[symbol][userId] = {
+          side: direction,
+          entryPrice: markPrice,
+          qty,
+          openedAt: Date.now(),
+          trailingStop: null,
+          highest: markPrice,
+          lowest: markPrice
+        };
+
+        await sendMessage(
+          `✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`
+        );
+
+      } catch (err) {
+        log(`❌ Order failed for ${userId} ${symbol}: ${err?.message || err}`);
+      }
+    }
+
+    // Cooldown AFTER execution
+    symbolCooldowns[symbol] = Date.now();
+
+  } catch (err) {
+    log(`❌ executeMarketOrderForAllUsers fatal error: ${err?.message || err}`);
+  }
 }
 
 // =====================================================
