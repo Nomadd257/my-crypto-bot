@@ -87,97 +87,61 @@ function isSessionActive() {
   return SESSIONS.some(s => h >= s.start && h < s.end);
 }
 
-// =====================================================
-// LOAD USERS + CREATE CLIENTS (CRITICAL FIX)
-// =====================================================
-function initializeUsers() {
-  if (!fs.existsSync(USERS_FILE)) {
-    log("❌ users.json not found");
-    return;
-  }
-
-  const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
-  if (!raw) {
-    log("❌ users.json is empty");
-    return;
-  }
-
-  const parsed = JSON.parse(raw);
+// --- Create Binance clients ---
+function createBinanceClients() {
+  const userList = loadUsers();
   userClients = {};
-
-  for (const u of parsed) {
-    if (!u.active || !u.apiKey || !u.apiSecret) continue;
-
-    const client = new Binance().options({
-      APIKEY: u.apiKey,
-      APISECRET: u.apiSecret,
-      useServerTime: true,
-      recvWindow: 60000
-    });
-
-    userClients[String(u.id)] = client;
-    log(`✅ User ${u.id} initialized`);
+  for (const u of userList) {
+    try {
+      const client = new Binance();
+      client.options({ APIKEY:u.apiKey, APISECRET:u.apiSecret, useServerTime:true, recvWindow:60000 });
+      userClients[u.id] = client;
+    } catch(err){ log(`❌ createBinanceClients failed for ${u.id}: ${err?.message||err}`); }
   }
-
-  log(`👥 Active users loaded: ${Object.keys(userClients).length}`);
+  return Object.entries(userClients).map(([userId, client])=>({ userId, client }));
 }
 
-// =====================================================
-// MARKET DATA
-// =====================================================
-async function fetchFuturesKlines(symbol, interval="15m", limit=3) {
-  const res = await fetch(
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-  );
-  const data = await res.json();
-  return data.map(c => ({
-    time: c[0],
-    open: +c[1],
-    high: +c[2],
-    low: +c[3],
-    close: +c[4],
-    volume: +c[5]
-  }));
+// --- Fetch Futures Klines ---
+async function fetchFuturesKlines(symbol, interval="15m", limit=3){
+  try{
+    const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return data.map(c=>({time:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4],volume:+c[5]}));
+  } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
 }
 
-// =====================================================
-// VWAP
-// =====================================================
-async function calculateVWAP(symbol) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 20);
-  let pv = 0, vol = 0;
-  for (const c of candles) {
-    const tp = (c.high + c.low + c.close) / 3;
-    pv += tp * c.volume;
-    vol += c.volume;
+// --- Calculate VWAP ---
+async function calculateVWAP(symbol, interval="15m", limit=20){
+  const candles = await fetchFuturesKlines(symbol,interval,limit);
+  if(!candles) return null;
+  let cumPV=0, cumVol=0;
+  for(const c of candles){
+    const tp = (c.high+c.low+c.close)/3;
+    cumPV += tp*c.volume;
+    cumVol += c.volume;
   }
-  return vol ? pv / vol : null;
+  return cumVol ? cumPV/cumVol : null;
 }
 
-// =====================================================
-// VOLUME IMBALANCE (LAST CANDLE)
-// =====================================================
-async function checkVolumeImbalance(symbol, direction) {
-  const candles = await fetchFuturesKlines(symbol, "15m", 2);
-  const last = candles[0];
-  const next = candles[1];
-
-  const res = await fetch(
-    `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${last.time}&endTime=${next.time}`
-  );
-  const trades = await res.json();
-
-  let buy = 0, sell = 0;
-  for (const t of trades) {
-    t.m ? sell += +t.q : buy += +t.q;
-  }
-
-  const total = buy + sell;
-  if (!total) return false;
-
-  if (direction === "BUY") return buy / total >= 0.6;
-  if (direction === "SELL") return sell / total >= 0.6;
-  return false;
+// --- Last candle volume imbalance ---
+async function checkVolumeImbalance(symbol,direction){
+  try{
+    const candles = await fetchFuturesKlines(symbol,"15m",2);
+    if(!candles || candles.length<2) return false;
+    const last = candles[candles.length-2];
+    const nextCandle = candles[candles.length-1];
+    const tradesRes = await fetch(`https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${last.time}&endTime=${nextCandle.time}`);
+    if(!tradesRes.ok) return false;
+    const trades = await tradesRes.json();
+    let buyVol=0,sellVol=0;
+    for(const t of trades){ if(t.m) sellVol+=parseFloat(t.q); else buyVol+=parseFloat(t.q); }
+    const total = buyVol+sellVol;
+    if(total===0) return false;
+    if(direction==="BUY") return buyVol/total>=0.6;
+    if(direction==="SELL") return sellVol/total>=0.6;
+    return false;
+  } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }
 }
 
 // --- Execute market orders for all users (FIXED & ROBUST) ---
@@ -203,7 +167,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         const balances = await client.futuresBalance();
         const usdtBal = balances.find(b => b.asset === "USDT");
         const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
-        if (!bal || bal <= 0) continue;
+        if (!bal || bal <= 0) {await sendMessage('⚠️User ${userId} has *NO USDT in Futures. Trade skipped.'); continue;}
 
         // Fetch mark price
         let markPrice = null;
