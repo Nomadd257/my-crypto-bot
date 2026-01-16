@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1; // 10% of USDT balance
 const LEVERAGE = 20;
 const TP_PCT = 2.0;
-const SL_PCT = 1.5; // stored as positive %
+const SL_PCT = 1.5; // positive number
 const TRAILING_STOP_PCT = 2.0;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -48,7 +48,8 @@ const COIN_LIST = [
   "TONUSDT",
 ];
 const MAX_TRADES = 4;
-const SYMBOL_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
+const SYMBOL_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
+let BOT_PAUSED = false;
 
 // --- Trading sessions in UTC ---
 const SESSIONS = [
@@ -318,6 +319,11 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
 // --- Full-auto scanning loop ---
 setInterval(async () => {
+  if (BOT_PAUSED) {
+    log("⏸️ Bot is paused.");
+    return;
+  }
+
   if (!isSessionActive()) {
     log("⏳ No active trading session.");
     return;
@@ -346,3 +352,27 @@ setInterval(async () => {
     }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
+
+// --- Telegram commands ---
+bot.onText(/\/pause/, async (msg) => {
+  BOT_PAUSED = true;
+  await sendMessage("⏸️ Bot has been paused.");
+});
+bot.onText(/\/resume/, async (msg) => {
+  BOT_PAUSED = false;
+  await sendMessage("▶️ Bot has resumed operation.");
+});
+bot.onText(/\/closeall/, async (msg) => {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
+      if (!client) continue;
+      try {
+        if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+        else await client.futuresMarketBuy(symbol, pos.qty);
+      } catch {}
+    }
+  }
+  activePositions = {};
+  await sendMessage("🛑 All positions have been closed.");
+});
