@@ -17,10 +17,12 @@
     "bybit-api": "^4.4.2",
     "dotenv": "^17.2.2",
     "node-binance-api": "^1.0.18",
+    "node-fetch": "^2.7.0",
     "node-schedule": "^2.1.1",
     "node-telegram-bot-api": "^0.66.0",
     "technicalindicators": "^3.1.0",
     "telegram": "^2.26.22",
+    "undici": "^7.16.0",
     "ws": "^8.18.3"
   }
 }
