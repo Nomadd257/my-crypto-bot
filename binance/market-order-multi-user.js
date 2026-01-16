@@ -167,7 +167,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         const balances = await client.futuresBalance();
         const usdtBal = balances.find(b => b.asset === "USDT");
         const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
-        if (!bal || bal <= 0) {await sendMessage('⚠️User ${userId} has *NO USDT in Futures. Trade skipped.'); continue;}
+        if (!bal || bal <= 0) {await sendMessage('⚠️ User ${userId} has *NO USDT* in Futures wallet. Trade skipped.'); continue;}
 
         // Fetch mark price
         let markPrice = null;
