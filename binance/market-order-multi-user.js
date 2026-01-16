@@ -142,37 +142,94 @@ function floorToStep(qty,step){
 }
 
 // --- Execute market orders for all users ---
-async function executeMarketOrderForAllUsers(symbol,direction){
-  const clients = createBinanceClients();
-  if(!clients.length){ await sendMessage(`⚠️ No active users.`); return; }
+async function executeMarketOrderForAllUsers(symbol, direction) {
+  const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
+  if (!clients.length) {
+    await sendMessage(`⚠️ No active users.`);
+    return;
+  }
+
   await sendMessage(`📢 Executing ${direction} on *${symbol}* for all users...`);
-  await Promise.all(clients.map(async({userId,client})=>{
-    try{
-      await client.futuresLeverage(symbol,LEVERAGE).catch(()=>{});
+
+  for (const { userId, client } of clients) {
+    try {
+      // Set leverage
+      await client.futuresLeverage(symbol, LEVERAGE).catch(() => {});
+
+      // Get USDT balance
       const balances = await client.futuresBalance();
-      const usdtBal = balances.find(b=>b.asset==="USDT");
-      const bal = usdtBal?parseFloat(usdtBal.balance):0;
-      if(!bal || bal<=0) return;
-      let markPrice=null;
-      try{ const mp=await client.futuresMarkPrice(symbol); markPrice=mp.markPrice||parseFloat(mp[0]?.markPrice||0); }catch{}
-      if(!markPrice){
-        const k=await fetchFuturesKlines(symbol,"1m",1); if(k && k.length) markPrice=k[0].close;
+      const usdtBal = balances.find(b => b.asset === "USDT");
+      const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
+      if (!bal || bal <= 0) continue;
+
+      // Get mark price
+      let markPrice = 0;
+      try {
+        const mp = await client.futuresMarkPrice(symbol);
+        markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
+      } catch (err) {
+        log(`⚠️ markPrice fetch error for ${symbol}: ${err?.message || err}`);
       }
-      if(!markPrice) return;
-      const tradeValue = bal*TRADE_PERCENT;
-      const rawQty = (tradeValue*LEVERAGE)/markPrice;
+
+      if (!markPrice || markPrice <= 0) {
+        // fallback to last 1m candle close
+        const k = await fetchFuturesKlines(symbol, "1m", 1);
+        markPrice = k && k.length ? k[0].close : 0;
+      }
+
+      if (!markPrice || markPrice <= 0) {
+        log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`);
+        continue;
+      }
+
+      // Calculate quantity
+      const tradeValue = bal * TRADE_PERCENT;
+      const rawQty = (tradeValue * LEVERAGE) / markPrice;
+
+      // Get lot size step
       let lotStep = 0.001;
-      try{ const info = await client.futuresExchangeInfo(); const s = info.symbols.find(s=>s.symbol===symbol); if(s) lotStep=parseFloat(s.filters.find(f=>f.filterType==="LOT_SIZE")?.stepSize||lotStep);}catch{}
-      const qty=floorToStep(rawQty,lotStep); if(!qty||qty<=0) return;
-      const side = direction==="BUY"?"BUY":"SELL";
-      if(side==="BUY") await client.futuresMarketBuy(symbol,qty);
-      else await client.futuresMarketSell(symbol,qty);
-      if(!activePositions[symbol]) activePositions[symbol]={};
-      activePositions[symbol][userId]={ side, entryPrice: markPrice, qty, openedAt: Date.now(), trailingStop:null, highest:markPrice, lowest:markPrice };
-      await sendMessage(`✅ *${side} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-    }catch(err){ log(`❌ executeMarketOrder user ${userId} ${symbol}: ${err?.message||err}`); }
-  }));
-  symbolCooldowns[symbol]=Date.now();
+      try {
+        const info = await client.futuresExchangeInfo();
+        const s = info.symbols.find(s => s.symbol === symbol);
+        if (s) lotStep = parseFloat(s.filters.find(f => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
+      } catch {}
+
+      const qty = floorToStep(rawQty, lotStep);
+      if (!qty || qty <= 0) continue;
+
+      // Place order
+      let order;
+      if (direction === "BUY") {
+        order = await client.futuresMarketBuy(symbol, qty);
+      } else {
+        order = await client.futuresMarketSell(symbol, qty);
+      }
+
+      // Confirm order executed
+      if (order && order.orderId) {
+        if (!activePositions[symbol]) activePositions[symbol] = {};
+        activePositions[symbol][userId] = {
+          side: direction,
+          entryPrice: markPrice,
+          qty,
+          openedAt: Date.now(),
+          trailingStop: null,
+          highest: markPrice,
+          lowest: markPrice
+        };
+
+        await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+      } else {
+        log(`❌ Order not confirmed for ${userId} on ${symbol}`);
+      }
+
+    } catch (err) {
+      log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
+    }
+  }
+
+  // Set cooldown for the symbol
+  symbolCooldowns[symbol] = Date.now();
 }
 
 // --- Monitor positions ---
