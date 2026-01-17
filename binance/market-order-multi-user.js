@@ -144,26 +144,35 @@ async function checkVolumeImbalance(symbol,direction){
   } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }
 }
 
-// --- Support / Resistance proximity filter (15m) ---
-async function isNearSupportResistance(symbol, direction, lookback = 50, bufferPct = 0.005) {
-  const candles = await fetchFuturesKlines(symbol, "15m", lookback);
-  if (!candles || candles.length < lookback) return true;
+// --- 1H Support & Resistance Filter ---
+async function isNear1HSupportResistance(symbol, direction) {
+  try {
+    // Fetch last 20 1H candles
+    const candles = await fetchFuturesKlines(symbol, "1h", 20);
+    if (!candles || candles.length < 20) return false;
 
-  let high = -Infinity;
-  let low = Infinity;
+    // Find the highest high and lowest low
+    const highs = candles.map(c => c.high);
+    const lows  = candles.map(c => c.low);
 
-  for (const c of candles) {
-    if (c.high > high) high = c.high;
-    if (c.low < low) low = c.low;
+    const resistance = Math.max(...highs);
+    const support = Math.min(...lows);
+
+    // Current price (last closed candle)
+    const price = candles[candles.length - 1].close;
+
+    // Buffer of 0.5%
+    const BUFFER = 0.005; // 0.5%
+
+    // Check proximity
+    if (direction === "BUY" && price <= resistance * (1 + BUFFER)) return true;
+    if (direction === "SELL" && price >= support * (1 - BUFFER)) return true;
+
+    return false; // Not near support/resistance
+  } catch (err) {
+    log(`❌ 1H S/R error for ${symbol}: ${err.message}`);
+    return false;
   }
-
-  const lastClose = candles[candles.length - 1].close;
-  const buffer = lastClose * bufferPct;
-
-  if (direction === "BUY" && lastClose <= low + buffer) return true;
-  if (direction === "SELL" && lastClose >= high - buffer) return true;
-
-  return false;
 }
 
 // --- Floor qty ---
@@ -338,9 +347,10 @@ setInterval(async()=>{
       if(dir==="BUY" && lastCandle.close<vwap) continue;
       if(dir==="SELL" && lastCandle.close>vwap) continue;
 
-      if (await isNearSupportResistance(symbol, dir)) {
-  await sendMessage(`🚫 ${symbol} blocked — price too close to support/resistance`);
-  continue;
+      const nearSR = await isNear1HSupportResistance(symbol, dir);
+if (nearSR) {
+  log(`⛔ 1H S/R BLOCK → ${symbol} ${dir}`);
+  continue; // skip this symbol/direction, but continue scanning others
 }
 
 await executeMarketOrderForAllUsers(symbol, side);
