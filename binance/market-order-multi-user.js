@@ -28,7 +28,7 @@ const SL_PCT = 1.5;                // positive number
 const TRAILING_STOP_PCT = 2.0;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
-const COIN_LIST = ["AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT","BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT","AAVEUSDT","ADAUSDT","TONUSDT"];
+const COIN_LIST = ["AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT","BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT","AAVEUSDT","ADAUSDT","TONUSDT","FILUSDT","LINKUSDT"];
 const MAX_TRADES = 4;
 const SYMBOL_COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3 hours
 let BOT_PAUSED = false;
@@ -338,9 +338,9 @@ setInterval(async()=>{
       if(dir==="BUY" && lastCandle.close<vwap) continue;
       if(dir==="SELL" && lastCandle.close>vwap) continue;
 
-      if (await isNearSupportResistance(symbol, side)) {
+      if (await isNearSupportResistance(symbol, dir)) {
   await sendMessage(`🚫 ${symbol} blocked — price too close to support/resistance`);
-  return;
+  continue;
 }
 
 await executeMarketOrderForAllUsers(symbol, side);
@@ -372,4 +372,32 @@ bot.onText(/\/closeall/, async (msg)=>{
   }
   activePositions = {};
   await sendMessage("🛑 All positions have been closed.");
+});
+bot.onText(/\/close (.+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase().trim();
+
+  if (!activePositions[symbol]) {
+    await sendMessage(`⚠️ No active position found for *${symbol}*`);
+    return;
+  }
+
+  for (const [userId, pos] of Object.entries(activePositions[symbol])) {
+    const client = userClients[userId];
+    if (!client) continue;
+
+    try {
+      if (pos.side === "BUY") {
+        await client.futuresMarketSell(symbol, pos.qty);
+      } else {
+        await client.futuresMarketBuy(symbol, pos.qty);
+      }
+
+      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
+    } catch (err) {
+      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
+    }
+  }
+
+  delete activePositions[symbol];
+  await sendMessage(`✅ *${symbol}* fully closed for all users`);
 });
