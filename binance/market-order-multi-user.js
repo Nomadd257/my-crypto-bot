@@ -11,80 +11,68 @@ const fs = require("fs");
 const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
-// =====================================================
-// TELEGRAM DETAILS (AS REQUESTED)
-// =====================================================
+// --- TELEGRAM DETAILS ---
 const TELEGRAM_BOT_TOKEN = "8247817335:AAEKf92ex9eiDZKoan1O8uzZ3ls5uEjJsQw";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "7476742687";
-
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// =====================================================
-// FILES
-// =====================================================
+// --- USERS FILE ---
 const USERS_FILE = "./users.json";
 
-// =====================================================
-// SETTINGS
-// =====================================================
-const TRADE_PERCENT = 0.10;
+// --- Settings ---
+const TRADE_PERCENT = 0.10;        // 10% of USDT balance
 const LEVERAGE = 20;
-
 const TP_PCT = 2.0;
-const SL_PCT = 1.5;
+const SL_PCT = 1.5;                // positive number
 const TRAILING_STOP_PCT = 2.0;
-
-const MAX_TRADES = 4;
-const SYMBOL_COOLDOWN_MS = 3 * 60 * 60 * 1000;
-
-const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MONITOR_INTERVAL_MS = 5000;
+const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
+const COIN_LIST = ["AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT","BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT","AAVEUSDT","ADAUSDT","TONUSDT"];
+const MAX_TRADES = 4;
+const SYMBOL_COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3 hours
+let BOT_PAUSED = false;
 
-const COIN_LIST = [
-  "AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT",
-  "BNBUSDT","SOLUSDT","UNIUSDT","BCHUSDT","AAVEUSDT",
-  "ADAUSDT","TONUSDT"
-];
-
-// =====================================================
-// TRADING SESSIONS (UTC)
-// =====================================================
+// --- Trading sessions in UTC ---
 const SESSIONS = [
   { name: "Asia", start: 0, end: 9 },
   { name: "London", start: 7, end: 16 },
   { name: "New York", start: 12, end: 21 }
 ];
 
-// =====================================================
-// STATE
-// =====================================================
-let BOT_PAUSED = false;
-let activePositions = {};     // { symbol: { userId: position } }
-let symbolCooldowns = {};     // { symbol: timestamp }
-let userClients = {};         // { userId: binanceClient }
+// --- In-memory ---
+let activePositions = {};   // { symbol: { userId: { side, entryPrice, qty, highest, lowest, trailingStop, openedAt } } }
+let symbolCooldowns = {};   // { symbol: timestamp }
+let userClients = {};       // { userId: client }
 
-// =====================================================
-// LOGGING
-// =====================================================
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
-}
+// --- Initialize Binance clients at startup ---
+createBinanceClients();
+log("✅ Binance clients initialized at startup.");
 
-// =====================================================
-// TELEGRAM HELPERS
-// =====================================================
-async function sendMessage(msg) {
-  try { await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" }); } catch {}
-  try { await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" }); } catch {}
-}
+// --- Refresh users periodically ---
+setInterval(() => {
+  createBinanceClients();
+  log("🔄 User clients refreshed.");
+}, 60 * 1000);
 
-// =====================================================
-// SESSION CHECK
-// =====================================================
-function isSessionActive() {
-  const h = new Date().getUTCHours();
-  return SESSIONS.some(s => h >= s.start && h < s.end);
+// --- Logging ---
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+// --- Load Users ---
+function loadUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    const users = [];
+    if (Array.isArray(parsed)) {
+      for (const u of parsed) if(u.active && u.apiKey && u.apiSecret) users.push({id:String(u.id),apiKey:u.apiKey,apiSecret:u.apiSecret});
+    } else {
+      for (const [k,v] of Object.entries(parsed)) if(v.active && v.apiKey && v.apiSecret) users.push({id:String(k),apiKey:v.apiKey,apiSecret:v.apiSecret});
+    }
+    return users;
+  } catch(err) { log(`❌ loadUsers error: ${err?.message||err}`); return []; }
 }
 
 // --- Create Binance clients ---
@@ -99,6 +87,18 @@ function createBinanceClients() {
     } catch(err){ log(`❌ createBinanceClients failed for ${u.id}: ${err?.message||err}`); }
   }
   return Object.entries(userClients).map(([userId, client])=>({ userId, client }));
+}
+
+// --- Telegram send ---
+async function sendMessage(msg){
+  try{ await bot.sendMessage(GROUP_CHAT_ID,msg,{parse_mode:"Markdown"}); } catch{}
+  try{ await bot.sendMessage(ADMIN_ID,msg,{parse_mode:"Markdown"}); } catch{}
+}
+
+// --- Session check ---
+function isSessionActive(){
+  const h = new Date().getUTCHours();
+  return SESSIONS.some(s=>h>=s.start && h<s.end);
 }
 
 // --- Fetch Futures Klines ---
@@ -144,83 +144,78 @@ async function checkVolumeImbalance(symbol,direction){
   } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }
 }
 
-// --- Execute market orders for all users (FIXED & ROBUST) ---
+// --- Floor qty ---
+function floorToStep(qty,step){
+  const s=Number(step); if(!s||s<=0) return qty;
+  const factor=Math.round(1/s);
+  return Number((Math.floor(qty*factor)/factor).toFixed((s.toString().split(".")[1]||"").length));
+}
+
+// --- Execute market orders for all users ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
-  try {
-    // 🔑 ALWAYS recreate clients at execution time
-    const clients = createBinanceClients();
+  const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
+  if (!clients.length) {
+    await sendMessage(`⚠️ No active users.`);
+    return;
+  }
 
-    if (!clients.length) {
-      await sendMessage(`⚠️ No active users found. Check users.json`);
-      return;
-    }
+  await sendMessage(`📢 Executing ${direction} on *${symbol}* for all users...`);
 
-    await sendMessage(`📢 Executing ${direction} on *${symbol}* for all users...`);
+  for (const { userId, client } of clients) {
+    try {
+      // Set leverage
+      await client.futuresLeverage(symbol, LEVERAGE).catch(() => {});
 
-    for (const { userId, client } of clients) {
-      try {
-        // Ensure one-way mode & leverage
-        try { await client.futuresPositionSideDual(false); } catch {}
-        try { await client.futuresLeverage(symbol, LEVERAGE); } catch {}
-
-        // Fetch USDT balance
+      // Fetch USDT balance
         const balances = await client.futuresBalance();
         const usdtBal = balances.find(b => b.asset === "USDT");
         const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
-        if (!bal || bal <= 0) {await sendMessage('⚠️ User ${userId} has *NO USDT* in Futures wallet. Trade skipped.'); continue;}
+        if (!bal || bal <= 0) {await sendMessage(`⚠️ User ${userId} has *NO USDT* in Futures wallet. Trade skipped.`); continue;}
 
-        // Fetch mark price
-        let markPrice = null;
-        try {
-          const mp = await client.futuresMarkPrice(symbol);
-          markPrice = mp.markPrice
-            ? parseFloat(mp.markPrice)
-            : parseFloat(mp[0]?.markPrice || 0);
-        } catch {}
+      // Get mark price
+      let markPrice = 0;
+      try {
+        const mp = await client.futuresMarkPrice(symbol);
+        markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
+      } catch (err) {
+        log(`⚠️ markPrice fetch error for ${symbol}: ${err?.message || err}`);
+      }
 
-        // Fallback to last candle close
-        if (!markPrice) {
-          const k = await fetchFuturesKlines(symbol, "1m", 1);
-          if (k && k.length) markPrice = k[0].close;
+      if (!markPrice || markPrice <= 0) {
+        // fallback to last 1m candle close
+        const k = await fetchFuturesKlines(symbol, "1m", 1);
+        markPrice = k && k.length ? k[0].close : 0;
+      }
+
+      if (!markPrice || markPrice <= 0) {
+        log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`);
+        continue;
+      }
+
+      // Calculate quantity
+      const tradeValue = bal * TRADE_PERCENT;
+      const rawQty = (tradeValue * LEVERAGE) / markPrice;
+
+      // Get lot size step
+      let lotStep = 0.001;
+      try {
+        const info = await client.futuresExchangeInfo();
+        const s = info.symbols.find(s => s.symbol === symbol);
+        if (s) lotStep = parseFloat(s.filters.find(f => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
+      } catch {}
+
+      const qty = floorToStep(rawQty, lotStep);
+      if (!qty || qty <= 0) continue;
+
+      // --- PLACE ORDER ---
+      try {
+        if (direction === "BUY") {
+          await client.futuresMarketBuy(symbol, qty);
+        } else {
+          await client.futuresMarketSell(symbol, qty);
         }
 
-        if (!markPrice || markPrice <= 0) continue;
-
-        // Calculate quantity
-        const tradeValue = bal * TRADE_PERCENT;
-        const rawQty = (tradeValue * LEVERAGE) / markPrice;
-
-        // Get lot size
-        let lotStep = 0.001;
-        try {
-          const info = await client.futuresExchangeInfo();
-          const s = info.symbols.find(x => x.symbol === symbol);
-          if (s) {
-            const lot = s.filters.find(f => f.filterType === "LOT_SIZE");
-            if (lot?.stepSize) lotStep = parseFloat(lot.stepSize);
-          }
-        } catch {}
-
-        const qty = floorToStep(rawQty, lotStep);
-        if (!qty || qty <= 0) continue;
-
-        // 🔥 PLACE ORDER (with fallback)
-        try {
-          if (direction === "BUY") {
-            await client.futuresMarketBuy(symbol, qty);
-          } else {
-            await client.futuresMarketSell(symbol, qty);
-          }
-        } catch (e) {
-          // Fallback method (older SDKs)
-          if (direction === "BUY") {
-            await client.futuresMarketOrder(symbol, "BUY", qty);
-          } else {
-            await client.futuresMarketOrder(symbol, "SELL", qty);
-          }
-        }
-
-        // Store active position
+        // Record active position
         if (!activePositions[symbol]) activePositions[symbol] = {};
         activePositions[symbol][userId] = {
           side: direction,
@@ -232,26 +227,21 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           lowest: markPrice
         };
 
-        await sendMessage(
-          `✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`
-        );
-
+        await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
       } catch (err) {
-        log(`❌ Order failed for ${userId} ${symbol}: ${err?.message || err}`);
+        log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
       }
+
+    } catch (err) {
+      log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
     }
-
-    // Cooldown AFTER execution
-    symbolCooldowns[symbol] = Date.now();
-
-  } catch (err) {
-    log(`❌ executeMarketOrderForAllUsers fatal error: ${err?.message || err}`);
   }
+
+  // Set cooldown for the symbol
+  symbolCooldowns[symbol] = Date.now();
 }
 
-// =====================================================
-// MONITOR POSITIONS (TP / SL / TRAILING)
-// =====================================================
+// --- Monitor positions ---
 async function monitorPositions(){
   for(const [symbol,users] of Object.entries(activePositions)){
     for(const [userId,pos] of Object.entries(users)){
@@ -297,65 +287,62 @@ async function monitorPositions(){
 }
 setInterval(monitorPositions,MONITOR_INTERVAL_MS);
 
+// --- Full-auto scanning loop ---
+setInterval(async()=>{
+  if(BOT_PAUSED){
+    log("⏸️ Bot is paused.");
+    return;
+  }
 
-// =====================================================
-// FULL AUTO SCANNER
-// =====================================================
-setInterval(async () => {
-  if (BOT_PAUSED) return;
-  if (!isSessionActive()) return;
+  if(!isSessionActive()){
+    log("⏳ No active trading session.");
+    return;
+  }
 
-  let openTrades = Object.values(activePositions)
-    .reduce((a,b)=>a+Object.keys(b).length,0);
+  let openTrades = Object.values(activePositions).reduce((acc,users)=>acc+Object.keys(users).length,0);
+  for(const symbol of COIN_LIST){
+    if(openTrades>=MAX_TRADES) break;
 
-  for (const symbol of COIN_LIST) {
-    if (openTrades >= MAX_TRADES) break;
-    if (Date.now() - (symbolCooldowns[symbol] || 0) < SYMBOL_COOLDOWN_MS) continue;
+    const lastTradeTime = symbolCooldowns[symbol]||0;
+    if(Date.now()-lastTradeTime<SYMBOL_COOLDOWN_MS) continue;
 
-    for (const dir of ["BUY","SELL"]) {
-      if (!(await checkVolumeImbalance(symbol, dir))) continue;
-
+    for(const dir of ["BUY","SELL"]){
+      const volOk = await checkVolumeImbalance(symbol,dir);
       const vwap = await calculateVWAP(symbol);
-      const last = (await fetchFuturesKlines(symbol, "15m", 1))[0];
+      if(!volOk || !vwap) continue;
 
-      if (dir === "BUY" && last.close < vwap) continue;
-      if (dir === "SELL" && last.close > vwap) continue;
+      // Directional VWAP check
+      const lastCandle = (await fetchFuturesKlines(symbol,"15m",1))[0];
+      if(dir==="BUY" && lastCandle.close<vwap) continue;
+      if(dir==="SELL" && lastCandle.close>vwap) continue;
 
-      await executeMarketOrderForAllUsers(symbol, dir);
+      await executeMarketOrderForAllUsers(symbol,dir);
       openTrades++;
-      break;
+      break; // only one direction per symbol at a time
     }
   }
+
 }, SIGNAL_CHECK_INTERVAL_MS);
 
-// =====================================================
-// TELEGRAM COMMANDS
-// =====================================================
-bot.onText(/\/pause/, () => {
+// --- Telegram commands ---
+bot.onText(/\/pause/, async (msg)=>{
   BOT_PAUSED = true;
-  sendMessage("⏸️ Bot paused");
+  await sendMessage("⏸️ Bot has been paused.");
 });
-
-bot.onText(/\/resume/, () => {
+bot.onText(/\/resume/, async (msg)=>{
   BOT_PAUSED = false;
-  sendMessage("▶️ Bot resumed");
+  await sendMessage("▶️ Bot has resumed operation.");
 });
-
-bot.onText(/\/closeall/, async () => {
-  for (const [symbol, users] of Object.entries(activePositions)) {
-    for (const [userId, pos] of Object.entries(users)) {
-      const client = userClients[userId];
-      if (!client) continue;
-      pos.side === "BUY"
-        ? await client.futuresMarketSell(symbol, pos.qty)
-        : await client.futuresMarketBuy(symbol, pos.qty);
+bot.onText(/\/closeall/, async (msg)=>{
+  for(const [symbol,users] of Object.entries(activePositions)){
+    for(const [userId,pos] of Object.entries(users)){
+      const client = userClients[userId]; if(!client) continue;
+      try{
+        if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty);
+        else await client.futuresMarketBuy(symbol,pos.qty);
+      }catch{}
     }
   }
   activePositions = {};
-  sendMessage("🛑 All positions closed");
+  await sendMessage("🛑 All positions have been closed.");
 });
-
-// =====================================================
-// STARTUP
-// =====================================================
-initializeUsers();
