@@ -144,6 +144,28 @@ async function checkVolumeImbalance(symbol,direction){
   } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }
 }
 
+// --- Support / Resistance proximity filter (15m) ---
+async function isNearSupportResistance(symbol, direction, lookback = 50, bufferPct = 0.005) {
+  const candles = await fetchFuturesKlines(symbol, "15m", lookback);
+  if (!candles || candles.length < lookback) return true;
+
+  let high = -Infinity;
+  let low = Infinity;
+
+  for (const c of candles) {
+    if (c.high > high) high = c.high;
+    if (c.low < low) low = c.low;
+  }
+
+  const lastClose = candles[candles.length - 1].close;
+  const buffer = lastClose * bufferPct;
+
+  if (direction === "BUY" && lastClose <= low + buffer) return true;
+  if (direction === "SELL" && lastClose >= high - buffer) return true;
+
+  return false;
+}
+
 // --- Floor qty ---
 function floorToStep(qty,step){
   const s=Number(step); if(!s||s<=0) return qty;
@@ -316,7 +338,12 @@ setInterval(async()=>{
       if(dir==="BUY" && lastCandle.close<vwap) continue;
       if(dir==="SELL" && lastCandle.close>vwap) continue;
 
-      await executeMarketOrderForAllUsers(symbol,dir);
+      if (await isNearSupportResistance(symbol, side)) {
+  await sendMessage(`🚫 ${symbol} blocked — price too close to support/resistance`);
+  return;
+}
+
+await executeMarketOrderForAllUsers(symbol, side);
       openTrades++;
       break; // only one direction per symbol at a time
     }
