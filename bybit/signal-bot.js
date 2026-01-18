@@ -11,13 +11,13 @@ const TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN_BYBIT_FVG;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_CHAT_IDS = [
   "1718404728",
-  "1013510628",
+  // "1013510628",
   "6333835622",
   "688928512",
   "7600568400",
   "6190443463",
   "8378624998",
-  "6945419628",
+  // "6945419628",
   "7080892234",
   // "1379711480",
   // "7536798670",
@@ -84,7 +84,7 @@ async function sendTelegramAlert(message) {
       .catch((err) => {
         console.error(`sendMessage to ${chat_id} failed:`, err?.response?.data || err.message);
         return null;
-      })
+      }),
   );
   await Promise.all(requests);
 }
@@ -209,8 +209,8 @@ function calcOBVTrend(candles, window = PERSIST_OBV_WINDOW) {
       candles[i].close > candles[i - 1].close
         ? candles[i].volume
         : candles[i].close < candles[i - 1].close
-        ? -candles[i].volume
-        : 0;
+          ? -candles[i].volume
+          : 0;
     obv += delta;
     arr.push(obv);
   }
