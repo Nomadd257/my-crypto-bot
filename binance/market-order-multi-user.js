@@ -57,9 +57,9 @@ const SESSIONS = [
 ];
 
 // --- In-memory ---
-let activePositions = {}; // { symbol: { userId: { side, entryPrice, qty, highest, lowest, trailingStop, openedAt } } }
-let symbolCooldowns = {}; // { symbol: timestamp }
-let userClients = {}; // { userId: client }
+let activePositions = {};
+let symbolCooldowns = {};
+let userClients = {};
 
 // --- Logging ---
 function log(msg) {
