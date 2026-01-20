@@ -250,33 +250,43 @@ async function monitorPositions() {
         const mark = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
         if (!mark) continue;
 
-        // --- Momentum validation (early exit) ---
-        if (
-          !pos.momentumChecked &&
-          Date.now() - pos.openedAt >= MOMENTUM_TIME_MS
-        ) {
-          const movePct =
-            pos.side === "BUY"
-              ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
-              : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
+        // --- Momentum validation with VWAP hold (replace existing momentum block) ---
+if (
+  !pos.momentumChecked &&
+  Date.now() - pos.openedAt >= MOMENTUM_TIME_MS
+) {
+  const movePct =
+    pos.side === "BUY"
+      ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
+      : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
 
-          pos.momentumChecked = true;
+  // Get current VWAP (same timeframe you use for entries)
+  const vwap = await calculateVWAP(symbol, "15m", 20);
 
-          if (movePct < MOMENTUM_MIN_MOVE_PCT) {
-            if (pos.side === "BUY") {
-              await client.futuresMarketSell(symbol, Math.abs(amt));
-            } else {
-              await client.futuresMarketBuy(symbol, Math.abs(amt));
-            }
+  pos.momentumChecked = true;
 
-            await sendMessage(
-              `⚠️ Momentum Exit: *${symbol}* failed to move +${MOMENTUM_MIN_MOVE_PCT}% in 15m (User ${userId})`
-            );
+  let exitEarly = false;
 
-            delete activePositions[symbol][userId];
-            continue;
-          }
-        }
+  if (movePct < MOMENTUM_MIN_MOVE_PCT && vwap) {
+    if (pos.side === "BUY" && mark < vwap) exitEarly = true;
+    if (pos.side === "SELL" && mark > vwap) exitEarly = true;
+  }
+
+  if (exitEarly) {
+    if (pos.side === "BUY") {
+      await client.futuresMarketSell(symbol, Math.abs(amt));
+    } else {
+      await client.futuresMarketBuy(symbol, Math.abs(amt));
+    }
+
+    await sendMessage(
+      `⚠️ Momentum + VWAP Exit: *${symbol}* failed momentum and lost VWAP (User ${userId})`
+    );
+
+    delete activePositions[symbol][userId];
+    continue;
+  }
+}
 
         // --- Trailing Stop Logic ---
         if (pos.side === "BUY") {
