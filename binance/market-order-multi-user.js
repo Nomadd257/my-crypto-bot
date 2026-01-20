@@ -31,6 +31,10 @@ const TRAILING_STOP_PCT = 2.0;
 const MOMENTUM_MIN_MOVE_PCT = 0.3;          // +0.3%
 const MOMENTUM_TIME_MS = 15 * 60 * 1000;    // 1 × 15m candle
 
+// --- VWAP zone awareness ---
+const VWAP_BAND_PCT = 0.5;          // VWAP upper/lower band %
+const VWAP_MOMENTUM_CONFIRM_PCT = 0.5; // Strong momentum confirmation
+
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const COIN_LIST = [
@@ -250,45 +254,39 @@ async function monitorPositions() {
         const mark = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
         if (!mark) continue;
 
-        // --- Momentum validation with VWAP hold (replace existing momentum block) ---
-if (
-  !pos.momentumChecked &&
-  Date.now() - pos.openedAt >= MOMENTUM_TIME_MS
-) {
-  const movePct =
-    pos.side === "BUY"
-      ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
-      : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
+        // --- Momentum + VWAP validation ---
+        if (!pos.momentumChecked && Date.now() - pos.openedAt >= MOMENTUM_TIME_MS) {
+          const movePct =
+            pos.side === "BUY"
+              ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
+              : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
 
-  // Get current VWAP (same timeframe you use for entries)
-  const vwap = await calculateVWAP(symbol, "15m", 20);
+          // Get VWAP
+          const vwap = await calculateVWAP(symbol, "15m", 20);
+          if (!vwap) continue;
 
-  pos.momentumChecked = true;
+          const priceVsVWAP = pos.side === "BUY" ? mark > vwap : mark < vwap;
 
-  let exitEarly = false;
+          pos.momentumChecked = true;
 
-  if (movePct < MOMENTUM_MIN_MOVE_PCT && vwap) {
-    if (pos.side === "BUY" && mark < vwap) exitEarly = true;
-    if (pos.side === "SELL" && mark > vwap) exitEarly = true;
-  }
+          // Exit ONLY if momentum fails AND price loses VWAP
+          if (movePct < MOMENTUM_MIN_MOVE_PCT && !priceVsVWAP) {
+            if (pos.side === "BUY") {
+              await client.futuresMarketSell(symbol, Math.abs(amt));
+            } else {
+              await client.futuresMarketBuy(symbol, Math.abs(amt));
+            }
 
-  if (exitEarly) {
-    if (pos.side === "BUY") {
-      await client.futuresMarketSell(symbol, Math.abs(amt));
-    } else {
-      await client.futuresMarketBuy(symbol, Math.abs(amt));
-    }
+            await sendMessage(
+              `⚠️ Momentum + VWAP Exit: *${symbol}* failed move ${movePct.toFixed(2)}% & lost VWAP (User ${userId})`
+            );
 
-    await sendMessage(
-      `⚠️ Momentum + VWAP Exit: *${symbol}* failed momentum and lost VWAP (User ${userId})`
-    );
+            delete activePositions[symbol][userId];
+            continue;
+          }
+        }
 
-    delete activePositions[symbol][userId];
-    continue;
-  }
-}
-
-        // --- Trailing Stop Logic ---
+        // --- Trailing Stop ---
         if (pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, mark);
           const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
@@ -339,25 +337,49 @@ if (
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
 // --- Full-auto scanning loop ---
-setInterval(async()=>{
-  if(BOT_PAUSED){ log("⏸️ Bot is paused."); return; }
-  if(!isSessionActive()){ log("⏳ No active trading session."); return; }
+setInterval(async () => {
+  if (BOT_PAUSED) { log("⏸️ Bot is paused."); return; }
+  if (!isSessionActive()) { log("⏳ No active trading session."); return; }
 
-  let openTrades = Object.values(activePositions).reduce((acc,users)=>acc+Object.keys(users).length,0);
-  for(const symbol of COIN_LIST){
-    if(openTrades>=MAX_TRADES) break;
-    const lastTradeTime = symbolCooldowns[symbol]||0;
-    if(Date.now()-lastTradeTime<SYMBOL_COOLDOWN_MS) continue;
+  let openTrades = Object.values(activePositions).reduce((acc, users) => acc + Object.keys(users).length, 0);
 
-    for(const dir of ["BUY","SELL"]){
-      const volOk = await checkVolumeImbalance(symbol,dir);
+  for (const symbol of COIN_LIST) {
+    if (openTrades >= MAX_TRADES) break;
+
+    const lastTradeTime = symbolCooldowns[symbol] || 0;
+    if (Date.now() - lastTradeTime < SYMBOL_COOLDOWN_MS) continue;
+
+    for (const dir of ["BUY", "SELL"]) {
+      const volOk = await checkVolumeImbalance(symbol, dir);
       const vwap = await calculateVWAP(symbol);
-      if(!volOk || !vwap) continue;
+      if (!volOk || !vwap) continue;
 
-      const lastCandle = (await fetchFuturesKlines(symbol,"15m",1))[0];
-      if(dir==="BUY" && lastCandle.close<vwap) continue;
-      if(dir==="SELL" && lastCandle.close>vwap) continue;
+      const lastCandle = (await fetchFuturesKlines(symbol, "15m", 1))[0];
+      const price = lastCandle.close;
 
+      // --- VWAP band calculation ---
+      const upperBand = vwap * (1 + VWAP_BAND_PCT / 100);
+      const lowerBand = vwap * (1 - VWAP_BAND_PCT / 100);
+
+      // % move from VWAP
+      const vwapMovePct = ((price - vwap) / vwap) * 100;
+
+      // --- VWAP zone filters ---
+      if (dir === "BUY") {
+        // No-trade zone
+        if (price <= upperBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
+        // Strong buy dominance only
+        if (price < vwap) continue;
+      }
+
+      if (dir === "SELL") {
+        // No-trade zone
+        if (price >= lowerBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
+        // Strong sell dominance only
+        if (price > vwap) continue;
+      }
+
+      // --- Execute trade ---
       await executeMarketOrderForAllUsers(symbol, dir);
       openTrades++;
       break;
