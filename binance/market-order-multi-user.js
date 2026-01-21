@@ -144,40 +144,42 @@ async function getVWAPBias(symbol) {
   return "NEUTRAL";  
 }  
 
-// --- Last candle volume imbalance (tighter, 3-candle logic) ---  
-async function checkVolumeImbalance(symbol,direction){  
-  try{  
-    const candles = await fetchFuturesKlines(symbol,"15m",4);  
-    if(!candles || candles.length<4) return false;  
+// --- Last candle volume imbalance ---
+async function checkVolumeImbalance(symbol, direction) {
+  try {
+    // Fetch only the last 15-min candle
+    const candles = await fetchFuturesKlines(symbol, "15m", 1);
+    if (!candles || candles.length < 1) return false;
 
-    let dominance=0;  
-    let volumes=[];  
+    const lastCandle = candles[0];
 
-    for(let i=0;i<3;i++){  
-      const start=candles[i].time;  
-      const end=candles[i+1].time;  
+    // Fetch aggregated trades during this candle
+    const tradesRes = await fetch(
+      `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${lastCandle.time}&endTime=${lastCandle.time + 15*60*1000}`
+    );
+    if (!tradesRes.ok) return false;
 
-      const res = await fetch(`https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${start}&endTime=${end}`);  
-      if(!res.ok) continue;  
-      const trades = await res.json();  
-      let buyVol=0,sellVol=0;  
+    const trades = await tradesRes.json();
 
-      for(const t of trades){ if(t.m) sellVol+=+t.q; else buyVol+=+t.q; }  
-      const total = buyVol+sellVol;  
-      if(!total) continue;  
-      volumes.push(total);  
+    let buyVol = 0, sellVol = 0;
+    for (const t of trades) {
+      if (t.m) sellVol += parseFloat(t.q); // 'm' = market sell
+      else buyVol += parseFloat(t.q);      // buy trades
+    }
 
-      if((direction==="BUY" && buyVol/total>=0.6) || (direction==="SELL" && sellVol/total>=0.6)) dominance++;  
-    }  
+    const total = buyVol + sellVol;
+    if (total === 0) return false;
 
-    if(dominance<2) return false;  
-    const avgVol=(volumes[0]+volumes[1])/2;  
-    const lastVol=volumes[2];  
-    if(lastVol<avgVol*1.2) return false;  
+    // Directional dominance
+    if (direction === "BUY") return buyVol / total >= 0.6;  // 60%+ buy dominance
+    if (direction === "SELL") return sellVol / total >= 0.6; // 60%+ sell dominance
 
-    return true;  
-  } catch(err){ log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message||err}`); return false; }  
-}  
+    return false;
+  } catch (err) {
+    log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message || err}`);
+    return false;
+  }
+}
 
 // --- Floor qty ---  
 function floorToStep(qty,step){  
