@@ -133,16 +133,17 @@ async function calculateVWAP(symbol, interval="15m", limit=20){
   return cumVol ? cumPV/cumVol : null;  
 }  
 
-// --- 1H VWAP bias ---  
+// --- 30m VWAP bias ---  
 async function getVWAPBias(symbol) {  
-  const vwap15 = await calculateVWAP(symbol, "15m", 20);  
-  const vwap1h = await calculateVWAP(symbol, "1h", 20);  
-  if (!vwap15 || !vwap1h) return null;  
-  const diffPct = ((vwap15 - vwap1h) / vwap1h) * 100;  
+  const vwap15 = await calculateVWAP(symbol, "15m", 20);   // still using 15m for fast VWAP
+  const vwap30 = await calculateVWAP(symbol, "30m", 20);   // new higher timeframe VWAP
+  if (!vwap15 || !vwap30) return null;  
+
+  const diffPct = ((vwap15 - vwap30) / vwap30) * 100;      // % difference
   if (diffPct > VWAP_BIAS_PCT) return "BULLISH";  
   if (diffPct < -VWAP_BIAS_PCT) return "BEARISH";  
   return "NEUTRAL";  
-}  
+}
 
 // --- Last candle volume imbalance ---
 async function checkVolumeImbalance(symbol, direction) {
@@ -370,9 +371,9 @@ async function monitorPositions() {
   }
 }
 
-setInterval(monitorPositions, MONITOR_INTERVAL_MS);  
+setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto scanning loop ---
+// --- Full-auto scanning loop (cleaned for 30-min VWAP bias) ---
 setInterval(async () => {
   if (BOT_PAUSED) { 
     log("⏸️ Bot is paused."); 
@@ -383,8 +384,8 @@ setInterval(async () => {
     return; 
   }
 
-  let openTrades = Object.values(activePositions)
-    .reduce((acc, users) => acc + Object.keys(users).length, 0);
+  // --- Count open trades per symbol ---
+  let openTrades = Object.keys(activePositions).length;
 
   for (const symbol of COIN_LIST) {
     if (openTrades >= MAX_TRADES) break;
@@ -393,46 +394,47 @@ setInterval(async () => {
     if (Date.now() - lastTradeTime < SYMBOL_COOLDOWN_MS) continue;
 
     for (const dir of ["BUY", "SELL"]) {
-      // --- Check volume imbalance ---
-      const volOk = await checkVolumeImbalance(symbol, dir);
-      if (!volOk) continue;
+      try {
+        // --- Check volume imbalance ---
+        const volOk = await checkVolumeImbalance(symbol, dir);
+        if (!volOk) continue;
 
-      // --- Calculate 15m VWAP ---
-      const vwap = await calculateVWAP(symbol, "15m", 20);
-      if (!vwap) continue;
+        // --- Entry VWAP (15m) ---
+        const vwapEntry = await calculateVWAP(symbol, "15m", 20);
+        if (!vwapEntry) continue;
 
-      // --- Check 1H VWAP bias ---
-      const bias = await getVWAPBias(symbol);
-      if (!bias) continue;
-      if (dir === "BUY" && bias !== "BULLISH") continue;
-      if (dir === "SELL" && bias !== "BEARISH") continue;
+        // --- Bias VWAP (30m) using central function ---
+        const bias = await getVWAPBias(symbol);
+        if (!bias) continue;
+        if ((dir === "BUY" && bias !== "BULLISH") || (dir === "SELL" && bias !== "BEARISH")) continue;
 
-      // --- Fetch last candle ---
-      const lastCandle = (await fetchFuturesKlines(symbol, "15m", 1))[0];
-      if (!lastCandle) continue;
-      const price = lastCandle.close;
+        // --- Fetch last 15m candle ---
+        const lastCandle = (await fetchFuturesKlines(symbol, "15m", 1))?.[0];
+        if (!lastCandle) continue;
+        const price = lastCandle.close;
 
-      // --- VWAP bands ---
-      const upperBand = vwap * (1 + VWAP_BAND_PCT / 100);
-      const lowerBand = vwap * (1 - VWAP_BAND_PCT / 100);
-      const vwapMovePct = ((price - vwap) / vwap) * 100;
+        // --- VWAP entry bands ---
+        const upperBand = vwapEntry * (1 + VWAP_BAND_PCT / 100);
+        const lowerBand = vwapEntry * (1 - VWAP_BAND_PCT / 100);
+        const vwapMovePct = ((price - vwapEntry) / vwapEntry) * 100;
 
-      // --- VWAP band filters ---
-      if (dir === "BUY") {
-        // Skip if price in no-trade zone or below VWAP
-        if (price <= upperBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
-        if (price < vwap) continue;
+        // --- VWAP band filters ---
+        if (dir === "BUY") {
+          if (price <= upperBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
+          if (price < vwapEntry) continue;
+        } else {
+          if (price >= lowerBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
+          if (price > vwapEntry) continue;
+        }
+
+        // --- Execute trade for all users ---
+        await executeMarketOrderForAllUsers(symbol, dir);
+        openTrades++; // increment trades per symbol
+        break; // move to next symbol after a trade
+      } catch (err) {
+        log(`❌ scanLoop error for ${symbol} ${dir}: ${err?.message || err}`);
+        continue;
       }
-      if (dir === "SELL") {
-        // Skip if price in no-trade zone or above VWAP
-        if (price >= lowerBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
-        if (price > vwap) continue;
-      }
-
-      // --- Execute trade ---
-      await executeMarketOrderForAllUsers(symbol, dir);
-      openTrades++;
-      break; // Move to next symbol after trade
     }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
