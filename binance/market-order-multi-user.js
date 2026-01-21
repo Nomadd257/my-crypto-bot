@@ -234,49 +234,142 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
   symbolCooldowns[symbol] = Date.now();  
 }  
 
-// --- Monitor positions ---  
-async function monitorPositions() {  
-  for (const [symbol, users] of Object.entries(activePositions)) {  
-    for (const [userId, pos] of Object.entries(users)) {  
-      const client = userClients[userId];  
-      if (!client) { delete activePositions[symbol][userId]; continue; }  
+// --- Monitor positions ---
+async function monitorPositions() {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
+      if (!client) {
+        delete activePositions[symbol][userId];
+        continue;
+      }
 
-      try {  
-        const positions = await client.futuresPositionRisk();  
-        const p = Array.isArray(positions) ? positions.find(x => x.symbol === symbol) : null;  
-        const amt = p ? parseFloat(p.positionAmt || 0) : 0;  
-        if (!p || amt === 0) { delete activePositions[symbol][userId]; continue; }  
+      try {
+        // --- Fetch position ---
+        const positions = await client.futuresPositionRisk();
+        const p = Array.isArray(positions)
+          ? positions.find(x => x.symbol === symbol)
+          : null;
 
-        const mp = await client.futuresMarkPrice(symbol);  
-        const mark = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);  
-        if (!mark) continue;  
+        const amt = p ? parseFloat(p.positionAmt || 0) : 0;
+        if (!p || amt === 0) {
+          delete activePositions[symbol][userId];
+          continue;
+        }
 
-        if (!pos.momentumChecked && Date.now() - pos.openedAt >= MOMENTUM_TIME_MS) {  
-          const movePct = pos.side==="BUY"?((mark-pos.entryPrice)/pos.entryPrice)*100:((pos.entryPrice-mark)/pos.entryPrice)*100;  
-          const vwap = await calculateVWAP(symbol,"15m",20);  
-          if(!vwap) continue;  
-          const priceVsVWAP = pos.side==="BUY"?mark>vwap:mark<vwap;  
-          pos.momentumChecked=true;  
-          if(movePct<MOMENTUM_MIN_MOVE_PCT && !priceVsVWAP){  
-            if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt));  
-            else await client.futuresMarketBuy(symbol,Math.abs(amt));  
-            await sendMessage(`⚠️ Momentum + VWAP Exit: *${symbol}* failed move ${movePct.toFixed(2)}% & lost VWAP (User ${userId})`);  
-            delete activePositions[symbol][userId];  
-            continue;  
-          }  
-        }  
+        // --- Mark price (safe) ---
+        let mark = 0;
+        try {
+          const mp = await client.futuresMarkPrice(symbol);
+          mark = mp?.markPrice ? parseFloat(mp.markPrice) : 0;
+        } catch {}
+        if (!mark || mark <= 0) continue;
 
-        if(pos.side==="BUY"){ pos.highest=Math.max(pos.highest,mark); const trail=pos.highest*(1-TRAILING_STOP_PCT/100); if(!pos.trailingStop||trail>pos.trailingStop) pos.trailingStop=trail; if(mark<=pos.trailingStop){ await client.futuresMarketSell(symbol,Math.abs(amt)); await sendMessage(`🔒 [User ${userId}] Trailing Stop Triggered on *${symbol}*`); delete activePositions[symbol][userId]; continue; } }  
-        else{ pos.lowest=Math.min(pos.lowest,mark); const trail=pos.lowest*(1+TRAILING_STOP_PCT/100); if(!pos.trailingStop||trail<pos.trailingStop) pos.trailingStop=trail; if(mark>=pos.trailingStop){ await client.futuresMarketBuy(symbol,Math.abs(amt)); await sendMessage(`🔒 [User ${userId}] Trailing Stop Triggered on *${symbol}*`); delete activePositions[symbol][userId]; continue; } }  
+        // =====================================================
+        // 1️⃣ Momentum + VWAP early validation (ONE-TIME CHECK)
+        // =====================================================
+        if (!pos.momentumChecked && Date.now() - pos.openedAt >= MOMENTUM_TIME_MS) {
+          const movePct =
+            pos.side === "BUY"
+              ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
+              : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
 
-        const move = pos.side==="BUY"?((mark-pos.entryPrice)/pos.entryPrice)*100:((pos.entryPrice-mark)/pos.entryPrice)*100;  
-        if(move>=TP_PCT){ await client.futuresMarketSell(symbol,Math.abs(amt)); await sendMessage(`🎯 TAKE PROFIT HIT for User ${userId} on *${symbol}*`); delete activePositions[symbol][userId]; continue; }  
-        if(move<=-SL_PCT){ await client.futuresMarketSell(symbol,Math.abs(amt)); await sendMessage(`🔻 STOP LOSS HIT for User ${userId} on *${symbol}*`); delete activePositions[symbol][userId]; continue; }  
+          let vwapOk = true;
+          try {
+            const vwap = await calculateVWAP(symbol, "15m", 20);
+            if (vwap) {
+              vwapOk = pos.side === "BUY" ? mark > vwap : mark < vwap;
+            }
+          } catch {}
 
-      } catch(err){ log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message||err}`); }  
-    }  
-  }  
-}  
+          pos.momentumChecked = true;
+
+          if (movePct < MOMENTUM_MIN_MOVE_PCT && !vwapOk) {
+            if (pos.side === "BUY") {
+              await client.futuresMarketSell(symbol, Math.abs(amt));
+            } else {
+              await client.futuresMarketBuy(symbol, Math.abs(amt));
+            }
+
+            await sendMessage(
+              `⚠️ Momentum + VWAP Exit: *${symbol}* (${movePct.toFixed(2)}%) User ${userId}`
+            );
+
+            delete activePositions[symbol][userId];
+            continue;
+          }
+        }
+
+        // ===============================
+        // 2️⃣ Trailing stop (ALWAYS RUNS)
+        // ===============================
+        if (pos.side === "BUY") {
+          pos.highest = Math.max(pos.highest, mark);
+          const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
+          if (!pos.trailingStop || trail > pos.trailingStop) {
+            pos.trailingStop = trail;
+          }
+          if (mark <= pos.trailingStop) {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
+            delete activePositions[symbol][userId];
+            continue;
+          }
+        } else {
+          pos.lowest = Math.min(pos.lowest, mark);
+          const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
+          if (!pos.trailingStop || trail < pos.trailingStop) {
+            pos.trailingStop = trail;
+          }
+          if (mark >= pos.trailingStop) {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
+            delete activePositions[symbol][userId];
+            continue;
+          }
+        }
+
+        // ======================
+        // 3️⃣ TP / SL (CRITICAL)
+        // ======================
+        const move =
+          pos.side === "BUY"
+            ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
+            : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
+
+        // TAKE PROFIT
+        if (move >= TP_PCT) {
+          if (pos.side === "BUY") {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+          } else {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+          }
+
+          await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`);
+          delete activePositions[symbol][userId];
+          continue;
+        }
+
+        // STOP LOSS
+        if (move <= -SL_PCT) {
+          if (pos.side === "BUY") {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+          } else {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+          }
+
+          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
+          delete activePositions[symbol][userId];
+          continue;
+        }
+
+      } catch (err) {
+        log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
+      }
+    }
+  }
+}
+
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);  
 
 // --- Full-auto scanning loop ---
