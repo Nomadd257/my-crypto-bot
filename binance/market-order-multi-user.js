@@ -358,9 +358,7 @@ setInterval(async () => {
 
     for (const dir of ["BUY", "SELL"]) {
       try {
-        // --- Check volume imbalance ---
-        const volOk = await checkVolumeImbalance(symbol, dir);
-        if (!volOk) continue;
+
 
         // --- Entry VWAP (15m) ---
         const vwapEntry = await calculateVWAP(symbol, "15m", 20);
