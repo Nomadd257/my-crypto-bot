@@ -145,43 +145,6 @@ async function getVWAPBias(symbol) {
   return "NEUTRAL";  
 }
 
-// --- Last candle volume imbalance ---
-async function checkVolumeImbalance(symbol, direction) {
-  try {
-    // Fetch only the last 15-min candle
-    const candles = await fetchFuturesKlines(symbol, "15m", 1);
-    if (!candles || candles.length < 1) return false;
-
-    const lastCandle = candles[0];
-
-    // Fetch aggregated trades during this candle
-    const tradesRes = await fetch(
-      `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&startTime=${lastCandle.time}&endTime=${lastCandle.time + 15*60*1000}`
-    );
-    if (!tradesRes.ok) return false;
-
-    const trades = await tradesRes.json();
-
-    let buyVol = 0, sellVol = 0;
-    for (const t of trades) {
-      if (t.m) sellVol += parseFloat(t.q); // 'm' = market sell
-      else buyVol += parseFloat(t.q);      // buy trades
-    }
-
-    const total = buyVol + sellVol;
-    if (total === 0) return false;
-
-    // Directional dominance
-    if (direction === "BUY") return buyVol / total >= 0.6;  // 60%+ buy dominance
-    if (direction === "SELL") return sellVol / total >= 0.6; // 60%+ sell dominance
-
-    return false;
-  } catch (err) {
-    log(`❌ checkVolumeImbalance error for ${symbol}: ${err?.message || err}`);
-    return false;
-  }
-}
-
 // --- Floor qty ---  
 function floorToStep(qty,step){  
   const s=Number(step); if(!s||s<=0) return qty;  
@@ -407,11 +370,6 @@ setInterval(async () => {
         const bias = await getVWAPBias(symbol);
         if (!bias) continue;
         if ((dir === "BUY" && bias !== "BULLISH") || (dir === "SELL" && bias !== "BEARISH")) continue;
-
-        // --- Fetch last 15m candle ---
-        const lastCandle = (await fetchFuturesKlines(symbol, "15m", 1))?.[0];
-        if (!lastCandle) continue;
-        const price = lastCandle.close;
 
         // --- VWAP entry bands ---
         const upperBand = vwapEntry * (1 + VWAP_BAND_PCT / 100);
