@@ -359,15 +359,22 @@ setInterval(async () => {
     for (const dir of ["BUY", "SELL"]) {
       try {
 
-
         // --- Entry VWAP (15m) ---
         const vwapEntry = await calculateVWAP(symbol, "15m", 20);
         if (!vwapEntry) continue;
 
-        // --- Bias VWAP (30m) using central function ---
+        // ✅ FIX: fetch last closed 15m candle to get price
+        const candles = await fetchFuturesKlines(symbol, "15m", 1);
+        if (!candles || !candles.length) continue;
+        const price = candles[0].close;
+
+        // --- Bias VWAP (30m) ---
         const bias = await getVWAPBias(symbol);
         if (!bias) continue;
-        if ((dir === "BUY" && bias !== "BULLISH") || (dir === "SELL" && bias !== "BEARISH")) continue;
+        if (
+          (dir === "BUY" && bias !== "BULLISH") ||
+          (dir === "SELL" && bias !== "BEARISH")
+        ) continue;
 
         // --- VWAP entry bands ---
         const upperBand = vwapEntry * (1 + VWAP_BAND_PCT / 100);
@@ -385,8 +392,9 @@ setInterval(async () => {
 
         // --- Execute trade for all users ---
         await executeMarketOrderForAllUsers(symbol, dir);
-        openTrades++; // increment trades per symbol
-        break; // move to next symbol after a trade
+        openTrades++;
+        break;
+
       } catch (err) {
         log(`❌ scanLoop error for ${symbol} ${dir}: ${err?.message || err}`);
         continue;
