@@ -336,18 +336,11 @@ async function monitorPositions() {
 
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto scanning loop (cleaned for 30-min VWAP bias) ---
+// --- Full-auto scanning loop (NO No-Trade Zone, fast VWAP entries) ---
 setInterval(async () => {
-  if (BOT_PAUSED) { 
-    log("⏸️ Bot is paused."); 
-    return; 
-  }
-  if (!isSessionActive()) { 
-    log("⏳ No active trading session."); 
-    return; 
-  }
+  if (BOT_PAUSED) return;
+  if (!isSessionActive()) return;
 
-  // --- Count open trades per symbol ---
   let openTrades = Object.keys(activePositions).length;
 
   for (const symbol of COIN_LIST) {
@@ -358,94 +351,34 @@ setInterval(async () => {
 
     for (const dir of ["BUY", "SELL"]) {
       try {
+        // --- Fetch last closed 15m candle ---
+        const candle = (await fetchFuturesKlines(symbol, "15m", 1))?.[0];
+        if (!candle) continue;
+
+        const price = candle.close;
 
         // --- Entry VWAP (15m) ---
-        const vwapEntry = await calculateVWAP(symbol, "15m", 20);
-        if (!vwapEntry) continue;
-
-        // ✅ FIX: fetch last closed 15m candle to get price
-        const candles = await fetchFuturesKlines(symbol, "15m", 1);
-        if (!candles || !candles.length) continue;
-        const price = candles[0].close;
+        const vwap15 = await calculateVWAP(symbol, "15m", 20);
+        if (!vwap15) continue;
 
         // --- Bias VWAP (30m) ---
         const bias = await getVWAPBias(symbol);
         if (!bias) continue;
-        if (
-          (dir === "BUY" && bias !== "BULLISH") ||
-          (dir === "SELL" && bias !== "BEARISH")
-        ) continue;
+        if (dir === "BUY" && bias !== "BULLISH") continue;
+        if (dir === "SELL" && bias !== "BEARISH") continue;
 
-        // --- VWAP entry bands ---
-        const upperBand = vwapEntry * (1 + VWAP_BAND_PCT / 100);
-        const lowerBand = vwapEntry * (1 - VWAP_BAND_PCT / 100);
-        const vwapMovePct = ((price - vwapEntry) / vwapEntry) * 100;
+        // --- PURE VWAP CROSS CONFIRMATION ---
+        if (dir === "BUY" && price <= vwap15) continue;
+        if (dir === "SELL" && price >= vwap15) continue;
 
-        // --- VWAP band filters ---
-        if (dir === "BUY") {
-          if (price <= upperBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
-          if (price < vwapEntry) continue;
-        } else {
-          if (price >= lowerBand && Math.abs(vwapMovePct) < VWAP_MOMENTUM_CONFIRM_PCT) continue;
-          if (price > vwapEntry) continue;
-        }
-
-        // --- Execute trade for all users ---
+        // --- Execute trade ---
         await executeMarketOrderForAllUsers(symbol, dir);
         openTrades++;
         break;
 
       } catch (err) {
-        log(`❌ scanLoop error for ${symbol} ${dir}: ${err?.message || err}`);
-        continue;
+        log(`❌ scanLoop error ${symbol} ${dir}: ${err?.message || err}`);
       }
     }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
-
-// --- Telegram commands ---
-bot.onText(/\/pause/, async () => {
-  BOT_PAUSED = true;
-  await sendMessage("⏸️ Bot has been paused.");
-});
-
-bot.onText(/\/resume/, async () => {
-  BOT_PAUSED = false;
-  await sendMessage("▶️ Bot has resumed operation.");
-});
-
-bot.onText(/\/closeall/, async () => {
-  for (const [symbol, users] of Object.entries(activePositions)) {
-    for (const [userId, pos] of Object.entries(users)) {
-      const client = userClients[userId];
-      if (!client) continue;
-      try {
-        if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
-        else await client.futuresMarketBuy(symbol, pos.qty);
-      } catch {}
-    }
-  }
-  activePositions = {};
-  await sendMessage("🛑 All positions have been closed.");
-});
-
-bot.onText(/\/close (.+)/, async (msg, match) => {
-  const symbol = match[1].toUpperCase().trim();
-  if (!activePositions[symbol]) {
-    await sendMessage(`⚠️ No active position found for *${symbol}*`);
-    return;
-  }
-  for (const [userId, pos] of Object.entries(activePositions[symbol])) {
-    const client = userClients[userId];
-    if (!client) continue;
-    try {
-      if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
-      else await client.futuresMarketBuy(symbol, pos.qty);
-      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
-    } catch (err) {
-      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
-    }
-  }
-  delete activePositions[symbol];
-  await sendMessage(`✅ *${symbol}* fully closed for all users`);
-});
