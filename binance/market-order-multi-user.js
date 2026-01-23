@@ -29,14 +29,7 @@ const TRAILING_STOP_PCT = 2.0;
 
 // --- Momentum validation ---  
 const MOMENTUM_MIN_MOVE_PCT = 0.3;          // +0.3%  
-const MOMENTUM_TIME_MS = 15 * 60 * 1000;    // 1 × 15m candle  
-
-// --- VWAP zone awareness ---  
-const VWAP_BAND_PCT = 0.5;          // VWAP upper/lower band %  
-const VWAP_MOMENTUM_CONFIRM_PCT = 0.5; // Strong momentum confirmation  
-
-// --- Higher timeframe VWAP bias ---  
-const VWAP_BIAS_PCT = 0.2; // 0.2% buffer to avoid noise  
+const MOMENTUM_TIME_MS = 15 * 60 * 1000;    // 1 × 15m candle   
 
 const MONITOR_INTERVAL_MS = 5000;  
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;  
@@ -134,15 +127,14 @@ async function calculateVWAP(symbol, interval="15m", limit=20){
 }  
 
 // --- 30m VWAP bias ---  
-async function getVWAPBias(symbol) {  
-  const vwap15 = await calculateVWAP(symbol, "15m", 20);   // still using 15m for fast VWAP
-  const vwap30 = await calculateVWAP(symbol, "30m", 20);   // new higher timeframe VWAP
-  if (!vwap15 || !vwap30) return null;  
+async function getVWAPBias(symbol) {
+  const vwap15 = await calculateVWAP(symbol, "15m", 20);
+  const vwap30 = await calculateVWAP(symbol, "30m", 20);
+  if (!vwap15 || !vwap30) return null;
 
-  const diffPct = ((vwap15 - vwap30) / vwap30) * 100;      // % difference
-  if (diffPct > VWAP_BIAS_PCT) return "BULLISH";  
-  if (diffPct < -VWAP_BIAS_PCT) return "BEARISH";  
-  return "NEUTRAL";  
+  if (vwap15 > vwap30) return "BULLISH";
+  if (vwap15 < vwap30) return "BEARISH";
+  return "NEUTRAL";
 }
 
 // --- Floor qty ---  
@@ -361,15 +353,12 @@ setInterval(async () => {
         const vwap15 = await calculateVWAP(symbol, "15m", 20);
         if (!vwap15) continue;
 
-        // --- Bias VWAP (30m) ---
-        const bias = await getVWAPBias(symbol);
-        if (!bias) continue;
-        if (dir === "BUY" && bias !== "BULLISH") continue;
-        if (dir === "SELL" && bias !== "BEARISH") continue;
+       // --- Immediate VWAP cross execution ---
+const bias = await getVWAPBias(symbol);
+if (!bias) continue;
 
-        // --- PURE VWAP CROSS CONFIRMATION ---
-        if (dir === "BUY" && price <= vwap15) continue;
-        if (dir === "SELL" && price >= vwap15) continue;
+if (dir === "BUY" && (bias !== "BULLISH" || candle.close <= vwap15)) continue;
+if (dir === "SELL" && (bias !== "BEARISH" || candle.close >= vwap15)) continue;
 
         // --- Execute trade ---
         await executeMarketOrderForAllUsers(symbol, dir);
@@ -382,3 +371,50 @@ setInterval(async () => {
     }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
+
+// --- Telegram commands ---
+bot.onText(/\/pause/, async () => {
+  BOT_PAUSED = true;
+  await sendMessage("⏸️ Bot has been paused.");
+});
+
+bot.onText(/\/resume/, async () => {
+  BOT_PAUSED = false;
+  await sendMessage("▶️ Bot has resumed operation.");
+});
+
+bot.onText(/\/closeall/, async () => {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
+      if (!client) continue;
+      try {
+        if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+        else await client.futuresMarketBuy(symbol, pos.qty);
+      } catch {}
+    }
+  }
+  activePositions = {};
+  await sendMessage("🛑 All positions have been closed.");
+});
+
+bot.onText(/\/close (.+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase().trim();
+  if (!activePositions[symbol]) {
+    await sendMessage(`⚠️ No active position found for *${symbol}*`);
+    return;
+  }
+  for (const [userId, pos] of Object.entries(activePositions[symbol])) {
+    const client = userClients[userId];
+    if (!client) continue;
+    try {
+      if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+      else await client.futuresMarketBuy(symbol, pos.qty);
+      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
+    } catch (err) {
+      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
+    }
+  }
+  delete activePositions[symbol];
+  await sendMessage(`✅ *${symbol}* fully closed for all users`);
+});
