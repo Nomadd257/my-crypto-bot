@@ -27,10 +27,6 @@ const TP_PCT = 2.0;
 const SL_PCT = 1.5;                  
 const TRAILING_STOP_PCT = 2.0;  
 
-// --- Momentum validation ---  
-const MOMENTUM_MIN_MOVE_PCT = 0.3;          // +0.3%  
-const MOMENTUM_TIME_MS = 15 * 60 * 1000;    // 1 × 15m candle   
-
 const MONITOR_INTERVAL_MS = 5000;  
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;  
 const COIN_LIST = [  
@@ -104,7 +100,7 @@ function isSessionActive(){
 }  
 
 // --- Fetch Futures Klines ---  
-async function fetchFuturesKlines(symbol, interval="15m", limit=3){  
+async function fetchFuturesKlines(symbol, interval="15m", limit=20){  
   try{  
     const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);  
     if(!res.ok) throw new Error(`HTTP ${res.status}`);  
@@ -113,28 +109,39 @@ async function fetchFuturesKlines(symbol, interval="15m", limit=3){
   } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }  
 }  
 
-// --- Calculate VWAP ---  
-async function calculateVWAP(symbol, interval="15m", limit=20){  
-  const candles = await fetchFuturesKlines(symbol,interval,limit);  
-  if(!candles) return null;  
-  let cumPV=0, cumVol=0;  
-  for(const c of candles){  
-    const tp = (c.high+c.low+c.close)/3;  
-    cumPV += tp*c.volume;  
-    cumVol += c.volume;  
-  }  
-  return cumVol ? cumPV/cumVol : null;  
-}  
+// --- EMA3 calculation (15m closes) ---
+function calculateEMA3(closes) {
+  if (!closes || closes.length < 3) return null;
+  let ema = closes[0];
+  const k = 2 / (3 + 1);
+  for (let i = 1; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
 
-// --- 30m VWAP bias ---  
-async function getVWAPBias(symbol) {
-  const vwap15 = await calculateVWAP(symbol, "15m", 20);
-  const vwap30 = await calculateVWAP(symbol, "30m", 20);
-  if (!vwap15 || !vwap30) return null;
+// --- Support/Resistance detection (30m) ---
+async function getSupportResistance(symbol){
+  const candles = await fetchFuturesKlines(symbol,"30m",50);
+  if(!candles) return null;
+  const highs = candles.map(c=>c.high);
+  const lows = candles.map(c=>c.low);
+  const resistance = Math.max(...highs);
+  const support = Math.min(...lows);
+  return {support,resistance};
+}
 
-  if (vwap15 > vwap30) return "BULLISH";
-  if (vwap15 < vwap30) return "BEARISH";
-  return "NEUTRAL";
+// --- Volume Imbalance Report (15m) ---
+async function sendVolumeImbalanceReport(symbol){
+  const candles = await fetchFuturesKlines(symbol,"15m",20);
+  if(!candles) return;
+  let buyVol = 0, sellVol = 0;
+  for(let i=0;i<candles.length;i++){
+    const c = candles[i];
+    if(c.close>c.open) buyVol+=c.volume;
+    else sellVol+=c.volume;
+  }
+  await sendMessage(`📊 Volume Imbalance: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)}\nSell Vol: ${sellVol.toFixed(2)}`);
 }
 
 // --- Floor qty ---  
@@ -179,7 +186,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 
         if(!activePositions[symbol]) activePositions[symbol]={};  
         activePositions[symbol][userId]={  
-          side:direction, entryPrice:markPrice, qty, openedAt:Date.now(), trailingStop:null, highest:markPrice, lowest:markPrice, momentumChecked:false  
+          side:direction, entryPrice:markPrice, qty, openedAt:Date.now(), trailingStop:null, highest:markPrice, lowest:markPrice  
         };  
         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);  
       } catch(err){ log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message||err}`); }  
@@ -190,7 +197,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
   symbolCooldowns[symbol] = Date.now();  
 }  
 
-// --- Monitor positions ---
+// --- Monitor positions (TP/SL/Trailing Stop) ---
 async function monitorPositions() {
   for (const [symbol, users] of Object.entries(activePositions)) {
     for (const [userId, pos] of Object.entries(users)) {
@@ -201,123 +208,32 @@ async function monitorPositions() {
       }
 
       try {
-        // --- Fetch position ---
         const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions)
-          ? positions.find(x => x.symbol === symbol)
-          : null;
-
+        const p = Array.isArray(positions) ? positions.find(x => x.symbol === symbol) : null;
         const amt = p ? parseFloat(p.positionAmt || 0) : 0;
-        if (!p || amt === 0) {
-          delete activePositions[symbol][userId];
-          continue;
-        }
+        if (!p || amt === 0) { delete activePositions[symbol][userId]; continue; }
 
-        // --- Mark price (safe) ---
         let mark = 0;
-        try {
-          const mp = await client.futuresMarkPrice(symbol);
-          mark = mp?.markPrice ? parseFloat(mp.markPrice) : 0;
-        } catch {}
+        try { const mp = await client.futuresMarkPrice(symbol); mark = mp?.markPrice ? parseFloat(mp.markPrice) : 0; } catch{}
         if (!mark || mark <= 0) continue;
 
-        // =====================================================
-        // 1️⃣ Momentum + VWAP early validation (ONE-TIME CHECK)
-        // =====================================================
-        if (!pos.momentumChecked && Date.now() - pos.openedAt >= MOMENTUM_TIME_MS) {
-          const movePct =
-            pos.side === "BUY"
-              ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
-              : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
-
-          let vwapOk = true;
-          try {
-            const vwap = await calculateVWAP(symbol, "15m", 20);
-            if (vwap) {
-              vwapOk = pos.side === "BUY" ? mark > vwap : mark < vwap;
-            }
-          } catch {}
-
-          pos.momentumChecked = true;
-
-          if (movePct < MOMENTUM_MIN_MOVE_PCT && !vwapOk) {
-            if (pos.side === "BUY") {
-              await client.futuresMarketSell(symbol, Math.abs(amt));
-            } else {
-              await client.futuresMarketBuy(symbol, Math.abs(amt));
-            }
-
-            await sendMessage(
-              `⚠️ Momentum + VWAP Exit: *${symbol}* (${movePct.toFixed(2)}%) User ${userId}`
-            );
-
-            delete activePositions[symbol][userId];
-            continue;
-          }
-        }
-
-        // ===============================
-        // 2️⃣ Trailing stop (ALWAYS RUNS)
-        // ===============================
+        // Trailing Stop
         if (pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, mark);
           const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail > pos.trailingStop) {
-            pos.trailingStop = trail;
-          }
-          if (mark <= pos.trailingStop) {
-            await client.futuresMarketSell(symbol, Math.abs(amt));
-            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
-            delete activePositions[symbol][userId];
-            continue;
-          }
+          if (!pos.trailingStop || trail > pos.trailingStop) pos.trailingStop = trail;
+          if (mark <= pos.trailingStop) { await client.futuresMarketSell(symbol, Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
         } else {
           pos.lowest = Math.min(pos.lowest, mark);
           const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail < pos.trailingStop) {
-            pos.trailingStop = trail;
-          }
-          if (mark >= pos.trailingStop) {
-            await client.futuresMarketBuy(symbol, Math.abs(amt));
-            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
-            delete activePositions[symbol][userId];
-            continue;
-          }
+          if (!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop = trail;
+          if (mark >= pos.trailingStop) { await client.futuresMarketBuy(symbol, Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
         }
 
-        // ======================
-        // 3️⃣ TP / SL (CRITICAL)
-        // ======================
-        const move =
-          pos.side === "BUY"
-            ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
-            : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
-
-        // TAKE PROFIT
-        if (move >= TP_PCT) {
-          if (pos.side === "BUY") {
-            await client.futuresMarketSell(symbol, Math.abs(amt));
-          } else {
-            await client.futuresMarketBuy(symbol, Math.abs(amt));
-          }
-
-          await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`);
-          delete activePositions[symbol][userId];
-          continue;
-        }
-
-        // STOP LOSS
-        if (move <= -SL_PCT) {
-          if (pos.side === "BUY") {
-            await client.futuresMarketSell(symbol, Math.abs(amt));
-          } else {
-            await client.futuresMarketBuy(symbol, Math.abs(amt));
-          }
-
-          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
-          delete activePositions[symbol][userId];
-          continue;
-        }
+        // TP / SL
+        const move = pos.side==="BUY"?((mark-pos.entryPrice)/pos.entryPrice)*100:((pos.entryPrice-mark)/pos.entryPrice)*100;
+        if (move>=TP_PCT) { if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`); continue; }
+        if (move<=-SL_PCT) { if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`); continue; }
 
       } catch (err) {
         log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
@@ -325,10 +241,9 @@ async function monitorPositions() {
     }
   }
 }
-
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto scanning loop (NO No-Trade Zone, fast VWAP entries) ---
+// --- Full-auto scanning loop (Support/Resistance + EMA3) ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
   if (!isSessionActive()) return;
@@ -341,79 +256,79 @@ setInterval(async () => {
     const lastTradeTime = symbolCooldowns[symbol] || 0;
     if (Date.now() - lastTradeTime < SYMBOL_COOLDOWN_MS) continue;
 
-    for (const dir of ["BUY", "SELL"]) {
-      try {
-        // --- Fetch last closed 15m candle ---
-        const candle = (await fetchFuturesKlines(symbol, "15m", 1))?.[0];
-        if (!candle) continue;
+    try {
+      const sr = await getSupportResistance(symbol);
+      if(!sr) continue;
 
-        const price = candle.close;
+      const candles15 = await fetchFuturesKlines(symbol,"15m",5);
+      if(!candles15 || candles15.length<3) continue;
 
-        // --- Entry VWAP (15m) ---
-        const vwap15 = await calculateVWAP(symbol, "15m", 20);
-        if (!vwap15) continue;
+      const closes = candles15.map(c=>c.close);
+      const ema3 = calculateEMA3(closes);
+      if(!ema3) continue;
 
-       // --- Immediate VWAP cross execution ---
-const bias = await getVWAPBias(symbol);
-if (!bias) continue;
+      const lastClose = closes[closes.length-1];
 
-if (dir === "BUY" && (bias !== "BULLISH" || candle.close <= vwap15)) continue;
-if (dir === "SELL" && (bias !== "BEARISH" || candle.close >= vwap15)) continue;
+      // --- Determine trade type ---
+      let tradeType = null;
+      let direction = null;
 
-        // --- Execute trade ---
-        await executeMarketOrderForAllUsers(symbol, dir);
-        openTrades++;
-        break;
-
-      } catch (err) {
-        log(`❌ scanLoop error ${symbol} ${dir}: ${err?.message || err}`);
+      // 1️⃣ Bounce trades
+      if (lastClose <= sr.support && lastClose > ema3) {
+        tradeType = "BOUNCE";
+        direction = "BUY";
       }
-    }
+      if (lastClose >= sr.resistance && lastClose < ema3) {
+        tradeType = "BOUNCE";
+        direction = "SELL";
+      }
+
+      // 2️⃣ Breakout trades
+      if (lastClose < sr.support && lastClose < ema3) {
+        tradeType = "BREAKOUT";
+        direction = "SELL";
+      }
+      if (lastClose > sr.resistance && lastClose > ema3) {
+        tradeType = "BREAKOUT";
+        direction = "BUY";
+      }
+
+      // --- Execute trade if any ---
+      if (tradeType && direction) {
+        await sendMessage(`⚡ *${tradeType} Trade Detected* on *${symbol}* → Direction: *${direction}*`);
+        await executeMarketOrderForAllUsers(symbol, direction);
+      }
+
+      // --- Volume imbalance report ---
+      await sendVolumeImbalanceReport(symbol);
+
+      openTrades = Object.keys(activePositions).length;
+
+    } catch(err){ log(`❌ scanLoop error ${symbol}: ${err?.message||err}`); }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 // --- Telegram commands ---
-bot.onText(/\/pause/, async () => {
-  BOT_PAUSED = true;
-  await sendMessage("⏸️ Bot has been paused.");
-});
-
-bot.onText(/\/resume/, async () => {
-  BOT_PAUSED = false;
-  await sendMessage("▶️ Bot has resumed operation.");
-});
+bot.onText(/\/pause/, async () => { BOT_PAUSED = true; await sendMessage("⏸️ Bot has been paused."); });
+bot.onText(/\/resume/, async () => { BOT_PAUSED = false; await sendMessage("▶️ Bot has resumed operation."); });
 
 bot.onText(/\/closeall/, async () => {
   for (const [symbol, users] of Object.entries(activePositions)) {
     for (const [userId, pos] of Object.entries(users)) {
-      const client = userClients[userId];
-      if (!client) continue;
-      try {
-        if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
-        else await client.futuresMarketBuy(symbol, pos.qty);
-      } catch {}
+      const client = userClients[userId]; if(!client) continue;
+      try { if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty); else await client.futuresMarketBuy(symbol,pos.qty); } catch{}
     }
   }
-  activePositions = {};
+  activePositions={};
   await sendMessage("🛑 All positions have been closed.");
 });
 
 bot.onText(/\/close (.+)/, async (msg, match) => {
   const symbol = match[1].toUpperCase().trim();
-  if (!activePositions[symbol]) {
-    await sendMessage(`⚠️ No active position found for *${symbol}*`);
-    return;
-  }
+  if (!activePositions[symbol]) { await sendMessage(`⚠️ No active position found for *${symbol}*`); return; }
   for (const [userId, pos] of Object.entries(activePositions[symbol])) {
-    const client = userClients[userId];
-    if (!client) continue;
-    try {
-      if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
-      else await client.futuresMarketBuy(symbol, pos.qty);
-      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
-    } catch (err) {
-      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
-    }
+    const client = userClients[userId]; if(!client) continue;
+    try { if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty); else await client.futuresMarketBuy(symbol,pos.qty); await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`); } catch(err){ log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message||err}`); }
   }
   delete activePositions[symbol];
   await sendMessage(`✅ *${symbol}* fully closed for all users`);
