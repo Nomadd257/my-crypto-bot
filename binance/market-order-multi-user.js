@@ -268,16 +268,16 @@ setInterval(async () => {
     try {
       // Get 30m support & resistance
       const sr = await getSupportResistance(symbol);
-      if(!sr) continue;
+      if (!sr) continue;
 
       // Get last 5 x 15m closes for EMA3
-      const candles15 = await fetchFuturesKlines(symbol,"15m",5);
-      if(!candles15 || candles15.length<3) continue;
-      const closes = candles15.map(c=>c.close);
+      const candles15 = await fetchFuturesKlines(symbol, "15m", 5);
+      if (!candles15 || candles15.length < 3) continue;
+      const closes = candles15.map(c => c.close);
       const ema3 = calculateEMA3(closes);
-      if(!ema3) continue;
+      if (!ema3) continue;
 
-      const lastClose = closes[closes.length-1];
+      const lastClose = closes[closes.length - 1];
 
       // --- Determine trade type & direction ---
       let tradeType = null;
@@ -307,12 +307,12 @@ setInterval(async () => {
       if (tradeType && direction) {
         await sendMessage(`⚡ *${tradeType} Trade Detected* on *${symbol}* → Direction: *${direction}*`);
 
-        // Volume imbalance report (15m) with dominance %
-        const candlesVol = await fetchFuturesKlines(symbol,"15m",20);
-        if(candlesVol && candlesVol.length > 0){
+        // Volume imbalance report (only for this trade)
+        const candlesVol = await fetchFuturesKlines(symbol, "15m", 20);
+        if (candlesVol && candlesVol.length > 0) {
           let buyVol = 0, sellVol = 0;
-          for(const c of candlesVol){
-            if(c.close > c.open) buyVol += c.volume;
+          for (const c of candlesVol) {
+            if (c.close > c.open) buyVol += c.volume;
             else sellVol += c.volume;
           }
           const totalVol = buyVol + sellVol;
@@ -332,11 +332,43 @@ setInterval(async () => {
 
       openTrades = Object.keys(activePositions).length;
 
-    } catch(err){
-      log(`❌ scanLoop error ${symbol}: ${err?.message||err}`);
+    } catch (err) {
+      log(`❌ scanLoop error ${symbol}: ${err?.message || err}`);
     }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
+
+
+// --- Hourly volume imbalance report for all coins ---
+setInterval(async () => {
+  if (BOT_PAUSED) return;
+  if (!isSessionActive()) return;
+
+  let reportMsg = `🕒 *Hourly Volume Imbalance Report* 🕒\n`;
+
+  for (const symbol of COIN_LIST) {
+    try {
+      const candlesVol = await fetchFuturesKlines(symbol, "15m", 20);
+      if (!candlesVol || candlesVol.length === 0) continue;
+
+      let buyVol = 0, sellVol = 0;
+      for (const c of candlesVol) {
+        if (c.close > c.open) buyVol += c.volume;
+        else sellVol += c.volume;
+      }
+      const totalVol = buyVol + sellVol;
+      const buyPct = totalVol > 0 ? (buyVol / totalVol * 100).toFixed(1) : 0;
+      const sellPct = totalVol > 0 ? (sellVol / totalVol * 100).toFixed(1) : 0;
+
+      reportMsg += `\n*${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`;
+    } catch (err) {
+      log(`❌ hourlyReport error for ${symbol}: ${err?.message || err}`);
+    }
+  }
+
+  await sendMessage(reportMsg);
+
+}, 60 * 60 * 1000); // runs once per hour
 
 // --- Telegram commands ---
 bot.onText(/\/pause/, async () => { BOT_PAUSED = true; await sendMessage("⏸️ Bot has been paused."); });
