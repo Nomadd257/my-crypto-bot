@@ -134,14 +134,23 @@ async function getSupportResistance(symbol){
 // --- Volume Imbalance Report (15m) ---
 async function sendVolumeImbalanceReport(symbol){
   const candles = await fetchFuturesKlines(symbol,"15m",20);
-  if(!candles) return;
+  if(!candles || candles.length === 0) return;
+
   let buyVol = 0, sellVol = 0;
-  for(let i=0;i<candles.length;i++){
-    const c = candles[i];
-    if(c.close>c.open) buyVol+=c.volume;
-    else sellVol+=c.volume;
+  for(const c of candles){
+    if(c.close > c.open) buyVol += c.volume;
+    else sellVol += c.volume;
   }
-  await sendMessage(`📊 Volume Imbalance: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)}\nSell Vol: ${sellVol.toFixed(2)}`);
+
+  const totalVol = buyVol + sellVol;
+  const buyPct = totalVol > 0 ? (buyVol / totalVol * 100).toFixed(1) : 0;
+  const sellPct = totalVol > 0 ? (sellVol / totalVol * 100).toFixed(1) : 0;
+
+  await sendMessage(
+    `📊 Volume Imbalance Report: *${symbol}*\n` +
+    `Buy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
+    `Sell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`
+  );
 }
 
 // --- Floor qty ---  
@@ -243,7 +252,7 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto scanning loop (Support/Resistance + EMA3) ---
+// --- Full-auto scanning loop (Support/Resistance + EMA3 + Volume Imbalance) ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
   if (!isSessionActive()) return;
@@ -257,19 +266,20 @@ setInterval(async () => {
     if (Date.now() - lastTradeTime < SYMBOL_COOLDOWN_MS) continue;
 
     try {
+      // Get 30m support & resistance
       const sr = await getSupportResistance(symbol);
       if(!sr) continue;
 
+      // Get last 5 x 15m closes for EMA3
       const candles15 = await fetchFuturesKlines(symbol,"15m",5);
       if(!candles15 || candles15.length<3) continue;
-
       const closes = candles15.map(c=>c.close);
       const ema3 = calculateEMA3(closes);
       if(!ema3) continue;
 
       const lastClose = closes[closes.length-1];
 
-      // --- Determine trade type ---
+      // --- Determine trade type & direction ---
       let tradeType = null;
       let direction = null;
 
@@ -296,15 +306,35 @@ setInterval(async () => {
       // --- Execute trade if any ---
       if (tradeType && direction) {
         await sendMessage(`⚡ *${tradeType} Trade Detected* on *${symbol}* → Direction: *${direction}*`);
+
+        // Volume imbalance report (15m) with dominance %
+        const candlesVol = await fetchFuturesKlines(symbol,"15m",20);
+        if(candlesVol && candlesVol.length > 0){
+          let buyVol = 0, sellVol = 0;
+          for(const c of candlesVol){
+            if(c.close > c.open) buyVol += c.volume;
+            else sellVol += c.volume;
+          }
+          const totalVol = buyVol + sellVol;
+          const buyPct = totalVol > 0 ? (buyVol / totalVol * 100).toFixed(1) : 0;
+          const sellPct = totalVol > 0 ? (sellVol / totalVol * 100).toFixed(1) : 0;
+
+          await sendMessage(
+            `📊 Volume Imbalance Report: *${symbol}*\n` +
+            `Buy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
+            `Sell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`
+          );
+        }
+
+        // Execute market order for all users
         await executeMarketOrderForAllUsers(symbol, direction);
       }
 
-      // --- Volume imbalance report ---
-      await sendVolumeImbalanceReport(symbol);
-
       openTrades = Object.keys(activePositions).length;
 
-    } catch(err){ log(`❌ scanLoop error ${symbol}: ${err?.message||err}`); }
+    } catch(err){
+      log(`❌ scanLoop error ${symbol}: ${err?.message||err}`);
+    }
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
 
