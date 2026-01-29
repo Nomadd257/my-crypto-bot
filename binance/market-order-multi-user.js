@@ -23,8 +23,8 @@ const USERS_FILE = "./users.json";
 // --- Settings ---
 const TRADE_PERCENT = 0.10;
 const LEVERAGE = 20;
-const TP_PCT = 2.0;
-const SL_PCT = -1.5;
+const TP_PCT = 1.8;
+const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 1.5;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000;
@@ -184,7 +184,16 @@ async function executeMarketOrderForAllUsers(symbol, direction){
       if(imbalance) await sendMessage(`📊 Volume Imbalance for *${symbol}*:\nBuy Vol: ${imbalance.buyVol} (${imbalance.buyPct}%)\nSell Vol: ${imbalance.sellVol} (${imbalance.sellPct}%)`);
 
       if(!activePositions[symbol]) activePositions[symbol]={};
-      activePositions[symbol][userId]={ side, entryPrice:markPrice, qty, openedAt:Date.now(), trailingStop:null, highest:markPrice, lowest:markPrice };
+      activePositions[symbol][userId] = {
+  side,
+  qty,
+  entryPrice: markPrice,
+  highest: markPrice,
+  lowest: markPrice,
+  trailingStop: null,
+  momentumChecked: false,
+  entryTime: Date.now()
+};
 
     }catch(err){ log(`❌ executeMarketOrder user ${userId} ${symbol}: ${err?.message||err}`); }
   }
@@ -215,6 +224,55 @@ async function monitorPositions(){
           markPrice = k && k.length ? k[0].close : 0; 
         }
         if(!markPrice || markPrice<=0) continue;
+
+// ================================
+// MOMENTUM VALIDATION (0.5% in 30 mins)
+// ================================
+if (!pos.momentumChecked) {
+  const elapsed = Date.now() - pos.entryTime;
+  const momentumWindow = 30 * 60 * 1000; // 30 mins
+  const momentumPct = 0.5 / 100;
+
+  let momentumHit = false;
+
+  if (pos.side === "BUY") {
+    if (markPrice >= pos.entryPrice * (1 + momentumPct)) {
+      momentumHit = true;
+    }
+  } else {
+    if (markPrice <= pos.entryPrice * (1 - momentumPct)) {
+      momentumHit = true;
+    }
+  }
+
+  // ✅ Momentum achieved → allow trade to continue
+  if (momentumHit) {
+    pos.momentumChecked = true;
+  }
+
+  // ❌ Momentum FAILED after 30 mins → close trade
+  if (!momentumHit && elapsed >= momentumWindow) {
+    const closeSide = pos.side === "BUY" ? "SELL" : "BUY";
+
+    if (closeSide === "SELL") {
+      await client.futuresMarketSell(symbol, pos.qty);
+    } else {
+      await client.futuresMarketBuy(symbol, pos.qty);
+    }
+
+    await sendMessage(
+      `⏱️ *Momentum Fail Close*\n` +
+      `Symbol: ${symbol}\n` +
+      `Side: ${pos.side}\n` +
+      `Required: 0.5%\n` +
+      `Time: 30 mins\n` +
+      `Result: ❌ Not achieved`
+    );
+
+    delete activePositions[symbol][userId];
+    continue;
+  }
+}
 
         // --- Trailing Stop ---
         if(pos.side === "BUY"){
