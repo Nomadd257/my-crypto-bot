@@ -1,7 +1,7 @@
 // =====================================================
-// FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// AUTOMATIC TRADING BASED ON LAST-CANDLE VOLUME IMBALANCE + VWAP + VOLATILITY COMPRESSION
-// MAX 4 TRADES, 12-HOUR SYMBOL COOLDOWN, MULTI-USERS EXECUTE SIMULTANEOUSLY
+// MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// CID SIGNALS + VOLUME IMBALANCE
+// TP/SL/TRAILING STOP INTACT
 // =====================================================
 
 const config = require("../config");
@@ -23,9 +23,9 @@ const USERS_FILE = "./users.json";
 // --- Settings ---
 const TRADE_PERCENT = 0.10;
 const LEVERAGE = 20;
-const TP_PCT = 1.8;
-const SL_PCT = 1.5;
-const TRAILING_STOP_PCT = 1.5;
+const TP_PCT = 2;
+const SL_PCT = -1.5;
+const TRAILING_STOP_PCT = 1.7;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000;
 
@@ -89,25 +89,6 @@ async function fetchFuturesKlines(symbol, interval="15m", limit=50) {
   } catch(err) { log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
 }
 
-// --- EMA3 (15m) ---
-function calculateEMA(values, period) {
-  if (!Array.isArray(values) || values.length < period) return null;
-  let ema = values.slice(0, period).reduce((a,b)=>a+b,0)/period;
-  const k = 2/(period+1);
-  for(let i=period;i<values.length;i++){ ema = values[i]*k + ema*(1-k); }
-  return ema;
-}
-
-// --- EMA3 trend ---
-async function getEMA3(symbol){
-  const candles = await fetchFuturesKlines(symbol,"15m",5);
-  if(!candles || candles.length<3) return null;
-  const closes = candles.map(c=>c.close);
-  const ema3 = calculateEMA(closes,3);
-  const lastClose = closes[closes.length-1];
-  return { lastClose, ema3 };
-}
-
 // --- Volume Imbalance ---
 async function checkVolumeImbalance(symbol){
   const candles = await fetchFuturesKlines(symbol,"15m",2); // last candle
@@ -136,12 +117,6 @@ function floorToStep(qty,step){
 async function executeMarketOrderForAllUsers(symbol, direction){
   const clients = createBinanceClients();
   if(!clients.length){ await sendMessage(`⚠️ No active users.`); return; }
-
-  // EMA3 filter
-  const emaData = await getEMA3(symbol);
-  if(!emaData){ await sendMessage(`⚠️ EMA3 unavailable for ${symbol}`); return; }
-  if(direction==="BULLISH" && emaData.lastClose<emaData.ema3){ await sendMessage(`⏳ Close below EMA3 for ${symbol}. Skipping.`); return; }
-  if(direction==="BEARISH" && emaData.lastClose>emaData.ema3){ await sendMessage(`⏳ Close above EMA3 for ${symbol}. Skipping.`); return; }
 
   for(const {userId, client} of clients){
     try{
@@ -387,23 +362,17 @@ bot.on("message", async msg => {
     if(pendingSignals[symbol]) return;
 
     pendingSignals[symbol]={ direction, expiresAt: Date.now()+SIGNAL_EXPIRY_MS };
-    await sendMessage(`📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(SIGNAL_EXPIRY_MS/60000)} minutes\nChecking EMA3 + Imbalance...`);
+    await sendMessage(`📢 CID Signal for *${symbol}* (${direction})\n⏱ Expires in ${Math.round(SIGNAL_EXPIRY_MS/60000)} minutes\nChecking Volume Imbalance...`);
 
     const timer = setInterval(async ()=>{
       const sig = pendingSignals[symbol];
       if(!sig){ clearInterval(timer); return; }
       if(Date.now()>sig.expiresAt){ clearInterval(timer); delete pendingSignals[symbol]; await sendMessage(`⌛ CID signal expired for *${symbol}*`); return; }
 
-      // EMA3 check for last closed candle
-      const emaData = await getEMA3(symbol);
-      if(!emaData){ await sendMessage(`⚠️ EMA3 unavailable for ${symbol}`); return; }
-      const emaCheck = (direction==="BULLISH" && emaData.lastClose>emaData.ema3) || (direction==="BEARISH" && emaData.lastClose<emaData.ema3);
-      if(!emaCheck){ await sendMessage(`⏳ Last candle close not valid for EMA3 on ${symbol}`); return; }
-
       clearInterval(timer);
-      delete pendingSignals[symbol];
-      await sendMessage(`✅ EMA3 validated for *${symbol}* — Executing Market Orders...`);
-      await executeMarketOrderForAllUsers(symbol,direction);
+delete pendingSignals[symbol];
+await sendMessage(`✅ CID confirmed for *${symbol}* — Executing Market Orders...`);
+await executeMarketOrderForAllUsers(symbol,direction);
 
 }, SIGNAL_CHECK_INTERVAL_MS);
 
