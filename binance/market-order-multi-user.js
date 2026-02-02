@@ -43,6 +43,11 @@ let last1HBias = {};           // { symbol: "BULL"|"BEAR" }
 let BOT_PAUSED = false;
 let symbolCooldowns = {};      // { symbol: timestamp }
 
+// --- STC cycle trackers ---
+let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
+let last1HSTC = {};           // { symbol: previous 1H STC value }
+let last15MSTCValue = {};     // { symbol: previous 15M STC value }
+
 // --- Logging ---
 function log(msg){ console.log(`[${new Date().toISOString()}] ${msg}`); }
 
@@ -96,20 +101,46 @@ async function fetchFuturesKlines(symbol, interval="15m", limit=100){
   } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
 }
 
-// --- Schaff Trend Cycle Calculation ---
-function calculateSTC(closes, {cycle=4, fast=10, slow=20}){
-  function EMA(data,length){
-    const k = 2/(length+1);
+// --- Proper Schaff Trend Cycle (STC) ---
+function calculateSTC(closes, { cycle = 4, fast = 10, slow = 20, signal = 3 } = {}) {
+  if (!closes || closes.length < slow + cycle) return null;
+
+  // --- EMA helper ---
+  function EMA(data, length) {
+    const k = 2 / (length + 1);
     let ema = data[0];
-    for(let i=1;i<data.length;i++) ema = data[i]*k + ema*(1-k);
-    return ema;
+    const result = [ema];
+    for (let i = 1; i < data.length; i++) {
+      ema = data[i] * k + ema * (1 - k);
+      result.push(ema);
+    }
+    return result;
   }
-  if(!closes || closes.length<slow) return null;
-  const fastEMA = EMA(closes,fast);
-  const slowEMA = EMA(closes,slow);
-  const macd = fastEMA - slowEMA;
-  let stc = macd; // simplified placeholder
-  return Math.max(0,Math.min(100, stc*100));
+
+  // --- MACD ---
+  const fastEMA = EMA(closes, fast);
+  const slowEMA = EMA(closes, slow);
+  const macd = fastEMA.map((v, i) => v - slowEMA[i]);
+
+  // --- MACD signal line ---
+  const signalLine = EMA(macd, signal);
+  const macdHist = macd.map((v, i) => v - signalLine[i]);
+
+  // --- Stochastic over MACD histogram ---
+  const stc = [];
+  for (let i = 0; i < macdHist.length; i++) {
+    if (i < cycle) {
+      stc.push(50); // neutral at start
+      continue;
+    }
+    const slice = macdHist.slice(i - cycle + 1, i + 1);
+    const min = Math.min(...slice);
+    const max = Math.max(...slice);
+    const value = max === min ? 50 : ((macdHist[i] - min) / (max - min)) * 100;
+    stc.push(value);
+  }
+
+  return stc[stc.length - 1]; // return latest STC value
 }
 
 // --- Floor qty ---
@@ -208,40 +239,70 @@ async function monitorPositions(){
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto STC scanning loop ---
+// --- Full-auto STC scanning loop with confirmed 1H cycle and 15M flip trades ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
 
   for (const symbol of COIN_LIST) {
     try {
-      // Check symbol cooldown
       const now = Date.now();
+
+      // --- Check symbol cooldown ---
       if(symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
-      // 1H STC for direction (closed candle only)
+      // --- 1H STC for cycle detection (closed candle only) ---
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
       if (!candles1H || candles1H.length < 20) continue;
       const closes1H = candles1H.slice(0,-1).map(c => c.close); // exclude current forming candle
       const stc1H = calculateSTC(closes1H, { cycle: 4, fast: 10, slow: 20 });
+      if(stc1H === null) continue;
 
-      let bias = last1HBias[symbol] || null;
-      if (stc1H >= 25) bias = "BULL";
-      if (stc1H <= 75) bias = "BEAR";
-      last1HBias[symbol] = bias;
+      // --- Detect 1H flip based on closed candle ---
+      const prev1H = last1HSTC[symbol] ?? stc1H;
+      let flip = null;
 
-      // 15M STC for entry
+      // Bullish flip: crosses 25 upward
+      if(prev1H < 25 && stc1H >= 25) flip = "BULL";
+
+      // Bearish flip: crosses 75 downward
+      if(prev1H > 75 && stc1H <= 75) flip = "BEAR";
+
+      if(flip){
+        currentCycle[symbol] = flip;
+        last15MSTCValue[symbol] = null; // reset 15M flip tracker on new cycle
+        await sendMessage(`🔄 STC FLIP confirmed on closed 1H candle for *${symbol}*: ${flip} cycle started`);
+      }
+
+      last1HSTC[symbol] = stc1H; // update previous 1H STC
+
+      // --- 15M STC for entry trades ---
       const candles15 = await fetchFuturesKlines(symbol, "15m", 100);
       if (!candles15 || candles15.length < 20) continue;
       const closes15 = candles15.map(c => c.close);
       const stc15 = calculateSTC(closes15, { cycle: 4, fast: 10, slow: 20 });
+      if(stc15 === null) continue;
 
+      // --- Detect 15M flips in the same 1H cycle ---
+      const cycle = currentCycle[symbol]; // "BULL" or "BEAR"
+      const prev15M = last15MSTCValue[symbol] ?? stc15;
       let direction = null;
-      if (bias === "BULL" && stc15 > 25) direction = "BUY";
-      if (bias === "BEAR" && stc15 < 75) direction = "SELL";
 
-      if (direction) await executeMarketOrderForAllUsers(symbol, direction);
+      // Buy flip: 15M crosses above 25 in bullish cycle
+      if(cycle === "BULL" && prev15M < 25 && stc15 >= 25) {
+        direction = "BUY";
+      }
 
-      // Volume imbalance per trade
+      // Sell flip: 15M crosses below 75 in bearish cycle
+      if(cycle === "BEAR" && prev15M > 75 && stc15 <= 75) {
+        direction = "SELL";
+      }
+
+      last15MSTCValue[symbol] = stc15; // update 15M tracker
+
+      // --- Execute trade if flip detected ---
+      if(direction) await executeMarketOrderForAllUsers(symbol, direction);
+
+      // --- Volume imbalance report ---
       const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
       const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
       const totalVol = buyVol + sellVol;
