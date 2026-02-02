@@ -39,13 +39,11 @@ const COIN_LIST = [
 // --- In-memory ---
 let activePositions = {};      // { symbol: { userId: position } }
 let userClients = {};
-let last1HBias = {};           // { symbol: "BULL"|"BEAR" }
 let BOT_PAUSED = false;
 let symbolCooldowns = {};      // { symbol: timestamp }
 
 // --- STC cycle trackers ---
 let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
-let last1HSTC = {};           // { symbol: previous 1H STC value }
 let last15MSTCValue = {};     // { symbol: previous 15M STC value }
 
 // --- Logging ---
@@ -250,27 +248,33 @@ setInterval(async () => {
       // --- Check symbol cooldown ---
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
-      // --- 1H STC for cycle detection (closed candle only) ---
-      const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-      if (!candles1H || candles1H.length < 20) continue;
-      const closes1H = candles1H.slice(0, -1).map(c => c.close); // exclude current forming candle
-      const stc1H = calculateSTC(closes1H, { cycle: 4, fast: 10, slow: 20 });
-      if (stc1H === null) continue;
+      // --- 1H STC: determine cycle by COLOR (slope) ---
+const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+if (!candles1H || candles1H.length < 30) continue;
 
-      // --- Detect 1H flip based on closed candle ---
-      const prev1H = last1HSTC[symbol] ?? stc1H;
-      let flip = null;
+const closes1H = candles1H.slice(0, -1).map(c => c.close); // closed candles only
 
-      if (prev1H < 25 && stc1H >= 25) flip = "BULL";      // Bullish flip
-      if (prev1H > 75 && stc1H <= 75) flip = "BEAR";      // Bearish flip
+// Build STC series to get slope (color)
+const stcSeries1H = [];
+for (let i = 0; i < closes1H.length; i++) {
+  const slice = closes1H.slice(0, i + 1);
+  const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+  if (val !== null) stcSeries1H.push(val);
+}
 
-      if (flip) {
-        currentCycle[symbol] = flip;
-        last15MSTCValue[symbol] = null; // reset 15M flip tracker on new cycle
-        await sendMessage(`🔄 STC FLIP confirmed on closed 1H candle for *${symbol}*: ${flip} cycle started`);
-      }
+if (stcSeries1H.length < 2) continue;
 
-      last1HSTC[symbol] = stc1H; // update previous 1H STC
+const prev1H = stcSeries1H[stcSeries1H.length - 2];
+const curr1H = stcSeries1H[stcSeries1H.length - 1];
+
+let cycle = null;
+if (curr1H > prev1H) cycle = "BULL";   // 🟢 STC rising
+if (curr1H < prev1H) cycle = "BEAR";   // 🔴 STC falling
+
+if (!cycle) continue;
+
+// Save current cycle state
+currentCycle[symbol] = cycle;
 
       // --- 15M STC for entry trades ---
       const candles15 = await fetchFuturesKlines(symbol, "15m", 100);
@@ -280,12 +284,12 @@ setInterval(async () => {
       if (stc15 === null) continue;
 
       // --- Detect 15M flips in the same 1H cycle ---
-      const cycle = currentCycle[symbol]; // "BULL" or "BEAR"
+      const trendCycle = currentCycle[symbol]; // "BULL" or "BEAR"
       const prev15M = last15MSTCValue[symbol] ?? stc15;
       let direction = null;
 
-      if (cycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";    // Buy flip
-      if (cycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";   // Sell flip
+      if (trendCycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";    // Buy flip
+      if (trendCycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";   // Sell flip
 
       last15MSTCValue[symbol] = stc15; // update 15M tracker
 
