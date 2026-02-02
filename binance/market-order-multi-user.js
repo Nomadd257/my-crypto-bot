@@ -193,7 +193,7 @@ async function monitorPositions(){
         } else {
           pos.lowest = Math.min(pos.lowest, mark);
           const trail = pos.lowest*(1+TRAILING_STOP_PCT/100);
-          if(!pos.trailingStop || trail<trailingStop) pos.trailingStop=trail;
+          if(!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop=trail;
           if(mark>=pos.trailingStop){ await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
         }
 
@@ -241,14 +241,13 @@ setInterval(async () => {
 
       if (direction) await executeMarketOrderForAllUsers(symbol, direction);
 
- // Volume imbalance per trade
-        const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-        const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
-        const totalVol = buyVol + sellVol;
-        const buyPct = totalVol > 0 ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
-        const sellPct = totalVol > 0 ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
-        await sendMessage(`📊 Volume Imbalance Report: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`);
-      }
+      // Volume imbalance per trade
+      const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+      const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+      const totalVol = buyVol + sellVol;
+      const buyPct = totalVol > 0 ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
+      const sellPct = totalVol > 0 ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
+      await sendMessage(`📊 Volume Imbalance Report: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`);
 
     } catch (err) {
       log(`❌ STC scan error ${symbol}: ${err?.message || err}`);
