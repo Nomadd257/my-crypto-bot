@@ -248,26 +248,23 @@ setInterval(async () => {
       const now = Date.now();
 
       // --- Check symbol cooldown ---
-      if(symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
+      if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // --- 1H STC for cycle detection (closed candle only) ---
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
       if (!candles1H || candles1H.length < 20) continue;
-      const closes1H = candles1H.slice(0,-1).map(c => c.close); // exclude current forming candle
+      const closes1H = candles1H.slice(0, -1).map(c => c.close); // exclude current forming candle
       const stc1H = calculateSTC(closes1H, { cycle: 4, fast: 10, slow: 20 });
-      if(stc1H === null) continue;
+      if (stc1H === null) continue;
 
       // --- Detect 1H flip based on closed candle ---
       const prev1H = last1HSTC[symbol] ?? stc1H;
       let flip = null;
 
-      // Bullish flip: crosses 25 upward
-      if(prev1H < 25 && stc1H >= 25) flip = "BULL";
+      if (prev1H < 25 && stc1H >= 25) flip = "BULL";      // Bullish flip
+      if (prev1H > 75 && stc1H <= 75) flip = "BEAR";      // Bearish flip
 
-      // Bearish flip: crosses 75 downward
-      if(prev1H > 75 && stc1H <= 75) flip = "BEAR";
-
-      if(flip){
+      if (flip) {
         currentCycle[symbol] = flip;
         last15MSTCValue[symbol] = null; // reset 15M flip tracker on new cycle
         await sendMessage(`🔄 STC FLIP confirmed on closed 1H candle for *${symbol}*: ${flip} cycle started`);
@@ -280,35 +277,30 @@ setInterval(async () => {
       if (!candles15 || candles15.length < 20) continue;
       const closes15 = candles15.map(c => c.close);
       const stc15 = calculateSTC(closes15, { cycle: 4, fast: 10, slow: 20 });
-      if(stc15 === null) continue;
+      if (stc15 === null) continue;
 
       // --- Detect 15M flips in the same 1H cycle ---
       const cycle = currentCycle[symbol]; // "BULL" or "BEAR"
       const prev15M = last15MSTCValue[symbol] ?? stc15;
       let direction = null;
 
-      // Buy flip: 15M crosses above 25 in bullish cycle
-      if(cycle === "BULL" && prev15M < 25 && stc15 >= 25) {
-        direction = "BUY";
-      }
-
-      // Sell flip: 15M crosses below 75 in bearish cycle
-      if(cycle === "BEAR" && prev15M > 75 && stc15 <= 75) {
-        direction = "SELL";
-      }
+      if (cycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";    // Buy flip
+      if (cycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";   // Sell flip
 
       last15MSTCValue[symbol] = stc15; // update 15M tracker
 
-      // --- Execute trade if flip detected ---
-      if(direction) await executeMarketOrderForAllUsers(symbol, direction);
+      // --- Execute trade and send volume report only if flip detected ---
+      if (direction) {
+        await executeMarketOrderForAllUsers(symbol, direction);
 
-      // --- Volume imbalance report ---
-      const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-      const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
-      const totalVol = buyVol + sellVol;
-      const buyPct = totalVol > 0 ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
-      const sellPct = totalVol > 0 ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
-      await sendMessage(`📊 Volume Imbalance Report: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`);
+        // --- Volume imbalance report ---
+        const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+        const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+        const totalVol = buyVol + sellVol;
+        const buyPct = totalVol > 0 ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
+        const sellPct = totalVol > 0 ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
+        await sendMessage(`📊 Volume Imbalance Report: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`);
+      }
 
     } catch (err) {
       log(`❌ STC scan error ${symbol}: ${err?.message || err}`);
