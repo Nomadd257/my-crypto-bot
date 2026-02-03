@@ -46,6 +46,8 @@ let symbolCooldowns = {};      // { symbol: timestamp }
 let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
 let last15MSTCValue = {};     // { symbol: previous 15M STC value }
 
+let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
+
 // --- Logging ---
 function log(msg){ console.log(`[${new Date().toISOString()}] ${msg}`); }
 
@@ -237,73 +239,108 @@ async function monitorPositions(){
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
-// --- Full-auto STC scanning loop with confirmed 1H cycle and 15M flip trades ---
+// --- Active coins for 15M entries ---
+let ACTIVE_COINS = [...COIN_LIST]; // By default, all coins are scanned
+
+// --- Manual cycle per symbol ---
+let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
+
+let symbolActive = {};
+COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
+
+// --- Full-auto STC scanning loop (per-symbol manual cycles + activate/deactivate) ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
 
   for (const symbol of COIN_LIST) {
+
+    // --- Skip inactive symbols ---
+    if (!symbolActive[symbol]) continue;
+
     try {
       const now = Date.now();
 
-      // --- Check symbol cooldown ---
-      if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
+      // --- Cooldown check ---
+      if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) {
+        continue;
+      }
 
-      // --- 1H STC: determine cycle by COLOR (slope) ---
-const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-if (!candles1H || candles1H.length < 30) continue;
+      // =====================================================
+      // 1H STC — DETERMINE & LOCK CYCLE (manual override or auto)
+      // =====================================================
+      if (!currentCycle[symbol]) {
+        // 1️⃣ Per-symbol manual cycle override
+if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
+  currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
 
-const closes1H = candles1H.slice(0, -1).map(c => c.close); // closed candles only
+// 2️⃣ Global manual cycle override
+} else if (MANUAL_CYCLE) {
+  currentCycle[symbol] = MANUAL_CYCLE;
 
-// Build STC series to get slope (color)
-const stcSeries1H = [];
-for (let i = 0; i < closes1H.length; i++) {
-  const slice = closes1H.slice(0, i + 1);
-  const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-  if (val !== null) stcSeries1H.push(val);
+// 3️⃣ Auto 1H STC detection
+} else {
+  const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+  if (!candles1H || candles1H.length < 30) continue;
+
+  const closes1H = candles1H.slice(0, -1).map(c => c.close);
+  const stcSeries1H = [];
+  for (let i = 0; i < closes1H.length; i++) {
+    const slice = closes1H.slice(0, i + 1);
+    const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+    if (val !== null) stcSeries1H.push(val);
+  }
+  if (stcSeries1H.length < 2) continue;
+
+  const prev1H = stcSeries1H[stcSeries1H.length - 2];
+  const curr1H = stcSeries1H[stcSeries1H.length - 1];
+
+  let cycle = null;
+  if (curr1H > prev1H) cycle = "BULL";
+  if (curr1H < prev1H) cycle = "BEAR";
+  if (!cycle) continue;
+
+  currentCycle[symbol] = cycle;
+  await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
 }
 
-if (stcSeries1H.length < 2) continue;
+      const trendCycle = currentCycle[symbol];
+      if (!trendCycle) continue;
 
-const prev1H = stcSeries1H[stcSeries1H.length - 2];
-const curr1H = stcSeries1H[stcSeries1H.length - 1];
-
-let cycle = null;
-if (curr1H > prev1H) cycle = "BULL";   // 🟢 STC rising
-if (curr1H < prev1H) cycle = "BEAR";   // 🔴 STC falling
-
-if (!cycle) continue;
-
-// Save current cycle state
-currentCycle[symbol] = cycle;
-
-      // --- 15M STC for entry trades ---
+      // =====================================================
+      // 15M STC — ENTRY LOGIC (FLIPS ONLY)
+      // =====================================================
       const candles15 = await fetchFuturesKlines(symbol, "15m", 100);
       if (!candles15 || candles15.length < 20) continue;
+
       const closes15 = candles15.map(c => c.close);
       const stc15 = calculateSTC(closes15, { cycle: 4, fast: 10, slow: 20 });
       if (stc15 === null) continue;
 
-      // --- Detect 15M flips in the same 1H cycle ---
-      const trendCycle = currentCycle[symbol]; // "BULL" or "BEAR"
       const prev15M = last15MSTCValue[symbol] ?? stc15;
       let direction = null;
 
-      if (trendCycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";    // Buy flip
-      if (trendCycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";   // Sell flip
+      if (trendCycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";
+      if (trendCycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";
 
-      last15MSTCValue[symbol] = stc15; // update 15M tracker
+      last15MSTCValue[symbol] = stc15;
 
-      // --- Execute trade and send volume report only if flip detected ---
+      // =====================================================
+      // EXECUTION + REPORT
+      // =====================================================
       if (direction) {
         await executeMarketOrderForAllUsers(symbol, direction);
 
-        // --- Volume imbalance report ---
         const buyVol = candles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
         const sellVol = candles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
         const totalVol = buyVol + sellVol;
-        const buyPct = totalVol > 0 ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
-        const sellPct = totalVol > 0 ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
-        await sendMessage(`📊 Volume Imbalance Report: *${symbol}*\nBuy Vol: ${buyVol.toFixed(2)} (${buyPct}%)\nSell Vol: ${sellVol.toFixed(2)} (${sellPct}%)`);
+        const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
+        const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
+
+        await sendMessage(
+          `📊 Volume Imbalance Report: *${symbol}*\n` +
+          `Buy: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
+          `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
+        );
       }
 
     } catch (err) {
@@ -313,27 +350,117 @@ currentCycle[symbol] = cycle;
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 // --- Telegram commands ---
-bot.onText(/\/pause/, async()=>{ BOT_PAUSED=true; await sendMessage("⏸️ Bot paused."); });
-bot.onText(/\/resume/, async()=>{ BOT_PAUSED=false; await sendMessage("▶️ Bot resumed."); });
 
-bot.onText(/\/closeall/, async()=>{
-  for(const [symbol, users] of Object.entries(activePositions)){
-    for(const [userId,pos] of Object.entries(users)){
-      const client = userClients[userId]; if(!client) continue;
-      try{ if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty); else await client.futuresMarketBuy(symbol,pos.qty); } catch{}
+// Pause bot completely
+bot.onText(/\/pause/, async () => {
+  BOT_PAUSED = true;
+  currentCycle = {};
+  last15MSTCValue = {};
+  MANUAL_CYCLE = null;
+  await sendMessage("⏸️ Bot paused. Cycles cleared.");
+});
+
+// Resume bot after pause
+bot.onText(/\/resume/, async () => {
+  BOT_PAUSED = false;
+  await sendMessage("▶️ Bot resumed.");
+});
+
+// Close all positions for all users
+bot.onText(/\/closeall/, async () => {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const client = userClients[userId];
+      if (!client) continue;
+      try {
+        if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+        else await client.futuresMarketBuy(symbol, pos.qty);
+      } catch {}
     }
   }
-  activePositions={};
+  activePositions = {};
   await sendMessage("🛑 All positions closed.");
 });
 
-bot.onText(/\/close (.+)/, async(msg, match)=>{
+// Close a specific symbol for all users
+bot.onText(/\/close (.+)/, async (msg, match) => {
   const symbol = match[1].toUpperCase().trim();
-  if(!activePositions[symbol]) { await sendMessage(`⚠️ No active position for *${symbol}*`); return; }
-  for(const [userId,pos] of Object.entries(activePositions[symbol])){
-    const client = userClients[userId]; if(!client) continue;
-    try{ if(pos.side==="BUY") await client.futuresMarketSell(symbol,pos.qty); else await client.futuresMarketBuy(symbol,pos.qty); await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`); } catch(err){ log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message||err}`); }
+  if (!activePositions[symbol]) {
+    await sendMessage(`⚠️ No active position for *${symbol}*`);
+    return;
+  }
+  for (const [userId, pos] of Object.entries(activePositions[symbol])) {
+    const client = userClients[userId];
+    if (!client) continue;
+    try {
+      if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+      else await client.futuresMarketBuy(symbol, pos.qty);
+      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
+    } catch (err) {
+      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
+    }
   }
   delete activePositions[symbol];
   await sendMessage(`✅ *${symbol}* fully closed for all users`);
+});
+
+// --- Global BULL/BEAR commands ---
+bot.onText(/\/setbull$/, async () => {
+  MANUAL_CYCLE = "BULL";
+  currentCycle = {};
+  last15MSTCValue = {};
+  await sendMessage("🟢 MANUAL MODE: All symbols set to *BULLISH* cycle");
+});
+
+bot.onText(/\/setbear$/, async () => {
+  MANUAL_CYCLE = "BEAR";
+  currentCycle = {};
+  last15MSTCValue = {};
+  await sendMessage("🔴 MANUAL MODE: All symbols set to *BEARISH* cycle");
+});
+
+bot.onText(/\/setauto$/, async () => {
+  MANUAL_CYCLE = null;
+  currentCycle = {};
+  last15MSTCValue = {};
+  await sendMessage("🤖 AUTO MODE: 1H STC detection re-enabled");
+});
+
+// --- Per-symbol BULL/BEAR commands ---
+bot.onText(/\/setbull (\w+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase();
+  currentCycle[symbol] = "BULL";
+  last15MSTCValue[symbol] = null;
+  await sendMessage(`🟢 MANUAL MODE: *${symbol}* set to *BULLISH* cycle`);
+});
+
+bot.onText(/\/setbear (\w+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase();
+  currentCycle[symbol] = "BEAR";
+  last15MSTCValue[symbol] = null;
+  await sendMessage(`🔴 MANUAL MODE: *${symbol}* set to *BEARISH* cycle`);
+});
+
+// --- Per-symbol ACTIVATE/DEACTIVATE commands ---
+
+// Deactivate a symbol (stop scanning/trading)
+bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase();
+  if (!(symbol in symbolActive)) {
+    await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
+    return;
+  }
+  symbolActive[symbol] = false;
+  await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
+});
+
+// Activate a symbol (resume scanning/trading)
+bot.onText(/\/activate (\w+)/, async (msg, match) => {
+  const symbol = match[1].toUpperCase();
+  if (!(symbol in symbolActive)) {
+    await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
+    return;
+  }
+  symbolActive[symbol] = true;
+  await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol.`);
 });
