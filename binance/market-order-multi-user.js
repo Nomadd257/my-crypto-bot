@@ -44,7 +44,6 @@ let symbolCooldowns = {};      // { symbol: timestamp }
 
 // --- STC cycle trackers ---
 let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
-let last15MSTCValue = {};     // { symbol: previous 15M STC value }
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -248,12 +247,13 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
 
-// --- Full-auto STC scanning loop (per-symbol manual cycles + activate/deactivate) ---
+let last15MSTCValue = {}; // { symbol: last STC value for 15M flips }
+
+// --- Full-auto STC scanning loop ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
 
   for (const symbol of COIN_LIST) {
-
     // --- Skip inactive symbols ---
     if (!symbolActive[symbol]) continue;
 
@@ -270,38 +270,40 @@ setInterval(async () => {
       // =====================================================
       if (!currentCycle[symbol]) {
         // 1️⃣ Per-symbol manual cycle override
-if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
-  currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
+        if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
+          currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
 
-// 2️⃣ Global manual cycle override
-} else if (MANUAL_CYCLE) {
-  currentCycle[symbol] = MANUAL_CYCLE;
+        // 2️⃣ Global manual cycle override
+        } else if (MANUAL_CYCLE) {
+          currentCycle[symbol] = MANUAL_CYCLE;
 
-// 3️⃣ Auto 1H STC detection
-} else {
-  const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-  if (!candles1H || candles1H.length < 30) continue;
+        // 3️⃣ Auto 1H STC detection
+        } else {
+          const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+          if (!candles1H || candles1H.length < 30) continue;
 
-  const closes1H = candles1H.slice(0, -1).map(c => c.close);
-  const stcSeries1H = [];
-  for (let i = 0; i < closes1H.length; i++) {
-    const slice = closes1H.slice(0, i + 1);
-    const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-    if (val !== null) stcSeries1H.push(val);
-  }
-  if (stcSeries1H.length < 2) continue;
+          const closes1H = candles1H.slice(0, -1).map(c => c.close);
+          const stcSeries1H = [];
 
-  const prev1H = stcSeries1H[stcSeries1H.length - 2];
-  const curr1H = stcSeries1H[stcSeries1H.length - 1];
+          for (let i = 0; i < closes1H.length; i++) {
+            const slice = closes1H.slice(0, i + 1);
+            const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+            if (val !== null) stcSeries1H.push(val);
+          }
+          if (stcSeries1H.length < 2) continue;
 
-  let cycle = null;
-  if (curr1H > prev1H) cycle = "BULL";
-  if (curr1H < prev1H) cycle = "BEAR";
-  if (!cycle) continue;
+          const prev1H = stcSeries1H[stcSeries1H.length - 2];
+          const curr1H = stcSeries1H[stcSeries1H.length - 1];
 
-  currentCycle[symbol] = cycle;
-  await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
-}
+          let cycle = null;
+          if (curr1H > prev1H) cycle = "BULL";
+          if (curr1H < prev1H) cycle = "BEAR";
+          if (!cycle) continue;
+
+          currentCycle[symbol] = cycle;
+          await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
+        }
+      }
 
       const trendCycle = currentCycle[symbol];
       if (!trendCycle) continue;
@@ -316,16 +318,18 @@ if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
       const stc15 = calculateSTC(closes15, { cycle: 4, fast: 10, slow: 20 });
       if (stc15 === null) continue;
 
-      const prev15M = last15MSTCValue[symbol] ?? stc15;
+      const prev15M = last15MSTCValue[symbol];
       let direction = null;
 
-      if (trendCycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";
-      if (trendCycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";
+      if (prev15M !== undefined) {
+        if (trendCycle === "BULL" && prev15M < 25 && stc15 >= 25) direction = "BUY";
+        if (trendCycle === "BEAR" && prev15M > 75 && stc15 <= 75) direction = "SELL";
+      }
 
       last15MSTCValue[symbol] = stc15;
 
       // =====================================================
-      // EXECUTION + REPORT
+      // EXECUTION + VOLUME REPORT
       // =====================================================
       if (direction) {
         await executeMarketOrderForAllUsers(symbol, direction);
@@ -341,12 +345,16 @@ if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
           `Buy: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
           `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
         );
+
+        // Start cooldown for this symbol after trade
+        symbolCooldowns[symbol] = Date.now();
       }
 
     } catch (err) {
       log(`❌ STC scan error ${symbol}: ${err?.message || err}`);
     }
   }
+
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 // --- Telegram commands ---
