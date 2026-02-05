@@ -1,7 +1,10 @@
 // =====================================================
-// MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// CID SIGNALS + VOLUME IMBALANCE
+// FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// STC STRATEGY: 1H STC = direction, 5M STC = entry (confirmed flip on close)
 // TP/SL/TRAILING STOP INTACT
+// Volume imbalance report only per trade
+// MAX TRADES = 7 per user
+// 30-min cooldown per symbol
 // =====================================================
 
 const config = require("../config");
@@ -244,31 +247,33 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
 
-// --- Full-auto STC scanning loop ---
+// --- Full-auto STC scanning loop (1H bias + 5M confirmed entries) ---
 setInterval(async () => {
   if (BOT_PAUSED) return;
 
   for (const symbol of COIN_LIST) {
-    // --- Skip inactive symbols ---
+
+    // Skip inactive symbols
     if (!symbolActive[symbol]) continue;
 
     try {
       const now = Date.now();
 
-      // --- Cooldown check ---
+      // Cooldown check
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) {
         continue;
       }
 
       // =====================================================
-      // 1H STC — DETERMINE & LOCK CYCLE (manual override or auto)
+      // 1H STC — DETERMINE & LOCK CYCLE
       // =====================================================
       if (!currentCycle[symbol]) {
-        // 1️⃣ Per-symbol manual cycle override
+
+        // 1️⃣ Per-symbol manual override
         if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
           currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
 
-        // 2️⃣ Global manual cycle override
+        // 2️⃣ Global manual override
         } else if (MANUAL_CYCLE) {
           currentCycle[symbol] = MANUAL_CYCLE;
 
@@ -277,6 +282,7 @@ setInterval(async () => {
           const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
           if (!candles1H || candles1H.length < 30) continue;
 
+          // Remove forming candle
           const closes1H = candles1H.slice(0, -1).map(c => c.close);
           const stcSeries1H = [];
 
@@ -285,6 +291,7 @@ setInterval(async () => {
             const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
             if (val !== null) stcSeries1H.push(val);
           }
+
           if (stcSeries1H.length < 2) continue;
 
           const prev1H = stcSeries1H[stcSeries1H.length - 2];
@@ -304,48 +311,50 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
+      // 5M STC — ENTRY LOGIC (CONFIRMED FLIPS ON CLOSE)
       // =====================================================
-// 15M STC — ENTRY LOGIC (CONFIRMED FLIPS ON CANDLE CLOSE)
-// =====================================================
-const candles15 = await fetchFuturesKlines(symbol, "15m", 100);
-if (!candles15 || candles15.length < 30) continue;
+      const candles5 = await fetchFuturesKlines(symbol, "5m", 100);
+      if (!candles5 || candles5.length < 30) continue;
 
-// ❗ Remove the currently forming candle
-const closedCandles15 = candles15.slice(0, -1);
-const closes15 = closedCandles15.map(c => c.close);
+      // Remove forming candle
+      const closedCandles5 = candles5.slice(0, -1);
+      const closes5 = closedCandles5.map(c => c.close);
 
-// Build STC series candle-by-candle
-const stcSeries15 = [];
-for (let i = 0; i < closes15.length; i++) {
-  const slice = closes15.slice(0, i + 1);
-  const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-  if (val !== null) stcSeries15.push(val);
-}
+      const stcSeries5 = [];
+      for (let i = 0; i < closes5.length; i++) {
+        const slice = closes5.slice(0, i + 1);
+        const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+        if (val !== null) stcSeries5.push(val);
+      }
 
-if (stcSeries15.length < 2) continue;
+      if (stcSeries5.length < 2) continue;
 
-const prev15 = stcSeries15[stcSeries15.length - 2];
-const curr15 = stcSeries15[stcSeries15.length - 1];
+      const prev5 = stcSeries5[stcSeries5.length - 2];
+      const curr5 = stcSeries5[stcSeries5.length - 1];
 
-let direction = null;
+      let direction = null;
 
-// ✅ Confirmed flips ONLY
-if (trendCycle === "BULL" && prev15 < 25 && curr15 >= 25) {
-  direction = "BUY";
-}
+      // Confirmed flips only
+      if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) {
+        direction = "BUY";
+      }
 
-if (trendCycle === "BEAR" && prev15 > 75 && curr15 <= 75) {
-  direction = "SELL";
-}
+      if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) {
+        direction = "SELL";
+      }
 
-// =====================================================
+      // =====================================================
       // EXECUTION + VOLUME REPORT
       // =====================================================
       if (direction) {
         await executeMarketOrderForAllUsers(symbol, direction);
 
-        const buyVol = closedCandles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-        const sellVol = closedCandles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+        const buyVol = closedCandles5.reduce(
+          (sum, c) => sum + (c.close > c.open ? c.volume : 0), 0
+        );
+        const sellVol = closedCandles5.reduce(
+          (sum, c) => sum + (c.close < c.open ? c.volume : 0), 0
+        );
         const totalVol = buyVol + sellVol;
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
@@ -356,7 +365,7 @@ if (trendCycle === "BEAR" && prev15 > 75 && curr15 <= 75) {
           `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
         );
 
-        // Start cooldown for this symbol after trade
+        // Start cooldown
         symbolCooldowns[symbol] = Date.now();
       }
 
