@@ -293,11 +293,15 @@ setInterval(async () => {
 
       const closedCandles1H = candles1H.slice(0, -1);
       const closes1H = closedCandles1H.map(c => c.close);
-      const highs = closedCandles1H.map(c => c.high);
-      const lows = closedCandles1H.map(c => c.low);
 
-      const dailyHigh = Math.max(...highs);
-      const dailyLow = Math.min(...lows);
+      // --- TRUE Daily High / Low (from last closed daily candle) ---
+      const dailyCandles = await fetchFuturesKlines(symbol, "1d", 2);
+      if (!dailyCandles || dailyCandles.length < 2) continue;
+
+      const lastClosedDaily = dailyCandles[dailyCandles.length - 2];
+      const dailyHigh = lastClosedDaily.high;
+      const dailyLow = lastClosedDaily.low;
+
       const currPrice = closes1H[closes1H.length - 1];
 
       const atr = calculateATR(closedCandles1H, ATR_PERIOD);
@@ -446,6 +450,7 @@ setInterval(async () => {
   }
 
 }, SIGNAL_CHECK_INTERVAL_MS);
+
 
 // --- Telegram commands ---
 
