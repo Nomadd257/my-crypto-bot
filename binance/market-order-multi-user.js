@@ -145,6 +145,30 @@ function calculateSTC(closes, { cycle = 4, fast = 10, slow = 20, signal = 3 } = 
   return stc[stc.length - 1]; // return latest STC value
 }
 
+// --- Average True Range (ATR) ---
+const ATR_PERIOD = 14; // standard ATR period
+
+function calculateATR(candles, period = ATR_PERIOD) {
+  if (!candles || candles.length < period + 1) return null;
+
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+    trs.push(tr);
+  }
+
+  const recentTRs = trs.slice(-period);
+  const atr = recentTRs.reduce((sum, val) => sum + val, 0) / period;
+  return atr;
+}
+
 // --- Floor qty ---
 function floorToStep(qty, step){
   const s = Number(step); if(!s||s<=0) return qty;
@@ -247,61 +271,98 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
 
-// --- Full-auto STC scanning loop (1H bias + 5M confirmed entries) ---
+// --- Full-auto STC scanning loop (1H bias + 5M confirmed entries + ATR notifications) ---
+let prevContractingNearLow = [];
+let prevExpandingNearHigh = [];
+let symbolCooldownsATR = {}; // per-symbol cooldown for ATR messages (1h)
+
 setInterval(async () => {
-  if (BOT_PAUSED) return;
+  const now = Date.now();
+
+  const contractingNearLow = [];
+  const expandingNearHigh = [];
 
   for (const symbol of COIN_LIST) {
 
-    // Skip inactive symbols
-    if (!symbolActive[symbol]) continue;
+    // Skip inactive symbols for trading, but still scan ATR extremes
+    const isActive = symbolActive[symbol] ?? true;
 
     try {
-      const now = Date.now();
+      const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+      if (!candles1H || candles1H.length < 30) continue;
 
-      // Cooldown check
-      if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) {
-        continue;
+      const closedCandles1H = candles1H.slice(0, -1);
+      const closes1H = closedCandles1H.map(c => c.close);
+      const highs = closedCandles1H.map(c => c.high);
+      const lows = closedCandles1H.map(c => c.low);
+
+      const dailyHigh = Math.max(...highs);
+      const dailyLow = Math.min(...lows);
+      const currPrice = closes1H[closes1H.length - 1];
+
+      const atr = calculateATR(closedCandles1H, ATR_PERIOD);
+      if (!atr) continue;
+
+      const prevAtr = calculateATR(closedCandles1H.slice(0, -1), ATR_PERIOD) || atr;
+      const atrContracting = atr < prevAtr;
+      const atrExpanding = atr > prevAtr;
+
+      const distToLow = currPrice - dailyLow;
+      const distToHigh = dailyHigh - currPrice;
+
+      const atrMsgCooldown = 60 * 60 * 1000; // 1 hour per symbol
+
+      // --- ATR LOW notification ---
+      if (distToLow / atr <= 0.2 && atrContracting) {
+        if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
+          await sendMessage(
+            `🟢 ${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting. Potential bullish flip soon!`
+          );
+          symbolCooldownsATR[symbol] = now;
+        }
+        contractingNearLow.push(symbol);
       }
+
+      // --- ATR HIGH notification ---
+      if (distToHigh / atr <= 0.2 && atrExpanding) {
+        if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
+          await sendMessage(
+            `🔴 ${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding. Watch for bearish flip!`
+          );
+          symbolCooldownsATR[symbol] = now;
+        }
+        expandingNearHigh.push(symbol);
+      }
+
+      // --- Skip trading if symbol inactive or bot paused ---
+      if (!isActive || BOT_PAUSED) continue;
+
+      // Cooldown check (trading)
+      if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
       // 1H STC — DETERMINE & LOCK CYCLE
       // =====================================================
       if (!currentCycle[symbol]) {
 
-        // 1️⃣ Per-symbol manual override
         if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
           currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
-
-        // 2️⃣ Global manual override
         } else if (MANUAL_CYCLE) {
           currentCycle[symbol] = MANUAL_CYCLE;
-
-        // 3️⃣ Auto 1H STC detection
         } else {
-          const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-          if (!candles1H || candles1H.length < 30) continue;
-
-          // Remove forming candle
-          const closes1H = candles1H.slice(0, -1).map(c => c.close);
           const stcSeries1H = [];
-
           for (let i = 0; i < closes1H.length; i++) {
             const slice = closes1H.slice(0, i + 1);
             const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
             if (val !== null) stcSeries1H.push(val);
           }
-
           if (stcSeries1H.length < 2) continue;
-
           const prev1H = stcSeries1H[stcSeries1H.length - 2];
           const curr1H = stcSeries1H[stcSeries1H.length - 1];
-
           let cycle = null;
           if (curr1H > prev1H) cycle = "BULL";
           if (curr1H < prev1H) cycle = "BEAR";
           if (!cycle) continue;
-
           currentCycle[symbol] = cycle;
           await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
         }
@@ -316,7 +377,6 @@ setInterval(async () => {
       const candles5 = await fetchFuturesKlines(symbol, "5m", 100);
       if (!candles5 || candles5.length < 30) continue;
 
-      // Remove forming candle
       const closedCandles5 = candles5.slice(0, -1);
       const closes5 = closedCandles5.map(c => c.close);
 
@@ -326,7 +386,6 @@ setInterval(async () => {
         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
         if (val !== null) stcSeries5.push(val);
       }
-
       if (stcSeries5.length < 2) continue;
 
       const prev5 = stcSeries5[stcSeries5.length - 2];
@@ -334,14 +393,8 @@ setInterval(async () => {
 
       let direction = null;
 
-      // Confirmed flips only
-      if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) {
-        direction = "BUY";
-      }
-
-      if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) {
-        direction = "SELL";
-      }
+      if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) direction = "BUY";
+      if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) direction = "SELL";
 
       // =====================================================
       // EXECUTION + VOLUME REPORT
@@ -365,13 +418,31 @@ setInterval(async () => {
           `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
         );
 
-        // Start cooldown
-        symbolCooldowns[symbol] = Date.now();
+        // Start trading cooldown
+        symbolCooldowns[symbol] = now;
       }
 
     } catch (err) {
       log(`❌ STC scan error ${symbol}: ${err?.message || err}`);
     }
+  }
+
+  // --- Summary Notification for multiple coins ---
+  const newContracting = contractingNearLow.filter(s => !prevContractingNearLow.includes(s));
+  const newExpanding = expandingNearHigh.filter(s => !prevExpandingNearHigh.includes(s));
+
+  if (newContracting.length + newExpanding.length >= 1) {
+    let summaryMsg = `⚡ Ready to Deploy Bot:\n`;
+    if (newContracting.length)
+      summaryMsg += `🟢 Contracting near ATR Low (Bullish flip soon): ${newContracting.join(", ")}\n`;
+    if (newExpanding.length)
+      summaryMsg += `🔴 Expanding near ATR High (Watch/possible bearish flip): ${newExpanding.join(", ")}`;
+
+    await sendMessage(summaryMsg);
+
+    // Update previous sets
+    prevContractingNearLow = contractingNearLow;
+    prevExpandingNearHigh = expandingNearHigh;
   }
 
 }, SIGNAL_CHECK_INTERVAL_MS);
@@ -484,4 +555,12 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
   }
   symbolActive[symbol] = true;
   await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol.`);
+});
+
+// Deactivate all symbols (stop scanning/trading for all coins)
+bot.onText(/\/deactivateall/, async () => {
+  COIN_LIST.forEach(symbol => {
+    symbolActive[symbol] = false;
+  });
+  await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
