@@ -272,29 +272,38 @@ let symbolActive = {};
 COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
 
 // --- Full-auto STC scanning loop (1H bias + 5M confirmed entries + ATR notifications) ---
-let prevContractingNearLow = [];
-let prevExpandingNearHigh = [];
+
+let prevBullishFlip = [];
+let prevBearishFlip = [];
+let prevBullishContinuation = [];
+let prevBearishContinuation = [];
+
 let symbolCooldownsATR = {}; // per-symbol cooldown for ATR messages (1h)
 
 setInterval(async () => {
+
   const now = Date.now();
 
-  const contractingNearLow = [];
-  const expandingNearHigh = [];
+  const bullishFlip = [];
+  const bearishFlip = [];
+  const bullishContinuation = [];
+  const bearishContinuation = [];
 
   for (const symbol of COIN_LIST) {
 
-    // Skip inactive symbols for trading, but still scan ATR extremes
     const isActive = symbolActive[symbol] ?? true;
 
     try {
+
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
       if (!candles1H || candles1H.length < 30) continue;
 
       const closedCandles1H = candles1H.slice(0, -1);
       const closes1H = closedCandles1H.map(c => c.close);
 
-      // --- TRUE Daily High / Low (from last closed daily candle) ---
+      // =============================
+      // TRUE DAILY LEVELS
+      // =============================
       const dailyCandles = await fetchFuturesKlines(symbol, "1d", 2);
       if (!dailyCandles || dailyCandles.length < 2) continue;
 
@@ -304,48 +313,81 @@ setInterval(async () => {
 
       const currPrice = closes1H[closes1H.length - 1];
 
+      // =============================
+      // ATR
+      // =============================
       const atr = calculateATR(closedCandles1H, ATR_PERIOD);
       if (!atr) continue;
 
       const prevAtr = calculateATR(closedCandles1H.slice(0, -1), ATR_PERIOD) || atr;
+
       const atrContracting = atr < prevAtr;
       const atrExpanding = atr > prevAtr;
 
       const distToLow = currPrice - dailyLow;
       const distToHigh = dailyHigh - currPrice;
 
-      const atrMsgCooldown = 60 * 60 * 1000; // 1 hour per symbol
+      const atrMsgCooldown = 60 * 60 * 1000;
 
-      // --- ATR LOW notification ---
-      if (distToLow / atr <= 0.2 && atrContracting) {
+      // =====================================================
+      // 4-STATE ATR STRUCTURE CLASSIFICATION
+      // =====================================================
+
+      // -------- NEAR DAILY LOW --------
+      if (distToLow / atr <= 0.2) {
+
         if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
-          await sendMessage(
-            `🟢 ${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting. Potential bullish flip soon!`
-          );
+
+          if (atrContracting) {
+            await sendMessage(
+              `🟢 *Bullish Flip*\n\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting. Watch for bullish flip`
+            );
+            bullishFlip.push(symbol);
+          }
+
+          if (atrExpanding) {
+            await sendMessage(
+              `🔴 *Bearish Continuation*\n\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding. Watch for bearish continuation`
+            );
+            bearishContinuation.push(symbol);
+          }
+
           symbolCooldownsATR[symbol] = now;
         }
-        contractingNearLow.push(symbol);
       }
 
-      // --- ATR HIGH notification ---
-      if (distToHigh / atr <= 0.2 && atrExpanding) {
+      // -------- NEAR DAILY HIGH --------
+      if (distToHigh / atr <= 0.2) {
+
         if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
-          await sendMessage(
-            `🔴 ${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding. Watch for bearish flip!`
-          );
+
+          if (atrContracting) {
+            await sendMessage(
+              `🔴 *Bearish Flip*\n\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting. Watch for bearish flip!`
+            );
+            bearishFlip.push(symbol);
+          }
+
+          if (atrExpanding) {
+            await sendMessage(
+              `🟢 *Bullish Continuation*\n\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding. Watch for bullish continuation`
+            );
+            bullishContinuation.push(symbol);
+          }
+
           symbolCooldownsATR[symbol] = now;
         }
-        expandingNearHigh.push(symbol);
       }
 
-      // --- Skip trading if symbol inactive or bot paused ---
+      // =====================================================
+      // Skip trading if paused/inactive
+      // =====================================================
       if (!isActive || BOT_PAUSED) continue;
 
-      // Cooldown check (trading)
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
-      // 1H STC — DETERMINE & LOCK CYCLE
+      // 1H STC CYCLE LOCK
       // =====================================================
       if (!currentCycle[symbol]) {
 
@@ -354,20 +396,27 @@ setInterval(async () => {
         } else if (MANUAL_CYCLE) {
           currentCycle[symbol] = MANUAL_CYCLE;
         } else {
+
           const stcSeries1H = [];
+
           for (let i = 0; i < closes1H.length; i++) {
             const slice = closes1H.slice(0, i + 1);
             const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
             if (val !== null) stcSeries1H.push(val);
           }
+
           if (stcSeries1H.length < 2) continue;
+
           const prev1H = stcSeries1H[stcSeries1H.length - 2];
           const curr1H = stcSeries1H[stcSeries1H.length - 1];
+
           let cycle = null;
           if (curr1H > prev1H) cycle = "BULL";
           if (curr1H < prev1H) cycle = "BEAR";
           if (!cycle) continue;
+
           currentCycle[symbol] = cycle;
+
           await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
         }
       }
@@ -376,7 +425,7 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-      // 5M STC — ENTRY LOGIC (CONFIRMED FLIPS ON CLOSE)
+      // 5M STC ENTRY
       // =====================================================
       const candles5 = await fetchFuturesKlines(symbol, "5m", 100);
       if (!candles5 || candles5.length < 30) continue;
@@ -385,11 +434,13 @@ setInterval(async () => {
       const closes5 = closedCandles5.map(c => c.close);
 
       const stcSeries5 = [];
+
       for (let i = 0; i < closes5.length; i++) {
         const slice = closes5.slice(0, i + 1);
         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
         if (val !== null) stcSeries5.push(val);
       }
+
       if (stcSeries5.length < 2) continue;
 
       const prev5 = stcSeries5[stcSeries5.length - 2];
@@ -401,18 +452,22 @@ setInterval(async () => {
       if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) direction = "SELL";
 
       // =====================================================
-      // EXECUTION + VOLUME REPORT
+      // EXECUTION
       // =====================================================
       if (direction) {
+
         await executeMarketOrderForAllUsers(symbol, direction);
 
         const buyVol = closedCandles5.reduce(
           (sum, c) => sum + (c.close > c.open ? c.volume : 0), 0
         );
+
         const sellVol = closedCandles5.reduce(
           (sum, c) => sum + (c.close < c.open ? c.volume : 0), 0
         );
+
         const totalVol = buyVol + sellVol;
+
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
 
@@ -422,7 +477,6 @@ setInterval(async () => {
           `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
         );
 
-        // Start trading cooldown
         symbolCooldowns[symbol] = now;
       }
 
@@ -431,22 +485,37 @@ setInterval(async () => {
     }
   }
 
-  // --- Summary Notification for multiple coins ---
-  const newContracting = contractingNearLow.filter(s => !prevContractingNearLow.includes(s));
-  const newExpanding = expandingNearHigh.filter(s => !prevExpandingNearHigh.includes(s));
+  // =====================================================
+  // 4-STATE SUMMARY
+  // =====================================================
 
-  if (newContracting.length + newExpanding.length >= 1) {
-    let summaryMsg = `⚡ Ready to Deploy Bot:\n`;
-    if (newContracting.length)
-      summaryMsg += `🟢 Contracting near ATR Low (Bullish flip soon): ${newContracting.join(", ")}\n`;
-    if (newExpanding.length)
-      summaryMsg += `🔴 Expanding near ATR High (Watch/possible bearish flip): ${newExpanding.join(", ")}`;
+  const newBullishFlip = bullishFlip.filter(s => !prevBullishFlip.includes(s));
+  const newBearishFlip = bearishFlip.filter(s => !prevBearishFlip.includes(s));
+  const newBullishCont = bullishContinuation.filter(s => !prevBullishContinuation.includes(s));
+  const newBearishCont = bearishContinuation.filter(s => !prevBearishContinuation.includes(s));
+
+  if (newBullishFlip.length || newBearishFlip.length || newBullishCont.length || newBearishCont.length) {
+
+    let summaryMsg = `⚡ *Ready to deploy bot*\n\n`;
+
+    if (newBullishFlip.length)
+      summaryMsg += `🟢 Bullish Flip (Low + Contracting):\n${newBullishFlip.join(", ")}\n\n`;
+
+    if (newBearishFlip.length)
+      summaryMsg += `🔴 Bearish Flip (High + Contracting):\n${newBearishFlip.join(", ")}\n\n`;
+
+    if (newBullishCont.length)
+      summaryMsg += `🟢 Bullish Continuation (High + Expanding):\n${newBullishCont.join(", ")}\n\n`;
+
+    if (newBearishCont.length)
+      summaryMsg += `🔴 Bearish Continuation (Low + Expanding):\n${newBearishCont.join(", ")}`;
 
     await sendMessage(summaryMsg);
 
-    // Update previous sets
-    prevContractingNearLow = contractingNearLow;
-    prevExpandingNearHigh = expandingNearHigh;
+    prevBullishFlip = bullishFlip;
+    prevBearishFlip = bearishFlip;
+    prevBullishContinuation = bullishContinuation;
+    prevBearishContinuation = bearishContinuation;
   }
 
 }, SIGNAL_CHECK_INTERVAL_MS);
