@@ -638,3 +638,73 @@ bot.onText(/\/deactivateall/, async () => {
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
+
+// --- Show all users Futures USDT balances ---
+bot.onText(/\/balances$/, async () => {
+
+  const clients = Object.entries(userClients)
+    .map(([userId, client]) => ({ userId, client }));
+
+  if (!clients.length) {
+    await sendMessage("⚠️ No active users.");
+    return;
+  }
+
+  await sendMessage("📊 Fetching Futures balances...");
+
+  try {
+
+    const results = await Promise.all(
+      clients.map(async ({ userId, client }) => {
+        try {
+          const balances = await client.futuresBalance();
+          const usdt = balances.find(b => b.asset === "USDT");
+
+          const wallet = usdt ? parseFloat(usdt.balance) : 0;
+          const available = usdt ? parseFloat(usdt.availableBalance) : 0;
+          const unrealized = usdt ? parseFloat(usdt.unrealizedProfit) : 0;
+
+          return { userId, wallet, available, unrealized };
+
+        } catch (err) {
+          return { userId, error: true };
+        }
+      })
+    );
+
+    let totalWallet = 0;
+    let totalAvailable = 0;
+    let totalUnrealized = 0;
+
+    let report = "💰 *Futures Wallet Summary:*\n\n";
+
+    for (const r of results) {
+
+      if (r.error) {
+        report += `User ${r.userId}: ❌ Error fetching balance\n`;
+        continue;
+      }
+
+      totalWallet += r.wallet;
+      totalAvailable += r.available;
+      totalUnrealized += r.unrealized;
+
+      report += 
+        `User ${r.userId}:\n` +
+        `   Wallet: ${r.wallet.toFixed(2)} USDT\n` +
+        `   Available: ${r.available.toFixed(2)} USDT\n` +
+        `   Unrealized PnL: ${r.unrealized.toFixed(2)} USDT\n\n`;
+    }
+
+    report += 
+      `📦 *Total Wallet:* ${totalWallet.toFixed(2)} USDT\n` +
+      `💵 *Total Available:* ${totalAvailable.toFixed(2)} USDT\n` +
+      `📈 *Total Unrealized:* ${totalUnrealized.toFixed(2)} USDT`;
+
+    await sendMessage(report);
+
+  } catch (err) {
+    await sendMessage("❌ Failed to fetch balances.");
+  }
+
+});
