@@ -271,7 +271,7 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
 
-// --- Full-auto STC scanning loop (1H bias + 5M confirmed entries + ATR notifications) ---
+// --- Full-auto STC + ATR combined scanning loop ---
 
 let prevBullishFlip = [];
 let prevBearishFlip = [];
@@ -294,7 +294,6 @@ setInterval(async () => {
     const isActive = symbolActive[symbol] ?? true;
 
     try {
-
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
       if (!candles1H || candles1H.length < 30) continue;
 
@@ -320,7 +319,6 @@ setInterval(async () => {
       if (!atr) continue;
 
       const prevAtr = calculateATR(closedCandles1H.slice(0, -1), ATR_PERIOD) || atr;
-
       const atrContracting = atr < prevAtr;
       const atrExpanding = atr > prevAtr;
 
@@ -329,95 +327,71 @@ setInterval(async () => {
 
       const atrMsgCooldown = 60 * 60 * 1000;
 
-      // =====================================================
-      // 4-STATE ATR STRUCTURE CLASSIFICATION
-      // =====================================================
-
-      // -------- NEAR DAILY LOW --------
-      if (distToLow / atr <= 0.2) {
-
-        if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
-
-          if (atrContracting) {
-            await sendMessage(
-              `🟢 *Bullish Flip*\n\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting. Watch for bullish flip`
-            );
-            bullishFlip.push(symbol);
-          }
-
-          if (atrExpanding) {
-            await sendMessage(
-              `🔴 *Bearish Continuation*\n\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding. Watch for bearish continuation`
-            );
-            bearishContinuation.push(symbol);
-          }
-
-          symbolCooldownsATR[symbol] = now;
-        }
+      // =============================
+      // 1H STC SLOPE
+      // =============================
+      const stcSeries1H = [];
+      for (let i = 0; i < closes1H.length; i++) {
+        const slice = closes1H.slice(0, i + 1);
+        const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+        if (val !== null) stcSeries1H.push(val);
       }
+      if (stcSeries1H.length < 2) continue;
 
-      // -------- NEAR DAILY HIGH --------
-      if (distToHigh / atr <= 0.2) {
+      const prev1H = stcSeries1H[stcSeries1H.length - 2];
+      const curr1H = stcSeries1H[stcSeries1H.length - 1];
+      const stcRising = curr1H > prev1H;
+      const stcFalling = curr1H < prev1H;
 
-        if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
+      // =====================================================
+      // COMBINED ATR + STC SIGNALS
+      // =====================================================
 
-          if (atrContracting) {
-            await sendMessage(
-              `🔴 *Bearish Flip*\n\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting. Watch for bearish flip!`
-            );
-            bearishFlip.push(symbol);
+      if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
+
+        // --- NEAR DAILY LOW ---
+        if (distToLow / atr <= 0.2) {
+          if (atrContracting && stcRising) {
+            bullishFlip.push(symbol);
+            await sendMessage(`🟢 *Bullish Flip*\n${symbol} near ATR LOW — ATR contracting + STC rising.`);
           }
-
-          if (atrExpanding) {
-            await sendMessage(
-              `🟢 *Bullish Continuation*\n\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding. Watch for bullish continuation`
-            );
-            bullishContinuation.push(symbol);
+          if (atrExpanding && stcFalling) {
+            bearishContinuation.push(symbol);
+            await sendMessage(`🔴 *Bearish Continuation*\n${symbol} near ATR LOW — ATR expanding + STC falling.`);
           }
-
-          symbolCooldownsATR[symbol] = now;
         }
+
+        // --- NEAR DAILY HIGH ---
+        if (distToHigh / atr <= 0.2) {
+          if (atrContracting && stcFalling) {
+            bearishFlip.push(symbol);
+            await sendMessage(`🔴 *Bearish Flip*\n${symbol} near ATR HIGH — ATR contracting + STC falling.`);
+          }
+          if (atrExpanding && stcRising) {
+            bullishContinuation.push(symbol);
+            await sendMessage(`🟢 *Bullish Continuation*\n${symbol} near ATR HIGH — ATR expanding + STC rising.`);
+          }
+        }
+
+        symbolCooldownsATR[symbol] = now;
       }
 
       // =====================================================
       // Skip trading if paused/inactive
       // =====================================================
       if (!isActive || BOT_PAUSED) continue;
-
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
-      // 1H STC CYCLE LOCK
+      // 1H STC CYCLE LOCK (if not manual)
       // =====================================================
       if (!currentCycle[symbol]) {
+        if (MANUAL_CYCLE_BY_SYMBOL[symbol]) currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
+        else if (MANUAL_CYCLE) currentCycle[symbol] = MANUAL_CYCLE;
+        else currentCycle[symbol] = stcRising ? "BULL" : stcFalling ? "BEAR" : null;
 
-        if (MANUAL_CYCLE_BY_SYMBOL[symbol]) {
-          currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
-        } else if (MANUAL_CYCLE) {
-          currentCycle[symbol] = MANUAL_CYCLE;
-        } else {
-
-          const stcSeries1H = [];
-
-          for (let i = 0; i < closes1H.length; i++) {
-            const slice = closes1H.slice(0, i + 1);
-            const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-            if (val !== null) stcSeries1H.push(val);
-          }
-
-          if (stcSeries1H.length < 2) continue;
-
-          const prev1H = stcSeries1H[stcSeries1H.length - 2];
-          const curr1H = stcSeries1H[stcSeries1H.length - 1];
-
-          let cycle = null;
-          if (curr1H > prev1H) cycle = "BULL";
-          if (curr1H < prev1H) cycle = "BEAR";
-          if (!cycle) continue;
-
-          currentCycle[symbol] = cycle;
-
-          await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${cycle}*`);
+        if (currentCycle[symbol]) {
+          await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${currentCycle[symbol]}*`);
         }
       }
 
@@ -434,20 +408,17 @@ setInterval(async () => {
       const closes5 = closedCandles5.map(c => c.close);
 
       const stcSeries5 = [];
-
       for (let i = 0; i < closes5.length; i++) {
         const slice = closes5.slice(0, i + 1);
         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
         if (val !== null) stcSeries5.push(val);
       }
-
       if (stcSeries5.length < 2) continue;
 
       const prev5 = stcSeries5[stcSeries5.length - 2];
       const curr5 = stcSeries5[stcSeries5.length - 1];
 
       let direction = null;
-
       if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) direction = "BUY";
       if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) direction = "SELL";
 
@@ -455,60 +426,41 @@ setInterval(async () => {
       // EXECUTION
       // =====================================================
       if (direction) {
-
         await executeMarketOrderForAllUsers(symbol, direction);
 
-        const buyVol = closedCandles5.reduce(
-          (sum, c) => sum + (c.close > c.open ? c.volume : 0), 0
-        );
-
-        const sellVol = closedCandles5.reduce(
-          (sum, c) => sum + (c.close < c.open ? c.volume : 0), 0
-        );
-
+        const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+        const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
         const totalVol = buyVol + sellVol;
-
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
 
         await sendMessage(
-          `📊 Volume Imbalance Report: *${symbol}*\n` +
-          `Buy: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
-          `Sell: ${sellVol.toFixed(2)} (${sellPct}%)`
+          `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`
         );
 
         symbolCooldowns[symbol] = now;
       }
 
     } catch (err) {
-      log(`❌ STC scan error ${symbol}: ${err?.message || err}`);
+      log(`❌ STC + ATR scan error ${symbol}: ${err?.message || err}`);
     }
   }
 
   // =====================================================
   // 4-STATE SUMMARY
   // =====================================================
-
   const newBullishFlip = bullishFlip.filter(s => !prevBullishFlip.includes(s));
   const newBearishFlip = bearishFlip.filter(s => !prevBearishFlip.includes(s));
   const newBullishCont = bullishContinuation.filter(s => !prevBullishContinuation.includes(s));
   const newBearishCont = bearishContinuation.filter(s => !prevBearishContinuation.includes(s));
 
   if (newBullishFlip.length || newBearishFlip.length || newBullishCont.length || newBearishCont.length) {
-
     let summaryMsg = `⚡ *Ready to deploy bot*\n\n`;
 
-    if (newBullishFlip.length)
-      summaryMsg += `🟢 Bullish Flip (Low + Contracting):\n${newBullishFlip.join(", ")}\n\n`;
-
-    if (newBearishFlip.length)
-      summaryMsg += `🔴 Bearish Flip (High + Contracting):\n${newBearishFlip.join(", ")}\n\n`;
-
-    if (newBullishCont.length)
-      summaryMsg += `🟢 Bullish Continuation (High + Expanding):\n${newBullishCont.join(", ")}\n\n`;
-
-    if (newBearishCont.length)
-      summaryMsg += `🔴 Bearish Continuation (Low + Expanding):\n${newBearishCont.join(", ")}`;
+    if (newBullishFlip.length) summaryMsg += `🟢 Bullish Flip (ATR Low + STC Rising):\n${newBullishFlip.join(", ")}\n\n`;
+    if (newBearishFlip.length) summaryMsg += `🔴 Bearish Flip (ATR High + STC Falling):\n${newBearishFlip.join(", ")}\n\n`;
+    if (newBullishCont.length) summaryMsg += `🟢 Bullish Continuation (ATR High + STC Rising):\n${newBullishCont.join(", ")}\n\n`;
+    if (newBearishCont.length) summaryMsg += `🔴 Bearish Continuation (ATR Low + STC Falling):\n${newBearishCont.join(", ")}`;
 
     await sendMessage(summaryMsg);
 
