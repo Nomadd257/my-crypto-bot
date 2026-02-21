@@ -472,10 +472,18 @@ setInterval(async () => {
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 
+const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
+
+// Helper function to check admin
+function isAdmin(msg) {
+  return msg?.chat?.id === ADMIN_CHAT_ID;
+}
+
 // --- Telegram commands ---
 
 // Pause bot completely
-bot.onText(/\/pause/, async () => {
+bot.onText(/\/pause/, async (msg) => {
+  if (!isAdmin(msg)) return;
   BOT_PAUSED = true;
   currentCycle = {};
   MANUAL_CYCLE = null;
@@ -483,13 +491,15 @@ bot.onText(/\/pause/, async () => {
 });
 
 // Resume bot after pause
-bot.onText(/\/resume/, async () => {
+bot.onText(/\/resume/, async (msg) => {
+  if (!isAdmin(msg)) return;
   BOT_PAUSED = false;
   await sendMessage("▶️ Bot resumed.");
 });
 
 // Close all positions for all users
-bot.onText(/\/closeall/, async () => {
+bot.onText(/\/closeall/, async (msg) => {
+  if (!isAdmin(msg)) return;
   for (const [symbol, users] of Object.entries(activePositions)) {
     for (const [userId, pos] of Object.entries(users)) {
       const client = userClients[userId];
@@ -506,6 +516,7 @@ bot.onText(/\/closeall/, async () => {
 
 // Close a specific symbol for all users
 bot.onText(/\/close (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase().trim();
   if (!activePositions[symbol]) {
     await sendMessage(`⚠️ No active position for *${symbol}*`);
@@ -527,19 +538,22 @@ bot.onText(/\/close (.+)/, async (msg, match) => {
 });
 
 // --- Global BULL/BEAR commands ---
-bot.onText(/\/setbull$/, async () => {
+bot.onText(/\/setbull$/, async (msg) => {
+  if (!isAdmin(msg)) return;
   MANUAL_CYCLE = "BULL";
   currentCycle = {};
   await sendMessage("🟢 MANUAL MODE: All symbols set to *BULLISH* cycle");
 });
 
-bot.onText(/\/setbear$/, async () => {
+bot.onText(/\/setbear$/, async (msg) => {
+  if (!isAdmin(msg)) return;
   MANUAL_CYCLE = "BEAR";
   currentCycle = {};
   await sendMessage("🔴 MANUAL MODE: All symbols set to *BEARISH* cycle");
 });
 
-bot.onText(/\/setauto$/, async () => {
+bot.onText(/\/setauto$/, async (msg) => {
+  if (!isAdmin(msg)) return;
   MANUAL_CYCLE = null;
   currentCycle = {};
   await sendMessage("🤖 AUTO MODE: 1H STC detection re-enabled");
@@ -547,21 +561,22 @@ bot.onText(/\/setauto$/, async () => {
 
 // --- Per-symbol BULL/BEAR commands ---
 bot.onText(/\/setbull (\w+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase();
   currentCycle[symbol] = "BULL";
   await sendMessage(`🟢 MANUAL MODE: *${symbol}* set to *BULLISH* cycle`);
 });
 
 bot.onText(/\/setbear (\w+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase();
   currentCycle[symbol] = "BEAR";
   await sendMessage(`🔴 MANUAL MODE: *${symbol}* set to *BEARISH* cycle`);
 });
 
 // --- Per-symbol ACTIVATE/DEACTIVATE commands ---
-
-// Deactivate a symbol (stop scanning/trading)
 bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase();
   if (!(symbol in symbolActive)) {
     await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
@@ -571,8 +586,8 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
 });
 
-// Activate a symbol (resume scanning/trading)
 bot.onText(/\/activate (\w+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase();
   if (!(symbol in symbolActive)) {
     await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
@@ -582,8 +597,8 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
   await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol.`);
 });
 
-// Deactivate all symbols (stop scanning/trading for all coins)
-bot.onText(/\/deactivateall/, async () => {
+bot.onText(/\/deactivateall/, async (msg) => {
+  if (!isAdmin(msg)) return;
   COIN_LIST.forEach(symbol => {
     symbolActive[symbol] = false;
   });
@@ -591,7 +606,8 @@ bot.onText(/\/deactivateall/, async () => {
 });
 
 // --- Show all users Futures USDT balances ---
-bot.onText(/\/balances$/, async () => {
+bot.onText(/\/balances$/, async (msg) => {
+  if (!isAdmin(msg)) return;
 
   const clients = Object.entries(userClients)
     .map(([userId, client]) => ({ userId, client }));
@@ -604,7 +620,6 @@ bot.onText(/\/balances$/, async () => {
   await sendMessage("📊 Fetching Futures balances...");
 
   try {
-
     const results = await Promise.all(
       clients.map(async ({ userId, client }) => {
         try {
@@ -616,7 +631,6 @@ bot.onText(/\/balances$/, async () => {
           const unrealized = usdt ? parseFloat(usdt.unrealizedProfit) : 0;
 
           return { userId, wallet, available, unrealized };
-
         } catch (err) {
           return { userId, error: true };
         }
@@ -630,7 +644,6 @@ bot.onText(/\/balances$/, async () => {
     let report = "💰 *Futures Wallet Summary:*\n\n";
 
     for (const r of results) {
-
       if (r.error) {
         report += `User ${r.userId}: ❌ Error fetching balance\n`;
         continue;
@@ -657,49 +670,13 @@ bot.onText(/\/balances$/, async () => {
   } catch (err) {
     await sendMessage("❌ Failed to fetch balances.");
   }
-
 });
 
-// --- In-memory monthly report tracker ---
-let monthlyReport = {}; // { userId: { startBalance: number, tradesWon: number, tradesLost: number } }
-
-// --- Initialize start balances for active users ---
-async function initializeMonthlyBalances() {
-  const users = loadUsers().filter(u => u.active);
-  for (const user of users) {
-    if (!monthlyReport[user.id]) monthlyReport[user.id] = {};
-    if (!monthlyReport[user.id].startBalance) {
-      try {
-        const client = userClients[user.id];
-        if (!client) continue;
-        const balances = await client.futuresBalance();
-        const usdtBal = balances.find(b => b.asset === "USDT");
-        monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
-      } catch (err) {
-        log(`❌ Failed to initialize startBalance for ${user.id}: ${err?.message || err}`);
-        monthlyReport[user.id].startBalance = 0;
-      }
-    }
-  }
-}
-
-// Call this at startup and periodically (for new activations)
-initializeMonthlyBalances();
-setInterval(initializeMonthlyBalances, 60 * 1000); // every 1 minute
-
-// --- Monthly Reset at start of each month ---
-setInterval(() => {
-  const now = new Date();
-  if (now.getDate() === 1 && now.getHours() === 0 && now.getMinutes() === 0) {
-    monthlyReport = {};
-    log("🔄 Monthly report reset for all users.");
-  }
-}, 60 * 1000); // check every minute
-
 // --- Monthly Report Command ---
-bot.onText(/\/monthlyreport/, async () => {
-  const PROFIT_SHARE_PERCENT = 30; // 30% profit share
+bot.onText(/\/monthlyreport/, async (msg) => {
+  if (!isAdmin(msg)) return;
 
+  const PROFIT_SHARE_PERCENT = 30; // 30% profit share
   const users = loadUsers().filter(u => u.active);
   if (!users.length) {
     await sendMessage("⚠️ No active users found for monthly report.");
@@ -707,7 +684,6 @@ bot.onText(/\/monthlyreport/, async () => {
   }
 
   let reportMsg = `📊 *Monthly Trading Report*\n\n`;
-
   let totalNetProfit = 0;
   let totalProfitShare = 0;
 
@@ -718,14 +694,12 @@ bot.onText(/\/monthlyreport/, async () => {
     if (!client) continue;
 
     try {
-      // --- Initialize startBalance if missing (mid-month join) ---
       if (!monthlyReport[user.id].startBalance) {
         const balances = await client.futuresBalance();
         const usdtBal = balances.find(b => b.asset === "USDT");
         monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
       }
 
-      // --- Fetch current balance ---
       const balances = await client.futuresBalance();
       const usdtBal = balances.find(b => b.asset === "USDT");
       const currentBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
@@ -733,13 +707,11 @@ bot.onText(/\/monthlyreport/, async () => {
       const startBalance = monthlyReport[user.id].startBalance || 0;
       const netProfit = currentBalance - startBalance;
 
-      // --- Calculate trades won/lost if tracking exists ---
       const tradesWon = monthlyReport[user.id].tradesWon || 0;
       const tradesLost = monthlyReport[user.id].tradesLost || 0;
       const totalTrades = tradesWon + tradesLost;
       const winRate = totalTrades ? ((tradesWon / totalTrades) * 100).toFixed(1) : "0.0";
 
-      // --- Profit share calculation ---
       const profitShare = netProfit > 0 ? (netProfit * PROFIT_SHARE_PERCENT / 100) : 0;
 
       totalNetProfit += netProfit;
@@ -756,7 +728,6 @@ bot.onText(/\/monthlyreport/, async () => {
     }
   }
 
-  // --- Append totals ---
   reportMsg += `💰 Total Net Profit (all users): ${totalNetProfit.toFixed(2)} USDT\n` +
                `📈 Total Profit Share Owed: ${totalProfitShare.toFixed(2)} USDT`;
 
