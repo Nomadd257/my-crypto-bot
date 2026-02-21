@@ -346,18 +346,17 @@ setInterval(async () => {
       // =====================================================
       // COMBINED ATR + STC SIGNALS
       // =====================================================
-
       if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
 
         // --- NEAR DAILY LOW ---
         if (distToLow / atr <= 0.2) {
           if (atrContracting && stcRising) {
             bullishFlip.push(symbol);
-            await sendMessage(`🟢 *Bullish Flip*\n${symbol} near ATR LOW — ATR contracting + STC rising.`);
+            await sendMessage(`🟢 *Bullish Flip*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting + STC rising.`);
           }
           if (atrExpanding && stcFalling) {
             bearishContinuation.push(symbol);
-            await sendMessage(`🔴 *Bearish Continuation*\n${symbol} near ATR LOW — ATR expanding + STC falling.`);
+            await sendMessage(`🔴 *Bearish Continuation*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding + STC falling.`);
           }
         }
 
@@ -365,11 +364,11 @@ setInterval(async () => {
         if (distToHigh / atr <= 0.2) {
           if (atrContracting && stcFalling) {
             bearishFlip.push(symbol);
-            await sendMessage(`🔴 *Bearish Flip*\n${symbol} near ATR HIGH — ATR contracting + STC falling.`);
+            await sendMessage(`🔴 *Bearish Flip*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting + STC falling.`);
           }
           if (atrExpanding && stcRising) {
             bullishContinuation.push(symbol);
-            await sendMessage(`🟢 *Bullish Continuation*\n${symbol} near ATR HIGH — ATR expanding + STC rising.`);
+            await sendMessage(`🟢 *Bullish Continuation*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding + STC rising.`);
           }
         }
 
@@ -447,7 +446,7 @@ setInterval(async () => {
   }
 
   // =====================================================
-  // 4-STATE SUMMARY
+  // 4-STATE SUMMARY (without price)
   // =====================================================
   const newBullishFlip = bullishFlip.filter(s => !prevBullishFlip.includes(s));
   const newBearishFlip = bearishFlip.filter(s => !prevBearishFlip.includes(s));
@@ -659,4 +658,107 @@ bot.onText(/\/balances$/, async () => {
     await sendMessage("❌ Failed to fetch balances.");
   }
 
+});
+
+// --- In-memory monthly report tracker ---
+let monthlyReport = {}; // { userId: { startBalance: number, tradesWon: number, tradesLost: number } }
+
+// --- Initialize start balances for active users ---
+async function initializeMonthlyBalances() {
+  const users = loadUsers().filter(u => u.active);
+  for (const user of users) {
+    if (!monthlyReport[user.id]) monthlyReport[user.id] = {};
+    if (!monthlyReport[user.id].startBalance) {
+      try {
+        const client = userClients[user.id];
+        if (!client) continue;
+        const balances = await client.futuresBalance();
+        const usdtBal = balances.find(b => b.asset === "USDT");
+        monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
+      } catch (err) {
+        log(`❌ Failed to initialize startBalance for ${user.id}: ${err?.message || err}`);
+        monthlyReport[user.id].startBalance = 0;
+      }
+    }
+  }
+}
+
+// Call this at startup and periodically (for new activations)
+initializeMonthlyBalances();
+setInterval(initializeMonthlyBalances, 60 * 1000); // every 1 minute
+
+// --- Monthly Reset at start of each month ---
+setInterval(() => {
+  const now = new Date();
+  if (now.getDate() === 1 && now.getHours() === 0 && now.getMinutes() === 0) {
+    monthlyReport = {};
+    log("🔄 Monthly report reset for all users.");
+  }
+}, 60 * 1000); // check every minute
+
+// --- Monthly Report Command ---
+bot.onText(/\/monthlyreport/, async () => {
+  const PROFIT_SHARE_PERCENT = 30; // 30% profit share
+
+  const users = loadUsers().filter(u => u.active);
+  if (!users.length) {
+    await sendMessage("⚠️ No active users found for monthly report.");
+    return;
+  }
+
+  let reportMsg = `📊 *Monthly Trading Report*\n\n`;
+
+  let totalNetProfit = 0;
+  let totalProfitShare = 0;
+
+  for (const user of users) {
+    if (!monthlyReport[user.id]) monthlyReport[user.id] = {};
+
+    const client = userClients[user.id];
+    if (!client) continue;
+
+    try {
+      // --- Initialize startBalance if missing (mid-month join) ---
+      if (!monthlyReport[user.id].startBalance) {
+        const balances = await client.futuresBalance();
+        const usdtBal = balances.find(b => b.asset === "USDT");
+        monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
+      }
+
+      // --- Fetch current balance ---
+      const balances = await client.futuresBalance();
+      const usdtBal = balances.find(b => b.asset === "USDT");
+      const currentBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
+
+      const startBalance = monthlyReport[user.id].startBalance || 0;
+      const netProfit = currentBalance - startBalance;
+
+      // --- Calculate trades won/lost if tracking exists ---
+      const tradesWon = monthlyReport[user.id].tradesWon || 0;
+      const tradesLost = monthlyReport[user.id].tradesLost || 0;
+      const totalTrades = tradesWon + tradesLost;
+      const winRate = totalTrades ? ((tradesWon / totalTrades) * 100).toFixed(1) : "0.0";
+
+      // --- Profit share calculation ---
+      const profitShare = netProfit > 0 ? (netProfit * PROFIT_SHARE_PERCENT / 100) : 0;
+
+      totalNetProfit += netProfit;
+      totalProfitShare += profitShare;
+
+      reportMsg += `👤 User: ${user.name || user.id}\n` +
+                   `💰 Net Profit/Loss: ${netProfit.toFixed(2)} USDT\n` +
+                   `🏆 Win Rate: ${winRate}%\n` +
+                   `📈 Profit Share (${PROFIT_SHARE_PERCENT}%): ${profitShare.toFixed(2)} USDT\n\n`;
+
+    } catch (err) {
+      log(`❌ Failed to generate monthly report for ${user.id}: ${err?.message || err}`);
+      reportMsg += `👤 User: ${user.name || user.id}\n⚠️ Report unavailable\n\n`;
+    }
+  }
+
+  // --- Append totals ---
+  reportMsg += `💰 Total Net Profit (all users): ${totalNetProfit.toFixed(2)} USDT\n` +
+               `📈 Total Profit Share Owed: ${totalProfitShare.toFixed(2)} USDT`;
+
+  await sendMessage(reportMsg);
 });
