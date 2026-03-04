@@ -475,6 +475,56 @@ setInterval(async () => {
     prevBearishContinuation = bearishContinuation;
   }
 
+  // --- Volatility Summary Tracker (sorted by ATR) ---
+let prevDailyATR = {}; // { symbol: number }
+const HIGH_ATR_THRESHOLD = 2; // adjust based on typical ATR values
+
+setInterval(async () => {
+  let volatilityData = [];
+
+  for (const symbol of COIN_LIST) {
+    try {
+      const dailyCandles = await fetchFuturesKlines(symbol, "1d", 30);
+      if (!dailyCandles || dailyCandles.length < 2) continue;
+
+      const closedDaily = dailyCandles.slice(0, -1); // exclude current forming candle
+      const atr = calculateATR(closedDaily, ATR_PERIOD);
+      if (!atr) continue;
+
+      const prevATR = prevDailyATR[symbol] || atr;
+      let trendSymbol = "–"; // stable by default
+      if (atr > prevATR) trendSymbol = "↑";      // volatility increasing
+      else if (atr < prevATR) trendSymbol = "↓"; // volatility decreasing
+
+      prevDailyATR[symbol] = atr; // update for next loop
+
+      const highVolLabel = atr >= HIGH_ATR_THRESHOLD ? "🚀 High Volatility" : "";
+
+      volatilityData.push({
+        symbol,
+        atr,
+        trendSymbol,
+        highVolLabel
+      });
+
+    } catch (err) {
+      log(`❌ Volatility check failed for ${symbol}: ${err?.message || err}`);
+    }
+  }
+
+  // Sort from highest ATR to lowest
+  volatilityData.sort((a, b) => b.atr - a.atr);
+
+  // Build message
+  let summaryMsg = `⚡ *Hourly Volatility Summary*\n\n`;
+  for (const v of volatilityData) {
+    summaryMsg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} USDT ${v.trendSymbol} ${v.highVolLabel}\n`;
+  }
+
+  if (volatilityData.length) await sendMessage(summaryMsg);
+
+}, 60 * 60 * 1000); // every 1 hour
+
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 
