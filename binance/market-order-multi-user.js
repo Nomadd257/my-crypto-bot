@@ -475,58 +475,70 @@ setInterval(async () => {
     prevBearishContinuation = bearishContinuation;
   }
 
-  // --- Volatility Summary Tracker (sorted by ATR) ---
-let prevDailyATR = {}; // { symbol: number }
-const HIGH_ATR_THRESHOLD = 2; // adjust based on typical ATR values
-
-setInterval(async () => {
-  let volatilityData = [];
-
-  for (const symbol of COIN_LIST) {
-    try {
-      const dailyCandles = await fetchFuturesKlines(symbol, "1d", 30);
-      if (!dailyCandles || dailyCandles.length < 2) continue;
-
-      const closedDaily = dailyCandles.slice(0, -1); // exclude current forming candle
-      const atr = calculateATR(closedDaily, ATR_PERIOD);
-      if (!atr) continue;
-
-      const prevATR = prevDailyATR[symbol] || atr;
-      let trendSymbol = "–"; // stable by default
-      if (atr > prevATR) trendSymbol = "↑";      // volatility increasing
-      else if (atr < prevATR) trendSymbol = "↓"; // volatility decreasing
-
-      prevDailyATR[symbol] = atr; // update for next loop
-
-      const highVolLabel = atr >= HIGH_ATR_THRESHOLD ? "🚀 High Volatility" : "";
-
-      volatilityData.push({
-        symbol,
-        atr,
-        trendSymbol,
-        highVolLabel
-      });
-
-    } catch (err) {
-      log(`❌ Volatility check failed for ${symbol}: ${err?.message || err}`);
-    }
-  }
-
-  // Sort from highest ATR to lowest
-  volatilityData.sort((a, b) => b.atr - a.atr);
-
-  // Build message
-  let summaryMsg = `⚡ *Hourly Volatility Summary*\n\n`;
-  for (const v of volatilityData) {
-    summaryMsg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} USDT ${v.trendSymbol} ${v.highVolLabel}\n`;
-  }
-
-  if (volatilityData.length) await sendMessage(summaryMsg);
-
-}, 60 * 60 * 1000); // every 1 hour
 
 }, SIGNAL_CHECK_INTERVAL_MS);
 
+// --- 4H ATR Volatility Tracker (every 4 hours) ---
+let prevATR4H = {}; // store previous ATR for trend
+const ATR_PERIOD_4H = 14;
+const HIGH_ATR_THRESHOLD = 2;
+const MEDIUM_ATR_THRESHOLD = 1;
+
+setInterval(async () => {
+  let highVol = [];
+  let mediumVol = [];
+  let lowVol = [];
+
+  for (const symbol of COIN_LIST) {
+    try {
+      const candles4H = await fetchFuturesKlines(symbol, "4h", 50);
+      if (!candles4H || candles4H.length < ATR_PERIOD_4H) continue;
+
+      const closed4H = candles4H.slice(0, -1); // exclude forming candle
+      const atr = calculateATR(closed4H, ATR_PERIOD_4H);
+      if (!atr) continue;
+
+      const prevATR = prevATR4H[symbol] || atr;
+      let trendSymbol = "–"; // stable by default
+      if (atr > prevATR) trendSymbol = "↑";
+      else if (atr < prevATR) trendSymbol = "↓";
+
+      prevATR4H[symbol] = atr; // update for next check
+
+      // categorize by ATR magnitude
+      if (atr >= HIGH_ATR_THRESHOLD) highVol.push({ symbol, atr, trendSymbol });
+      else if (atr >= MEDIUM_ATR_THRESHOLD) mediumVol.push({ symbol, atr, trendSymbol });
+      else lowVol.push({ symbol, atr, trendSymbol });
+
+    } catch (err) {
+      log(`❌ 4H ATR check failed for ${symbol}: ${err?.message || err}`);
+    }
+  }
+
+  // Build grouped message
+  let msg = `⚡ *4H ATR Volatility Summary*\n\n`;
+
+  if (highVol.length) {
+    msg += `🚀 *High Volatility Coins* (ATR ≥ ${HIGH_ATR_THRESHOLD})\n`;
+    highVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+    msg += `\n`;
+  }
+
+  if (mediumVol.length) {
+    msg += `⚡ *Medium Volatility Coins* (ATR ${MEDIUM_ATR_THRESHOLD}-${HIGH_ATR_THRESHOLD})\n`;
+    mediumVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+    msg += `\n`;
+  }
+
+  if (lowVol.length) {
+    msg += `🌱 *Low Volatility Coins* (ATR < ${MEDIUM_ATR_THRESHOLD})\n`;
+    lowVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+    msg += `\n`;
+  }
+
+  if (msg) await sendMessage(msg);
+
+}, 4 * 60 * 60 * 1000); // every 4 hours
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
