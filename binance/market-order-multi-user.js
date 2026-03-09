@@ -10,6 +10,7 @@
 const config = require("../config");
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
+const {TSI} = require("technicalindicators");
 const fs = require("fs");
 const fetch = require("node-fetch");
 globalThis.fetch = fetch;
@@ -173,6 +174,29 @@ function calculateATR(candles, period = ATR_PERIOD) {
   const recentTRs = trs.slice(-period);
   const atr = recentTRs.reduce((sum, val) => sum + val, 0) / period;
   return atr;
+}
+
+// --- True Strength Index (TSI) ---
+function calculateTSI(candles) {
+  if (!candles || candles.length < 30) return null;
+
+  const closes = candles.map(c => c.close);
+
+  const tsiValues = TSI.calculate({
+    values: closes,
+    long: TSI_LONG,
+    short: TSI_SHORT,
+    signal: TSI_SIGNAL
+  });
+
+  if (!tsiValues.length) return null;
+
+  const latest = tsiValues[tsiValues.length - 1];
+
+  return {
+    tsi: latest.tsi,
+    signal: latest.signal
+  };
 }
 
 // --- Floor qty ---
@@ -539,6 +563,125 @@ setInterval(async () => {
   if (msg) await sendMessage(msg);
 
 }, 4 * 60 * 60 * 1000); // every 4 hours
+
+// --- 1H TSI Trend Tracker (every 1 hour) ---
+const TSI_LONG = 10;
+const TSI_SHORT = 5;
+const TSI_SIGNAL = 5;
+
+setInterval(async () => {
+  let confirmedBullish = [];
+  let confirmedBearish = [];
+  let potentialBullish = [];
+  let potentialBearish = [];
+
+  for (const symbol of COIN_LIST) {
+    try {
+      const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+      if (!candles1H || candles1H.length < TSI_LONG + TSI_SIGNAL) continue;
+
+      const closed1H = candles1H.slice(0, -1); // exclude forming candle
+      const closes = closed1H.map(c => c.close);
+
+      // --- ATR check ---
+      const atr = calculateATR(closed1H, ATR_PERIOD);
+      if (!atr) continue;
+      const lastClose = closes[closes.length - 1];
+      const dailyHigh = Math.max(...closes.slice(-24));
+      const dailyLow = Math.min(...closes.slice(-24));
+      const distToHigh = dailyHigh - lastClose;
+      const distToLow = lastClose - dailyLow;
+
+      // --- TSI calculation ---
+      const tsiSeries = calculateTSI(closes, TSI_LONG, TSI_SHORT, TSI_SIGNAL); // returns array of {tsi, signal}
+      const latest = tsiSeries[tsiSeries.length - 1];
+      const prev = tsiSeries[tsiSeries.length - 2];
+      if (!latest || !prev) continue;
+
+      // --- Determine Cross ---
+      const bullishCross = prev.tsi < prev.signal && latest.tsi >= latest.signal;
+      const bearishCross = prev.tsi > prev.signal && latest.tsi <= latest.signal;
+
+      // --- Confirmed Flips ---
+      if (bullishCross && distToLow / atr <= 0.2) {
+        confirmedBullish.push({
+          symbol,
+          lastClose,
+          tsi: latest.tsi,
+          signal: latest.signal,
+          atrLow: dailyLow.toFixed(4)
+        });
+      }
+      if (bearishCross && distToHigh / atr <= 0.2) {
+        confirmedBearish.push({
+          symbol,
+          lastClose,
+          tsi: latest.tsi,
+          signal: latest.signal,
+          atrHigh: dailyHigh.toFixed(4)
+        });
+      }
+
+      // --- Potential Continuation ---
+      if (!bullishCross && distToLow / atr <= 0.2) {
+        potentialBullish.push({
+          symbol,
+          lastClose,
+          tsi: latest.tsi,
+          signal: latest.signal,
+          atrLow: dailyLow.toFixed(4)
+        });
+      }
+      if (!bearishCross && distToHigh / atr <= 0.2) {
+        potentialBearish.push({
+          symbol,
+          lastClose,
+          tsi: latest.tsi,
+          signal: latest.signal,
+          atrHigh: dailyHigh.toFixed(4)
+        });
+      }
+
+    } catch (err) {
+      log(`❌ 1H TSI scan failed for ${symbol}: ${err?.message || err}`);
+    }
+  }
+
+  // --- Build Telegram message ---
+  let msg = `⚡ *1H TSI Trend Summary*\n\n`;
+
+  if (confirmedBullish.length) {
+    msg += `✅ *Confirmed Bullish Cross* (ATR Low + TSI Cross)\n`;
+    confirmedBullish.forEach(v => 
+      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+    );
+    msg += `\n`;
+  }
+  if (confirmedBearish.length) {
+    msg += `✅ *Confirmed Bearish Cross* (ATR High + TSI Cross)\n`;
+    confirmedBearish.forEach(v => 
+      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+    );
+    msg += `\n`;
+  }
+  if (potentialBullish.length) {
+    msg += `⚠️ *Potential Continuation (ATR Low)*\n`;
+    potentialBullish.forEach(v => 
+      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+    );
+    msg += `\n`;
+  }
+  if (potentialBearish.length) {
+    msg += `⚠️ *Potential Continuation (ATR High)*\n`;
+    potentialBearish.forEach(v => 
+      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+    );
+    msg += `\n`;
+  }
+
+  if (msg) await sendMessage(msg);
+
+}, 60 * 60 * 1000); // every 1 hour
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
