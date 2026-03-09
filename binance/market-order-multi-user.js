@@ -564,12 +564,17 @@ setInterval(async () => {
 
 }, 4 * 60 * 60 * 1000); // every 4 hours
 
-// --- 1H TSI Trend Tracker (every 1 hour) ---
+// --- 1H TSI Trend Tracker ---
 const TSI_LONG = 10;
 const TSI_SHORT = 5;
 const TSI_SIGNAL = 5;
 
+// --- Anti-spam cooldown ---
+const atrAlertCooldown = {};
+const ATR_ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hour per coin
+
 setInterval(async () => {
+
   let confirmedBullish = [];
   let confirmedBearish = [];
   let potentialBullish = [];
@@ -577,6 +582,7 @@ setInterval(async () => {
 
   for (const symbol of COIN_LIST) {
     try {
+
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
       if (!candles1H || candles1H.length < TSI_LONG + TSI_SIGNAL) continue;
 
@@ -586,14 +592,24 @@ setInterval(async () => {
       // --- ATR check ---
       const atr = calculateATR(closed1H, ATR_PERIOD);
       if (!atr) continue;
-      const lastClose = closes[closes.length - 1];
-      const dailyHigh = Math.max(...closes.slice(-24));
-      const dailyLow = Math.min(...closes.slice(-24));
-      const distToHigh = dailyHigh - lastClose;
-      const distToLow = lastClose - dailyLow;
+
+      const lastCandle = closed1H[closed1H.length - 1];
+      const lastClose = lastCandle.close;
+
+      const highs = closed1H.map(c => c.high);
+      const lows = closed1H.map(c => c.low);
+
+      const dailyHigh = Math.max(...highs.slice(-24));
+      const dailyLow = Math.min(...lows.slice(-24));
+
+      const distToHigh = dailyHigh - lastCandle.high;
+      const distToLow = lastCandle.low - dailyLow;
+
+      const nearATRHigh = Math.abs(distToHigh) / atr <= 0.3;
+      const nearATRLow = Math.abs(distToLow) / atr <= 0.3;
 
       // --- TSI calculation ---
-      const tsiSeries = calculateTSI(closes, TSI_LONG, TSI_SHORT, TSI_SIGNAL); // returns array of {tsi, signal}
+      const tsiSeries = calculateTSI(closes, TSI_LONG, TSI_SHORT, TSI_SIGNAL);
       const latest = tsiSeries[tsiSeries.length - 1];
       const prev = tsiSeries[tsiSeries.length - 2];
       if (!latest || !prev) continue;
@@ -602,8 +618,14 @@ setInterval(async () => {
       const bullishCross = prev.tsi < prev.signal && latest.tsi >= latest.signal;
       const bearishCross = prev.tsi > prev.signal && latest.tsi <= latest.signal;
 
-      // --- Confirmed Flips ---
-      if (bullishCross && distToLow / atr <= 0.2) {
+      const now = Date.now();
+      if (atrAlertCooldown[symbol] && now - atrAlertCooldown[symbol] < ATR_ALERT_COOLDOWN) continue;
+
+      // --- Confirmed Cross ---
+      if (bullishCross && nearATRLow) {
+
+        atrAlertCooldown[symbol] = now;
+
         confirmedBullish.push({
           symbol,
           lastClose,
@@ -612,7 +634,11 @@ setInterval(async () => {
           atrLow: dailyLow.toFixed(4)
         });
       }
-      if (bearishCross && distToHigh / atr <= 0.2) {
+
+      if (bearishCross && nearATRHigh) {
+
+        atrAlertCooldown[symbol] = now;
+
         confirmedBearish.push({
           symbol,
           lastClose,
@@ -623,7 +649,10 @@ setInterval(async () => {
       }
 
       // --- Potential Continuation ---
-      if (!bullishCross && distToLow / atr <= 0.2) {
+      if (!bullishCross && nearATRLow) {
+
+        atrAlertCooldown[symbol] = now;
+
         potentialBullish.push({
           symbol,
           lastClose,
@@ -632,7 +661,11 @@ setInterval(async () => {
           atrLow: dailyLow.toFixed(4)
         });
       }
-      if (!bearishCross && distToHigh / atr <= 0.2) {
+
+      if (!bearishCross && nearATRHigh) {
+
+        atrAlertCooldown[symbol] = now;
+
         potentialBearish.push({
           symbol,
           lastClose,
@@ -652,36 +685,46 @@ setInterval(async () => {
 
   if (confirmedBullish.length) {
     msg += `✅ *Confirmed Bullish Cross* (ATR Low + TSI Cross)\n`;
-    confirmedBullish.forEach(v => 
+    confirmedBullish.forEach(v =>
       msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
     );
     msg += `\n`;
   }
+
   if (confirmedBearish.length) {
     msg += `✅ *Confirmed Bearish Cross* (ATR High + TSI Cross)\n`;
-    confirmedBearish.forEach(v => 
+    confirmedBearish.forEach(v =>
       msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
     );
     msg += `\n`;
   }
+
   if (potentialBullish.length) {
     msg += `⚠️ *Potential Continuation (ATR Low)*\n`;
-    potentialBullish.forEach(v => 
+    potentialBullish.forEach(v =>
       msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
     );
     msg += `\n`;
   }
+
   if (potentialBearish.length) {
     msg += `⚠️ *Potential Continuation (ATR High)*\n`;
-    potentialBearish.forEach(v => 
+    potentialBearish.forEach(v =>
       msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
     );
     msg += `\n`;
   }
 
-  if (msg) await sendMessage(msg);
+  if (
+    confirmedBullish.length ||
+    confirmedBearish.length ||
+    potentialBullish.length ||
+    potentialBearish.length
+  ) {
+    await sendMessage(msg);
+  }
 
-}, 60 * 60 * 1000); // every 1 hour
+}, 60 * 1000); // check every 1 minute
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
