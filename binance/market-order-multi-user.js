@@ -612,25 +612,37 @@ setInterval(async () => {
 
   if (strongTrend.length) {
     msg += `🔥 *Strong Trend Coins* (ADX ≥ 30)\n`;
-    strongTrend.forEach(v => 
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
-    );
+    strongTrend.forEach(v => {
+
+      const diff = Math.abs(v.plusDI - v.minusDI);
+      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+    });
     msg += `\n`;
   }
 
   if (mediumTrend.length) {
     msg += `⚡ *Medium Trend Coins* (ADX 20-30)\n`;
-    mediumTrend.forEach(v => 
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
-    );
+    mediumTrend.forEach(v => {
+
+      const diff = Math.abs(v.plusDI - v.minusDI);
+      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+    });
     msg += `\n`;
   }
 
   if (weakTrend.length) {
     msg += `🌱 *Weak Trend Coins* (ADX < 20)\n`;
-    weakTrend.forEach(v => 
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
-    );
+    weakTrend.forEach(v => {
+
+      const diff = Math.abs(v.plusDI - v.minusDI);
+      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+    });
     msg += `\n`;
   }
 
