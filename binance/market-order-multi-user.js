@@ -10,7 +10,7 @@
 const config = require("../config");
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
-const {TSI} = require("technicalindicators");
+const {ADX} = require("technicalindicators");
 const fs = require("fs");
 const fetch = require("node-fetch");
 globalThis.fetch = fetch;
@@ -176,26 +176,30 @@ function calculateATR(candles, period = ATR_PERIOD) {
   return atr;
 }
 
-// --- True Strength Index (TSI) ---
-function calculateTSI(candles) {
-  if (!candles || candles.length < 30) return null;
+// --- Average Directional Index (ADX) ---
+function calculateADX(candles, period = 14) {
 
+  if (!candles || candles.length < period + 1) return null;
+
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
   const closes = candles.map(c => c.close);
 
-  const tsiValues = TSI.calculate({
-    values: closes,
-    long: TSI_LONG,
-    short: TSI_SHORT,
-    signal: TSI_SIGNAL
+  const result = ADX.calculate({
+    high: highs,
+    low: lows,
+    close: closes,
+    period: period
   });
 
-  if (!tsiValues.length) return null;
+  if (!result || !result.length) return null;
 
-  const latest = tsiValues[tsiValues.length - 1];
+  const latest = result[result.length - 1];
 
   return {
-    tsi: latest.tsi,
-    signal: latest.signal
+    adx: latest.adx,
+    plusDI: latest.pdi,
+    minusDI: latest.mdi
   };
 }
 
@@ -564,167 +568,75 @@ setInterval(async () => {
 
 }, 4 * 60 * 60 * 1000); // every 4 hours
 
-// --- 1H TSI Trend Tracker ---
-const TSI_LONG = 10;
-const TSI_SHORT = 5;
-const TSI_SIGNAL = 5;
-
-// --- Anti-spam cooldown ---
-const atrAlertCooldown = {};
-const ATR_ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hour per coin
+// --- 30M ADX Trend Tracker (every 30 minutes) ---
+let prevADX30M = {}; // store previous ADX for trend comparison
+const ADX_PERIOD = 14;
 
 setInterval(async () => {
-
-  let confirmedBullish = [];
-  let confirmedBearish = [];
-  let potentialBullish = [];
-  let potentialBearish = [];
+  let strongTrend = [];
+  let mediumTrend = [];
+  let weakTrend = [];
 
   for (const symbol of COIN_LIST) {
     try {
+      const candles30M = await fetchFuturesKlines(symbol, "30m", 50);
+      if (!candles30M || candles30M.length < ADX_PERIOD) continue;
 
-      const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-      if (!candles1H || candles1H.length < TSI_LONG + TSI_SIGNAL) continue;
+      const closed30M = candles30M.slice(0, -1); // exclude current forming candle
+      const adxData = calculateADX(closed30M, ADX_PERIOD); // returns { adx, plusDI, minusDI }
+      if (!adxData) continue;
 
-      const closed1H = candles1H.slice(0, -1); // exclude forming candle
-      const closes = closed1H.map(c => c.close);
+      const { adx, plusDI, minusDI } = adxData;
+      const prev = prevADX30M[symbol] || adx;
 
-      // --- ATR check ---
-      const atr = calculateATR(closed1H, ATR_PERIOD);
-      if (!atr) continue;
+      let trendSymbol = "–";
+      if (adx > prev) trendSymbol = "↑";
+      else if (adx < prev) trendSymbol = "↓";
 
-      const lastCandle = closed1H[closed1H.length - 1];
-      const lastClose = lastCandle.close;
+      prevADX30M[symbol] = adx;
 
-      const highs = closed1H.map(c => c.high);
-      const lows = closed1H.map(c => c.low);
+      const dirLabel = plusDI > minusDI ? "🟢 Bullish" : "🔴 Bearish";
 
-      const dailyHigh = Math.max(...highs.slice(-24));
-      const dailyLow = Math.min(...lows.slice(-24));
-
-      const distToHigh = dailyHigh - lastCandle.high;
-      const distToLow = lastCandle.low - dailyLow;
-
-      const nearATRHigh = Math.abs(distToHigh) / atr <= 0.3;
-      const nearATRLow = Math.abs(distToLow) / atr <= 0.3;
-
-      // --- TSI calculation ---
-      const tsiSeries = calculateTSI(closes, TSI_LONG, TSI_SHORT, TSI_SIGNAL);
-      const latest = tsiSeries[tsiSeries.length - 1];
-      const prev = tsiSeries[tsiSeries.length - 2];
-      if (!latest || !prev) continue;
-
-      // --- Determine Cross ---
-      const bullishCross = prev.tsi < prev.signal && latest.tsi >= latest.signal;
-      const bearishCross = prev.tsi > prev.signal && latest.tsi <= latest.signal;
-
-      const now = Date.now();
-      if (atrAlertCooldown[symbol] && now - atrAlertCooldown[symbol] < ATR_ALERT_COOLDOWN) continue;
-
-      // --- Confirmed Cross ---
-      if (bullishCross && nearATRLow) {
-
-        atrAlertCooldown[symbol] = now;
-
-        confirmedBullish.push({
-          symbol,
-          lastClose,
-          tsi: latest.tsi,
-          signal: latest.signal,
-          atrLow: dailyLow.toFixed(4)
-        });
-      }
-
-      if (bearishCross && nearATRHigh) {
-
-        atrAlertCooldown[symbol] = now;
-
-        confirmedBearish.push({
-          symbol,
-          lastClose,
-          tsi: latest.tsi,
-          signal: latest.signal,
-          atrHigh: dailyHigh.toFixed(4)
-        });
-      }
-
-      // --- Potential Continuation ---
-      if (!bullishCross && nearATRLow) {
-
-        atrAlertCooldown[symbol] = now;
-
-        potentialBullish.push({
-          symbol,
-          lastClose,
-          tsi: latest.tsi,
-          signal: latest.signal,
-          atrLow: dailyLow.toFixed(4)
-        });
-      }
-
-      if (!bearishCross && nearATRHigh) {
-
-        atrAlertCooldown[symbol] = now;
-
-        potentialBearish.push({
-          symbol,
-          lastClose,
-          tsi: latest.tsi,
-          signal: latest.signal,
-          atrHigh: dailyHigh.toFixed(4)
-        });
-      }
+      // categorize by ADX
+      if (adx >= 30) strongTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
+      else if (adx >= 20) mediumTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
+      else weakTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
 
     } catch (err) {
-      log(`❌ 1H TSI scan failed for ${symbol}: ${err?.message || err}`);
+      log(`❌ 30M ADX check failed for ${symbol}: ${err?.message || err}`);
     }
   }
 
-  // --- Build Telegram message ---
-  let msg = `⚡ *1H TSI Trend Summary*\n\n`;
+  // Build Telegram message
+  let msg = `⚡ *30M ADX Trend Summary*\n\n`;
 
-  if (confirmedBullish.length) {
-    msg += `✅ *Confirmed Bullish Cross* (ATR Low + TSI Cross)\n`;
-    confirmedBullish.forEach(v =>
-      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+  if (strongTrend.length) {
+    msg += `🔥 *Strong Trend Coins* (ADX ≥ 30)\n`;
+    strongTrend.forEach(v => 
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
     );
     msg += `\n`;
   }
 
-  if (confirmedBearish.length) {
-    msg += `✅ *Confirmed Bearish Cross* (ATR High + TSI Cross)\n`;
-    confirmedBearish.forEach(v =>
-      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+  if (mediumTrend.length) {
+    msg += `⚡ *Medium Trend Coins* (ADX 20-30)\n`;
+    mediumTrend.forEach(v => 
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
     );
     msg += `\n`;
   }
 
-  if (potentialBullish.length) {
-    msg += `⚠️ *Potential Continuation (ATR Low)*\n`;
-    potentialBullish.forEach(v =>
-      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR Low: ${v.atrLow})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
+  if (weakTrend.length) {
+    msg += `🌱 *Weak Trend Coins* (ADX < 20)\n`;
+    weakTrend.forEach(v => 
+      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})\n`
     );
     msg += `\n`;
   }
 
-  if (potentialBearish.length) {
-    msg += `⚠️ *Potential Continuation (ATR High)*\n`;
-    potentialBearish.forEach(v =>
-      msg += `*${v.symbol}* — Price: ${v.lastClose.toFixed(4)} (ATR High: ${v.atrHigh})\nTSI: ${v.tsi.toFixed(2)}, Signal: ${v.signal.toFixed(2)}\n`
-    );
-    msg += `\n`;
-  }
+  if (msg) await sendMessage(msg);
 
-  if (
-    confirmedBullish.length ||
-    confirmedBearish.length ||
-    potentialBullish.length ||
-    potentialBearish.length
-  ) {
-    await sendMessage(msg);
-  }
-
-}, 60 * 1000); // check every 1 minute
+}, 30 * 60 * 1000); // every 30 minutes
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
