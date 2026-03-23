@@ -615,7 +615,7 @@ setInterval(async () => {
     strongTrend.forEach(v => {
 
       const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
 
       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
     });
@@ -627,7 +627,7 @@ setInterval(async () => {
     mediumTrend.forEach(v => {
 
       const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
 
       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
     });
@@ -639,7 +639,7 @@ setInterval(async () => {
     weakTrend.forEach(v => {
 
       const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 3 ? " ⚠️ Potential change of Trend Soon" : "";
+      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
 
       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
     });
