@@ -10,7 +10,7 @@
 const config = require("../config");
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
-const {ADX} = require("technicalindicators");
+const { ADX } = require("technicalindicators");
 const fs = require("fs");
 const fetch = require("node-fetch");
 globalThis.fetch = fetch;
@@ -25,7 +25,7 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const USERS_FILE = "./users.json";
 
 // --- Settings ---
-const TRADE_PERCENT = 0.10;
+const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const TP_PCT = 2.0;
 const SL_PCT = 2.0;
@@ -35,79 +35,135 @@ const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_TRADES = 7; // per user
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 const COIN_LIST = [
-  "AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT",
-  "BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT",
-  "AAVEUSDT","ADAUSDT","TONUSDT","FILUSDT","LINKUSDT",
-  "XLMUSDT","ATOMUSDT","HYPEUSDT","XMRUSDT","SUIUSDT",
-  "DOGEUSDT","DOTUSDT","ZECUSDT","HBARUSDT","WLFIUSDT",
-  "ASTERUSDT","ICPUSDT","ONDOUSDT","WLDUSDT","POLUSDT",
-  "ENAUSDT","ALGOUSDT","MORPHOUSDT","QNTUSDT","RENDERUSDT",
-  "ZROUSDT","DASHUSDT","RIVERUSDT","POWERUSDT","PHAUSDT",
-  "PIPPINUSDT","XAGUSDT","SAHARAUSDT","ARCUSDT","FORMUSDT"
+  "AVAXUSDT",
+  "NEARUSDT",
+  "LTCUSDT",
+  "XRPUSDT",
+  "APTUSDT",
+  "BNBUSDT",
+  "SOLUSDT",
+  "UNIUSDT",
+  "TRUMPUSDT",
+  "BCHUSDT",
+  "AAVEUSDT",
+  "ADAUSDT",
+  "TONUSDT",
+  "FILUSDT",
+  "LINKUSDT",
+  "XLMUSDT",
+  "ATOMUSDT",
+  "HYPEUSDT",
+  "XMRUSDT",
+  "SUIUSDT",
+  "DOGEUSDT",
+  "DOTUSDT",
+  "ZECUSDT",
+  "HBARUSDT",
+  "WLFIUSDT",
+  "ASTERUSDT",
+  "ICPUSDT",
+  "ONDOUSDT",
+  "WLDUSDT",
+  "POLUSDT",
+  "ENAUSDT",
+  "ALGOUSDT",
+  "MORPHOUSDT",
+  "QNTUSDT",
+  "RENDERUSDT",
+  "ZROUSDT",
+  "DASHUSDT",
+  "RIVERUSDT",
+  "POWERUSDT",
+  "PHAUSDT",
+  "PIPPINUSDT",
+  "XAGUSDT",
+  "SAHARAUSDT",
+  "ARCUSDT",
+  "FORMUSDT",
 ];
 
 // --- In-memory ---
-let activePositions = {};      // { symbol: { userId: position } }
+let activePositions = {}; // { symbol: { userId: position } }
 let userClients = {};
 let BOT_PAUSED = false;
-let symbolCooldowns = {};      // { symbol: timestamp }
+let symbolCooldowns = {}; // { symbol: timestamp }
 
 // --- STC cycle trackers ---
-let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
+let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
 // --- Logging ---
-function log(msg){ console.log(`[${new Date().toISOString()}] ${msg}`); }
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
 // --- Load Users ---
-function loadUsers(){
-  try{
-    if(!fs.existsSync(USERS_FILE)) return [];
-    const raw = fs.readFileSync(USERS_FILE,"utf8").trim();
-    if(!raw) return [];
+function loadUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    const raw = fs.readFileSync(USERS_FILE, "utf8").trim();
+    if (!raw) return [];
     const parsed = JSON.parse(raw);
     const users = [];
-    if(Array.isArray(parsed)){
-      for(const u of parsed) if(u.active && u.apiKey && u.apiSecret) users.push({id:String(u.id),apiKey:u.apiKey,apiSecret:u.apiSecret});
+    if (Array.isArray(parsed)) {
+      for (const u of parsed)
+        if (u.active && u.apiKey && u.apiSecret)
+          users.push({ id: String(u.id), apiKey: u.apiKey, apiSecret: u.apiSecret });
     } else {
-      for(const [k,v] of Object.entries(parsed)) if(v.active && v.apiKey && v.apiSecret) users.push({id:String(k),apiKey:v.apiKey,apiSecret:v.apiSecret});
+      for (const [k, v] of Object.entries(parsed))
+        if (v.active && v.apiKey && v.apiSecret)
+          users.push({ id: String(k), apiKey: v.apiKey, apiSecret: v.apiSecret });
     }
     return users;
-  } catch(err){ log(`❌ loadUsers error: ${err?.message||err}`); return []; }
+  } catch (err) {
+    log(`❌ loadUsers error: ${err?.message || err}`);
+    return [];
+  }
 }
 
 // --- Create Binance clients ---
-function createBinanceClients(){
+function createBinanceClients() {
   const userList = loadUsers();
   userClients = {};
-  for(const u of userList){
-    try{
+  for (const u of userList) {
+    try {
       const client = new Binance();
-      client.options({APIKEY:u.apiKey,APISECRET:u.apiSecret,useServerTime:true,recvWindow:60000});
+      client.options({ APIKEY: u.apiKey, APISECRET: u.apiSecret, useServerTime: true, recvWindow: 60000 });
       userClients[u.id] = client;
-    } catch(err){ log(`❌ createBinanceClients failed for ${u.id}: ${err?.message||err}`); }
+    } catch (err) {
+      log(`❌ createBinanceClients failed for ${u.id}: ${err?.message || err}`);
+    }
   }
-  return Object.entries(userClients).map(([userId, client])=>({ userId, client }));
+  return Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
 }
 createBinanceClients();
 log("✅ Binance clients initialized at startup.");
-setInterval(createBinanceClients, 60*1000);
+setInterval(createBinanceClients, 60 * 1000);
 
 // --- Telegram send ---
-async function sendMessage(msg){
-  try{ await bot.sendMessage(GROUP_CHAT_ID,msg,{parse_mode:"Markdown"}); } catch{}
-  try{ await bot.sendMessage(ADMIN_ID,msg,{parse_mode:"Markdown"}); } catch{}
+async function sendMessage(msg) {
+  try {
+    await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" });
+  } catch {}
+  try {
+    await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" });
+  } catch {}
 }
 
 // --- Fetch Futures Klines ---
-async function fetchFuturesKlines(symbol, interval="15m", limit=100){
-  try{
-    const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
+  try {
+    const res = await fetch(
+      `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    return data.map(c=>({time:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4],volume:+c[5]}));
-  } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
+    return data.map((c) => ({ time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], volume: +c[5] }));
+  } catch (err) {
+    log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message || err}`);
+    return null;
+  }
 }
 
 // --- Proper Schaff Trend Cycle (STC) ---
@@ -163,11 +219,7 @@ function calculateATR(candles, period = ATR_PERIOD) {
     const high = candles[i].high;
     const low = candles[i].low;
     const prevClose = candles[i - 1].close;
-    const tr = Math.max(
-      high - low,
-      Math.abs(high - prevClose),
-      Math.abs(low - prevClose)
-    );
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
     trs.push(tr);
   }
 
@@ -176,124 +228,166 @@ function calculateATR(candles, period = ATR_PERIOD) {
   return atr;
 }
 
-// --- Average Directional Index (ADX) ---
-function calculateADX(candles, period = 14) {
-
-  if (!candles || candles.length < period + 1) return null;
-
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
-  const closes = candles.map(c => c.close);
-
-  const result = ADX.calculate({
-    high: highs,
-    low: lows,
-    close: closes,
-    period: period
-  });
-
-  if (!result || !result.length) return null;
-
-  const latest = result[result.length - 1];
-
-  return {
-    adx: latest.adx,
-    plusDI: latest.pdi,
-    minusDI: latest.mdi
-  };
-}
-
 // --- Floor qty ---
-function floorToStep(qty, step){
-  const s = Number(step); if(!s||s<=0) return qty;
-  const factor = Math.round(1/s);
-  return Number((Math.floor(qty*factor)/factor).toFixed((s.toString().split(".")[1]||"").length));
+function floorToStep(qty, step) {
+  const s = Number(step);
+  if (!s || s <= 0) return qty;
+  const factor = Math.round(1 / s);
+  return Number((Math.floor(qty * factor) / factor).toFixed((s.toString().split(".")[1] || "").length));
 }
 
 // --- Execute market orders for all users ---
-async function executeMarketOrderForAllUsers(symbol, direction){
-  const clients = Object.entries(userClients).map(([userId, client])=>({userId,client}));
-  if(!clients.length){ await sendMessage(`⚠️ No active users.`); return; }
+async function executeMarketOrderForAllUsers(symbol, direction) {
+  const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
+  if (!clients.length) {
+    await sendMessage(`⚠️ No active users.`);
+    return;
+  }
 
   await sendMessage(`⚡ Executing *${direction}* on *${symbol}* for all users...`);
 
-  for(const {userId, client} of clients){
-    try{
+  for (const { userId, client } of clients) {
+    try {
       // Check user MAX_TRADES
-      const userOpenTrades = Object.values(activePositions).reduce((sum,sym)=>sum + (sym[userId]?1:0),0);
-      if(userOpenTrades >= MAX_TRADES){ log(`User ${userId} has max open trades.`); continue; }
+      const userOpenTrades = Object.values(activePositions).reduce((sum, sym) => sum + (sym[userId] ? 1 : 0), 0);
+      if (userOpenTrades >= MAX_TRADES) {
+        log(`User ${userId} has max open trades.`);
+        continue;
+      }
 
-      await client.futuresLeverage(symbol,LEVERAGE).catch(()=>{});
+      await client.futuresLeverage(symbol, LEVERAGE).catch(() => {});
       const balances = await client.futuresBalance();
-      const usdtBal = balances.find(b=>b.asset==="USDT");
-      const bal = usdtBal?parseFloat(usdtBal.balance):0;
-      if(!bal || bal<=0){ await sendMessage(`⚠️ User ${userId} has *NO USDT*. Trade skipped.`); continue; }
+      const usdtBal = balances.find((b) => b.asset === "USDT");
+      const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
+      if (!bal || bal <= 0) {
+        await sendMessage(`⚠️ User ${userId} has *NO USDT*. Trade skipped.`);
+        continue;
+      }
 
-      let markPrice=0;
-      try{ const mp = await client.futuresMarkPrice(symbol); markPrice = mp.markPrice?parseFloat(mp.markPrice):parseFloat(mp[0]?.markPrice||0); } catch{}
-      if(!markPrice || markPrice<=0){ const k = await fetchFuturesKlines(symbol,"1m",1); markPrice = k&&k.length?k[0].close:0; }
-      if(!markPrice || markPrice<=0){ log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`); continue; }
+      let markPrice = 0;
+      try {
+        const mp = await client.futuresMarkPrice(symbol);
+        markPrice = mp.markPrice ? parseFloat(mp.markPrice) : parseFloat(mp[0]?.markPrice || 0);
+      } catch {}
+      if (!markPrice || markPrice <= 0) {
+        const k = await fetchFuturesKlines(symbol, "1m", 1);
+        markPrice = k && k.length ? k[0].close : 0;
+      }
+      if (!markPrice || markPrice <= 0) {
+        log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`);
+        continue;
+      }
 
-      const tradeValue = bal*TRADE_PERCENT;
-      const rawQty = (tradeValue*LEVERAGE)/markPrice;
+      const tradeValue = bal * TRADE_PERCENT;
+      const rawQty = (tradeValue * LEVERAGE) / markPrice;
 
       let lotStep = 0.001;
-      try{ const info = await client.futuresExchangeInfo(); const s = info.symbols.find(s=>s.symbol===symbol); if(s) lotStep=parseFloat(s.filters.find(f=>f.filterType==="LOT_SIZE")?.stepSize||lotStep); } catch{}
+      try {
+        const info = await client.futuresExchangeInfo();
+        const s = info.symbols.find((s) => s.symbol === symbol);
+        if (s) lotStep = parseFloat(s.filters.find((f) => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
+      } catch {}
 
-      const qty = floorToStep(rawQty,lotStep);
-      if(!qty || qty<=0) continue;
+      const qty = floorToStep(rawQty, lotStep);
+      if (!qty || qty <= 0) continue;
 
-      try{
-        if(direction==="BUY") await client.futuresMarketBuy(symbol,qty);
-        else await client.futuresMarketSell(symbol,qty);
+      try {
+        if (direction === "BUY") await client.futuresMarketBuy(symbol, qty);
+        else await client.futuresMarketSell(symbol, qty);
 
-        if(!activePositions[symbol]) activePositions[symbol]={};
-        activePositions[symbol][userId] = {side:direction,entryPrice:markPrice,qty,openedAt:Date.now(),trailingStop:null,highest:markPrice,lowest:markPrice};
+        if (!activePositions[symbol]) activePositions[symbol] = {};
+        activePositions[symbol][userId] = {
+          side: direction,
+          entryPrice: markPrice,
+          qty,
+          openedAt: Date.now(),
+          trailingStop: null,
+          highest: markPrice,
+          lowest: markPrice,
+        };
         // Start cooldown for this symbol
         symbolCooldowns[symbol] = Date.now();
         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
-      } catch(err){ log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message||err}`); }
-
-    } catch(err){ log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message||err}`); }
+      } catch (err) {
+        log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
+      }
+    } catch (err) {
+      log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
+    }
   }
 }
 
 // --- Monitor positions (TP/SL/Trailing Stop) ---
-async function monitorPositions(){
-  for(const [symbol, users] of Object.entries(activePositions)){
-    for(const [userId, pos] of Object.entries(users)){
+async function monitorPositions() {
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
       const client = userClients[userId];
-      if(!client){ delete activePositions[symbol][userId]; continue; }
+      if (!client) {
+        delete activePositions[symbol][userId];
+        continue;
+      }
 
-      try{
+      try {
         const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions)?positions.find(x=>x.symbol===symbol):null;
-        const amt = p?parseFloat(p.positionAmt||0):0;
-        if(!p||amt===0){ delete activePositions[symbol][userId]; continue; }
+        const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
+        const amt = p ? parseFloat(p.positionAmt || 0) : 0;
+        if (!p || amt === 0) {
+          delete activePositions[symbol][userId];
+          continue;
+        }
 
         let mark = 0;
-        try{ const mp = await client.futuresMarkPrice(symbol); mark = mp?.markPrice?parseFloat(mp.markPrice):0; } catch{}
-        if(!mark||mark<=0) continue;
+        try {
+          const mp = await client.futuresMarkPrice(symbol);
+          mark = mp?.markPrice ? parseFloat(mp.markPrice) : 0;
+        } catch {}
+        if (!mark || mark <= 0) continue;
 
         // Trailing Stop
-        if(pos.side==="BUY"){
+        if (pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, mark);
-          const trail = pos.highest*(1-TRAILING_STOP_PCT/100);
-          if(!pos.trailingStop || trail>pos.trailingStop) pos.trailingStop=trail;
-          if(mark<=pos.trailingStop){ await client.futuresMarketSell(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
+          const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
+          if (!pos.trailingStop || trail > pos.trailingStop) pos.trailingStop = trail;
+          if (mark <= pos.trailingStop) {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+            delete activePositions[symbol][userId];
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
+            continue;
+          }
         } else {
           pos.lowest = Math.min(pos.lowest, mark);
-          const trail = pos.lowest*(1+TRAILING_STOP_PCT/100);
-          if(!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop=trail;
-          if(mark>=pos.trailingStop){ await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
+          const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
+          if (!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop = trail;
+          if (mark >= pos.trailingStop) {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+            delete activePositions[symbol][userId];
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
+            continue;
+          }
         }
 
         // TP / SL
-        const move = pos.side==="BUY"?((mark-pos.entryPrice)/pos.entryPrice)*100:((pos.entryPrice-mark)/pos.entryPrice)*100;
-        if(move>=TP_PCT){ if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`); continue; }
-        if(move<=-SL_PCT){ if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`); continue; }
-
-      } catch(err){ log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message||err}`); }
+        const move =
+          pos.side === "BUY"
+            ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
+            : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
+        if (move >= TP_PCT) {
+          if (pos.side === "BUY") await client.futuresMarketSell(symbol, Math.abs(amt));
+          else await client.futuresMarketBuy(symbol, Math.abs(amt));
+          delete activePositions[symbol][userId];
+          await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`);
+          continue;
+        }
+        if (move <= -SL_PCT) {
+          if (pos.side === "BUY") await client.futuresMarketSell(symbol, Math.abs(amt));
+          else await client.futuresMarketBuy(symbol, Math.abs(amt));
+          delete activePositions[symbol][userId];
+          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
+          continue;
+        }
+      } catch (err) {
+        log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
+      }
     }
   }
 }
@@ -303,7 +397,7 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
-COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
+COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // --- Full-auto STC + ATR combined scanning loop ---
 
@@ -315,7 +409,6 @@ let prevBearishContinuation = [];
 let symbolCooldownsATR = {}; // per-symbol cooldown for ATR messages (1h)
 
 setInterval(async () => {
-
   const now = Date.now();
 
   const bullishFlip = [];
@@ -324,7 +417,6 @@ setInterval(async () => {
   const bearishContinuation = [];
 
   for (const symbol of COIN_LIST) {
-
     const isActive = symbolActive[symbol] ?? true;
 
     try {
@@ -332,7 +424,7 @@ setInterval(async () => {
       if (!candles1H || candles1H.length < 30) continue;
 
       const closedCandles1H = candles1H.slice(0, -1);
-      const closes1H = closedCandles1H.map(c => c.close);
+      const closes1H = closedCandles1H.map((c) => c.close);
 
       // =============================
       // TRUE DAILY LEVELS
@@ -381,16 +473,19 @@ setInterval(async () => {
       // COMBINED ATR + STC SIGNALS
       // =====================================================
       if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
-
         // --- NEAR DAILY LOW ---
         if (distToLow / atr <= 0.2) {
           if (atrContracting && stcRising) {
             bullishFlip.push(symbol);
-            await sendMessage(`🟢 *Bullish Flip*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting + STC rising.`);
+            await sendMessage(
+              `🟢 *Bullish Flip*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting + STC rising.`,
+            );
           }
           if (atrExpanding && stcFalling) {
             bearishContinuation.push(symbol);
-            await sendMessage(`🔴 *Bearish Continuation*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding + STC falling.`);
+            await sendMessage(
+              `🔴 *Bearish Continuation*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding + STC falling.`,
+            );
           }
         }
 
@@ -398,11 +493,15 @@ setInterval(async () => {
         if (distToHigh / atr <= 0.2) {
           if (atrContracting && stcFalling) {
             bearishFlip.push(symbol);
-            await sendMessage(`🔴 *Bearish Flip*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting + STC falling.`);
+            await sendMessage(
+              `🔴 *Bearish Flip*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting + STC falling.`,
+            );
           }
           if (atrExpanding && stcRising) {
             bullishContinuation.push(symbol);
-            await sendMessage(`🟢 *Bullish Continuation*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding + STC rising.`);
+            await sendMessage(
+              `🟢 *Bullish Continuation*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding + STC rising.`,
+            );
           }
         }
 
@@ -438,7 +537,7 @@ setInterval(async () => {
       if (!candles5 || candles5.length < 30) continue;
 
       const closedCandles5 = candles5.slice(0, -1);
-      const closes5 = closedCandles5.map(c => c.close);
+      const closes5 = closedCandles5.map((c) => c.close);
 
       const stcSeries5 = [];
       for (let i = 0; i < closes5.length; i++) {
@@ -468,12 +567,11 @@ setInterval(async () => {
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
 
         await sendMessage(
-          `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`
+          `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`,
         );
 
         symbolCooldowns[symbol] = now;
       }
-
     } catch (err) {
       log(`❌ STC + ATR scan error ${symbol}: ${err?.message || err}`);
     }
@@ -482,18 +580,22 @@ setInterval(async () => {
   // =====================================================
   // 4-STATE SUMMARY (without price)
   // =====================================================
-  const newBullishFlip = bullishFlip.filter(s => !prevBullishFlip.includes(s));
-  const newBearishFlip = bearishFlip.filter(s => !prevBearishFlip.includes(s));
-  const newBullishCont = bullishContinuation.filter(s => !prevBullishContinuation.includes(s));
-  const newBearishCont = bearishContinuation.filter(s => !prevBearishContinuation.includes(s));
+  const newBullishFlip = bullishFlip.filter((s) => !prevBullishFlip.includes(s));
+  const newBearishFlip = bearishFlip.filter((s) => !prevBearishFlip.includes(s));
+  const newBullishCont = bullishContinuation.filter((s) => !prevBullishContinuation.includes(s));
+  const newBearishCont = bearishContinuation.filter((s) => !prevBearishContinuation.includes(s));
 
   if (newBullishFlip.length || newBearishFlip.length || newBullishCont.length || newBearishCont.length) {
     let summaryMsg = `⚡ *Ready to deploy bot*\n\n`;
 
-    if (newBullishFlip.length) summaryMsg += `🟢 Bullish Flip (ATR Low + STC Rising):\n${newBullishFlip.join(", ")}\n\n`;
-    if (newBearishFlip.length) summaryMsg += `🔴 Bearish Flip (ATR High + STC Falling):\n${newBearishFlip.join(", ")}\n\n`;
-    if (newBullishCont.length) summaryMsg += `🟢 Bullish Continuation (ATR High + STC Rising):\n${newBullishCont.join(", ")}\n\n`;
-    if (newBearishCont.length) summaryMsg += `🔴 Bearish Continuation (ATR Low + STC Falling):\n${newBearishCont.join(", ")}`;
+    if (newBullishFlip.length)
+      summaryMsg += `🟢 Bullish Flip (ATR Low + STC Rising):\n${newBullishFlip.join(", ")}\n\n`;
+    if (newBearishFlip.length)
+      summaryMsg += `🔴 Bearish Flip (ATR High + STC Falling):\n${newBearishFlip.join(", ")}\n\n`;
+    if (newBullishCont.length)
+      summaryMsg += `🟢 Bullish Continuation (ATR High + STC Rising):\n${newBullishCont.join(", ")}\n\n`;
+    if (newBearishCont.length)
+      summaryMsg += `🔴 Bearish Continuation (ATR Low + STC Falling):\n${newBearishCont.join(", ")}`;
 
     await sendMessage(summaryMsg);
 
@@ -502,8 +604,6 @@ setInterval(async () => {
     prevBullishContinuation = bullishContinuation;
     prevBearishContinuation = bearishContinuation;
   }
-
-
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 // --- 4H ATR Volatility Tracker (every 4 hours) ---
@@ -512,143 +612,62 @@ const ATR_PERIOD_4H = 14;
 const HIGH_ATR_THRESHOLD = 2;
 const MEDIUM_ATR_THRESHOLD = 1;
 
-setInterval(async () => {
-  let highVol = [];
-  let mediumVol = [];
-  let lowVol = [];
+setInterval(
+  async () => {
+    let highVol = [];
+    let mediumVol = [];
+    let lowVol = [];
 
-  for (const symbol of COIN_LIST) {
-    try {
-      const candles4H = await fetchFuturesKlines(symbol, "4h", 50);
-      if (!candles4H || candles4H.length < ATR_PERIOD_4H) continue;
+    for (const symbol of COIN_LIST) {
+      try {
+        const candles4H = await fetchFuturesKlines(symbol, "4h", 50);
+        if (!candles4H || candles4H.length < ATR_PERIOD_4H) continue;
 
-      const closed4H = candles4H.slice(0, -1); // exclude forming candle
-      const atr = calculateATR(closed4H, ATR_PERIOD_4H);
-      if (!atr) continue;
+        const closed4H = candles4H.slice(0, -1); // exclude forming candle
+        const atr = calculateATR(closed4H, ATR_PERIOD_4H);
+        if (!atr) continue;
 
-      const prevATR = prevATR4H[symbol] || atr;
-      let trendSymbol = "–"; // stable by default
-      if (atr > prevATR) trendSymbol = "↑";
-      else if (atr < prevATR) trendSymbol = "↓";
+        const prevATR = prevATR4H[symbol] || atr;
+        let trendSymbol = "–"; // stable by default
+        if (atr > prevATR) trendSymbol = "↑";
+        else if (atr < prevATR) trendSymbol = "↓";
 
-      prevATR4H[symbol] = atr; // update for next check
+        prevATR4H[symbol] = atr; // update for next check
 
-      // categorize by ATR magnitude
-      if (atr >= HIGH_ATR_THRESHOLD) highVol.push({ symbol, atr, trendSymbol });
-      else if (atr >= MEDIUM_ATR_THRESHOLD) mediumVol.push({ symbol, atr, trendSymbol });
-      else lowVol.push({ symbol, atr, trendSymbol });
-
-    } catch (err) {
-      log(`❌ 4H ATR check failed for ${symbol}: ${err?.message || err}`);
+        // categorize by ATR magnitude
+        if (atr >= HIGH_ATR_THRESHOLD) highVol.push({ symbol, atr, trendSymbol });
+        else if (atr >= MEDIUM_ATR_THRESHOLD) mediumVol.push({ symbol, atr, trendSymbol });
+        else lowVol.push({ symbol, atr, trendSymbol });
+      } catch (err) {
+        log(`❌ 4H ATR check failed for ${symbol}: ${err?.message || err}`);
+      }
     }
-  }
 
-  // Build grouped message
-  let msg = `⚡ *4H ATR Volatility Summary*\n\n`;
+    // Build grouped message
+    let msg = `⚡ *4H ATR Volatility Summary*\n\n`;
 
-  if (highVol.length) {
-    msg += `🚀 *High Volatility Coins* (ATR ≥ ${HIGH_ATR_THRESHOLD})\n`;
-    highVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
-    msg += `\n`;
-  }
-
-  if (mediumVol.length) {
-    msg += `⚡ *Medium Volatility Coins* (ATR ${MEDIUM_ATR_THRESHOLD}-${HIGH_ATR_THRESHOLD})\n`;
-    mediumVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
-    msg += `\n`;
-  }
-
-  if (lowVol.length) {
-    msg += `🌱 *Low Volatility Coins* (ATR < ${MEDIUM_ATR_THRESHOLD})\n`;
-    lowVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
-    msg += `\n`;
-  }
-
-  if (msg) await sendMessage(msg);
-
-}, 4 * 60 * 60 * 1000); // every 4 hours
-
-// --- 30M ADX Trend Tracker (every 30 minutes) ---
-let prevADX30M = {}; // store previous ADX for trend comparison
-const ADX_PERIOD = 14;
-
-setInterval(async () => {
-  let strongTrend = [];
-  let mediumTrend = [];
-  let weakTrend = [];
-
-  for (const symbol of COIN_LIST) {
-    try {
-      const candles30M = await fetchFuturesKlines(symbol, "30m", 50);
-      if (!candles30M || candles30M.length < ADX_PERIOD) continue;
-
-      const closed30M = candles30M.slice(0, -1); // exclude current forming candle
-      const adxData = calculateADX(closed30M, ADX_PERIOD); // returns { adx, plusDI, minusDI }
-      if (!adxData) continue;
-
-      const { adx, plusDI, minusDI } = adxData;
-      const prev = prevADX30M[symbol] || adx;
-
-      let trendSymbol = "–";
-      if (adx > prev) trendSymbol = "↑";
-      else if (adx < prev) trendSymbol = "↓";
-
-      prevADX30M[symbol] = adx;
-
-      const dirLabel = plusDI > minusDI ? "🟢 Bullish" : "🔴 Bearish";
-
-      // categorize by ADX
-      if (adx >= 30) strongTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
-      else if (adx >= 20) mediumTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
-      else weakTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
-
-    } catch (err) {
-      log(`❌ 30M ADX check failed for ${symbol}: ${err?.message || err}`);
+    if (highVol.length) {
+      msg += `🚀 *High Volatility Coins* (ATR ≥ ${HIGH_ATR_THRESHOLD})\n`;
+      highVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
+      msg += `\n`;
     }
-  }
 
-  // Build Telegram message
-  let msg = `⚡ *30M ADX Trend Summary*\n\n`;
+    if (mediumVol.length) {
+      msg += `⚡ *Medium Volatility Coins* (ATR ${MEDIUM_ATR_THRESHOLD}-${HIGH_ATR_THRESHOLD})\n`;
+      mediumVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
+      msg += `\n`;
+    }
 
-  if (strongTrend.length) {
-    msg += `🔥 *Strong Trend Coins* (ADX ≥ 30)\n`;
-    strongTrend.forEach(v => {
+    if (lowVol.length) {
+      msg += `🌱 *Low Volatility Coins* (ATR < ${MEDIUM_ATR_THRESHOLD})\n`;
+      lowVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
+      msg += `\n`;
+    }
 
-      const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
-
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
-    });
-    msg += `\n`;
-  }
-
-  if (mediumTrend.length) {
-    msg += `⚡ *Medium Trend Coins* (ADX 20-30)\n`;
-    mediumTrend.forEach(v => {
-
-      const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
-
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
-    });
-    msg += `\n`;
-  }
-
-  if (weakTrend.length) {
-    msg += `🌱 *Weak Trend Coins* (ADX < 20)\n`;
-    weakTrend.forEach(v => {
-
-      const diff = Math.abs(v.plusDI - v.minusDI);
-      const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
-
-      msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
-    });
-    msg += `\n`;
-  }
-
-  if (msg) await sendMessage(msg);
-
-}, 30 * 60 * 1000); // every 30 minutes
+    if (msg) await sendMessage(msg);
+  },
+  4 * 60 * 60 * 1000,
+); // every 4 hours
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
@@ -777,7 +796,7 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
 
 bot.onText(/\/deactivateall/, async (msg) => {
   if (!isAdmin(msg)) return;
-  COIN_LIST.forEach(symbol => {
+  COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
@@ -787,8 +806,7 @@ bot.onText(/\/deactivateall/, async (msg) => {
 bot.onText(/\/balances$/, async (msg) => {
   if (!isAdmin(msg)) return;
 
-  const clients = Object.entries(userClients)
-    .map(([userId, client]) => ({ userId, client }));
+  const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
 
   if (!clients.length) {
     await sendMessage("⚠️ No active users.");
@@ -802,7 +820,7 @@ bot.onText(/\/balances$/, async (msg) => {
       clients.map(async ({ userId, client }) => {
         try {
           const balances = await client.futuresBalance();
-          const usdt = balances.find(b => b.asset === "USDT");
+          const usdt = balances.find((b) => b.asset === "USDT");
 
           const wallet = usdt ? parseFloat(usdt.balance) : 0;
           const available = usdt ? parseFloat(usdt.availableBalance) : 0;
@@ -812,7 +830,7 @@ bot.onText(/\/balances$/, async (msg) => {
         } catch (err) {
           return { userId, error: true };
         }
-      })
+      }),
     );
 
     let totalWallet = 0;
@@ -831,20 +849,19 @@ bot.onText(/\/balances$/, async (msg) => {
       totalAvailable += r.available;
       totalUnrealized += r.unrealized;
 
-      report += 
+      report +=
         `User ${r.userId}:\n` +
         `   Wallet: ${r.wallet.toFixed(2)} USDT\n` +
         `   Available: ${r.available.toFixed(2)} USDT\n` +
         `   Unrealized PnL: ${r.unrealized.toFixed(2)} USDT\n\n`;
     }
 
-    report += 
+    report +=
       `📦 *Total Wallet:* ${totalWallet.toFixed(2)} USDT\n` +
       `💵 *Total Available:* ${totalAvailable.toFixed(2)} USDT\n` +
       `📈 *Total Unrealized:* ${totalUnrealized.toFixed(2)} USDT`;
 
     await sendMessage(report);
-
   } catch (err) {
     await sendMessage("❌ Failed to fetch balances.");
   }
@@ -855,7 +872,7 @@ bot.onText(/\/monthlyreport/, async (msg) => {
   if (!isAdmin(msg)) return;
 
   const PROFIT_SHARE_PERCENT = 30; // 30% profit share
-  const users = loadUsers().filter(u => u.active);
+  const users = loadUsers().filter((u) => u.active);
   if (!users.length) {
     await sendMessage("⚠️ No active users found for monthly report.");
     return;
@@ -874,12 +891,12 @@ bot.onText(/\/monthlyreport/, async (msg) => {
     try {
       if (!monthlyReport[user.id].startBalance) {
         const balances = await client.futuresBalance();
-        const usdtBal = balances.find(b => b.asset === "USDT");
+        const usdtBal = balances.find((b) => b.asset === "USDT");
         monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
       }
 
       const balances = await client.futuresBalance();
-      const usdtBal = balances.find(b => b.asset === "USDT");
+      const usdtBal = balances.find((b) => b.asset === "USDT");
       const currentBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
 
       const startBalance = monthlyReport[user.id].startBalance || 0;
@@ -890,24 +907,912 @@ bot.onText(/\/monthlyreport/, async (msg) => {
       const totalTrades = tradesWon + tradesLost;
       const winRate = totalTrades ? ((tradesWon / totalTrades) * 100).toFixed(1) : "0.0";
 
-      const profitShare = netProfit > 0 ? (netProfit * PROFIT_SHARE_PERCENT / 100) : 0;
+      const profitShare = netProfit > 0 ? (netProfit * PROFIT_SHARE_PERCENT) / 100 : 0;
 
       totalNetProfit += netProfit;
       totalProfitShare += profitShare;
 
-      reportMsg += `👤 User: ${user.name || user.id}\n` +
-                   `💰 Net Profit/Loss: ${netProfit.toFixed(2)} USDT\n` +
-                   `🏆 Win Rate: ${winRate}%\n` +
-                   `📈 Profit Share (${PROFIT_SHARE_PERCENT}%): ${profitShare.toFixed(2)} USDT\n\n`;
-
+      reportMsg +=
+        `👤 User: ${user.name || user.id}\n` +
+        `💰 Net Profit/Loss: ${netProfit.toFixed(2)} USDT\n` +
+        `🏆 Win Rate: ${winRate}%\n` +
+        `📈 Profit Share (${PROFIT_SHARE_PERCENT}%): ${profitShare.toFixed(2)} USDT\n\n`;
     } catch (err) {
       log(`❌ Failed to generate monthly report for ${user.id}: ${err?.message || err}`);
       reportMsg += `👤 User: ${user.name || user.id}\n⚠️ Report unavailable\n\n`;
     }
   }
 
-  reportMsg += `💰 Total Net Profit (all users): ${totalNetProfit.toFixed(2)} USDT\n` +
-               `📈 Total Profit Share Owed: ${totalProfitShare.toFixed(2)} USDT`;
+  reportMsg +=
+    `💰 Total Net Profit (all users): ${totalNetProfit.toFixed(2)} USDT\n` +
+    `📈 Total Profit Share Owed: ${totalProfitShare.toFixed(2)} USDT`;
 
   await sendMessage(reportMsg);
 });
+
+// --- Settings ---
+// const TRADE_PERCENT = 0.10;
+// const LEVERAGE = 20;
+// const TP_PCT = 2.0;
+// const SL_PCT = 2.0;
+// const TRAILING_STOP_PCT = 2.0;
+// const MONITOR_INTERVAL_MS = 5000;
+// const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
+// const MAX_TRADES = 7; // per user
+// const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+// const COIN_LIST = [
+//   "AVAXUSDT","NEARUSDT","LTCUSDT","XRPUSDT","APTUSDT",
+//   "BNBUSDT","SOLUSDT","UNIUSDT","TRUMPUSDT","BCHUSDT",
+//   "AAVEUSDT","ADAUSDT","TONUSDT","FILUSDT","LINKUSDT",
+//   "XLMUSDT","ATOMUSDT","HYPEUSDT","XMRUSDT","SUIUSDT",
+//   "DOGEUSDT","DOTUSDT","ZECUSDT","HBARUSDT","WLFIUSDT",
+//   "ASTERUSDT","ICPUSDT","ONDOUSDT","WLDUSDT","POLUSDT",
+//   "ENAUSDT","ALGOUSDT","MORPHOUSDT","QNTUSDT","RENDERUSDT",
+//   "ZROUSDT","DASHUSDT","RIVERUSDT","POWERUSDT","PHAUSDT",
+//   "PIPPINUSDT","XAGUSDT","SAHARAUSDT","ARCUSDT","FORMUSDT"
+// ];
+
+// // --- In-memory ---
+// let activePositions = {};      // { symbol: { userId: position } }
+// let userClients = {};
+// let BOT_PAUSED = false;
+// let symbolCooldowns = {};      // { symbol: timestamp }
+
+// // --- STC cycle trackers ---
+// let currentCycle = {};        // { symbol: "BULL" | "BEAR" }
+
+// let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
+
+// // --- Logging ---
+// function log(msg){ console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+// // --- Load Users ---
+// function loadUsers(){
+//   try{
+//     if(!fs.existsSync(USERS_FILE)) return [];
+//     const raw = fs.readFileSync(USERS_FILE,"utf8").trim();
+//     if(!raw) return [];
+//     const parsed = JSON.parse(raw);
+//     const users = [];
+//     if(Array.isArray(parsed)){
+//       for(const u of parsed) if(u.active && u.apiKey && u.apiSecret) users.push({id:String(u.id),apiKey:u.apiKey,apiSecret:u.apiSecret});
+//     } else {
+//       for(const [k,v] of Object.entries(parsed)) if(v.active && v.apiKey && v.apiSecret) users.push({id:String(k),apiKey:v.apiKey,apiSecret:v.apiSecret});
+//     }
+//     return users;
+//   } catch(err){ log(`❌ loadUsers error: ${err?.message||err}`); return []; }
+// }
+
+// // --- Create Binance clients ---
+// function createBinanceClients(){
+//   const userList = loadUsers();
+//   userClients = {};
+//   for(const u of userList){
+//     try{
+//       const client = new Binance();
+//       client.options({APIKEY:u.apiKey,APISECRET:u.apiSecret,useServerTime:true,recvWindow:60000});
+//       userClients[u.id] = client;
+//     } catch(err){ log(`❌ createBinanceClients failed for ${u.id}: ${err?.message||err}`); }
+//   }
+//   return Object.entries(userClients).map(([userId, client])=>({ userId, client }));
+// }
+// createBinanceClients();
+// log("✅ Binance clients initialized at startup.");
+// setInterval(createBinanceClients, 60*1000);
+
+// // --- Telegram send ---
+// async function sendMessage(msg){
+//   try{ await bot.sendMessage(GROUP_CHAT_ID,msg,{parse_mode:"Markdown"}); } catch{}
+//   try{ await bot.sendMessage(ADMIN_ID,msg,{parse_mode:"Markdown"}); } catch{}
+// }
+
+// // --- Fetch Futures Klines ---
+// async function fetchFuturesKlines(symbol, interval="15m", limit=100){
+//   try{
+//     const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+//     if(!res.ok) throw new Error(`HTTP ${res.status}`);
+//     const data = await res.json();
+//     return data.map(c=>({time:c[0],open:+c[1],high:+c[2],low:+c[3],close:+c[4],volume:+c[5]}));
+//   } catch(err){ log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message||err}`); return null; }
+// }
+
+// // --- Proper Schaff Trend Cycle (STC) ---
+// function calculateSTC(closes, { cycle = 4, fast = 10, slow = 20, signal = 3 } = {}) {
+//   if (!closes || closes.length < slow + cycle) return null;
+
+//   // --- EMA helper ---
+//   function EMA(data, length) {
+//     const k = 2 / (length + 1);
+//     let ema = data[0];
+//     const result = [ema];
+//     for (let i = 1; i < data.length; i++) {
+//       ema = data[i] * k + ema * (1 - k);
+//       result.push(ema);
+//     }
+//     return result;
+//   }
+
+//   // --- MACD ---
+//   const fastEMA = EMA(closes, fast);
+//   const slowEMA = EMA(closes, slow);
+//   const macd = fastEMA.map((v, i) => v - slowEMA[i]);
+
+//   // --- MACD signal line ---
+//   const signalLine = EMA(macd, signal);
+//   const macdHist = macd.map((v, i) => v - signalLine[i]);
+
+//   // --- Stochastic over MACD histogram ---
+//   const stc = [];
+//   for (let i = 0; i < macdHist.length; i++) {
+//     if (i < cycle) {
+//       stc.push(50); // neutral at start
+//       continue;
+//     }
+//     const slice = macdHist.slice(i - cycle + 1, i + 1);
+//     const min = Math.min(...slice);
+//     const max = Math.max(...slice);
+//     const value = max === min ? 50 : ((macdHist[i] - min) / (max - min)) * 100;
+//     stc.push(value);
+//   }
+
+//   return stc[stc.length - 1]; // return latest STC value
+// }
+
+// // --- Average True Range (ATR) ---
+// const ATR_PERIOD = 14; // standard ATR period
+
+// function calculateATR(candles, period = ATR_PERIOD) {
+//   if (!candles || candles.length < period + 1) return null;
+
+//   const trs = [];
+//   for (let i = 1; i < candles.length; i++) {
+//     const high = candles[i].high;
+//     const low = candles[i].low;
+//     const prevClose = candles[i - 1].close;
+//     const tr = Math.max(
+//       high - low,
+//       Math.abs(high - prevClose),
+//       Math.abs(low - prevClose)
+//     );
+//     trs.push(tr);
+//   }
+
+//   const recentTRs = trs.slice(-period);
+//   const atr = recentTRs.reduce((sum, val) => sum + val, 0) / period;
+//   return atr;
+// }
+
+// // --- Average Directional Index (ADX) ---
+// function calculateADX(candles, period = 14) {
+
+//   if (!candles || candles.length < period + 1) return null;
+
+//   const highs = candles.map(c => c.high);
+//   const lows = candles.map(c => c.low);
+//   const closes = candles.map(c => c.close);
+
+//   const result = ADX.calculate({
+//     high: highs,
+//     low: lows,
+//     close: closes,
+//     period: period
+//   });
+
+//   if (!result || !result.length) return null;
+
+//   const latest = result[result.length - 1];
+
+//   return {
+//     adx: latest.adx,
+//     plusDI: latest.pdi,
+//     minusDI: latest.mdi
+//   };
+// }
+
+// // --- Floor qty ---
+// function floorToStep(qty, step){
+//   const s = Number(step); if(!s||s<=0) return qty;
+//   const factor = Math.round(1/s);
+//   return Number((Math.floor(qty*factor)/factor).toFixed((s.toString().split(".")[1]||"").length));
+// }
+
+// // --- Execute market orders for all users ---
+// async function executeMarketOrderForAllUsers(symbol, direction){
+//   const clients = Object.entries(userClients).map(([userId, client])=>({userId,client}));
+//   if(!clients.length){ await sendMessage(`⚠️ No active users.`); return; }
+
+//   await sendMessage(`⚡ Executing *${direction}* on *${symbol}* for all users...`);
+
+//   for(const {userId, client} of clients){
+//     try{
+//       // Check user MAX_TRADES
+//       const userOpenTrades = Object.values(activePositions).reduce((sum,sym)=>sum + (sym[userId]?1:0),0);
+//       if(userOpenTrades >= MAX_TRADES){ log(`User ${userId} has max open trades.`); continue; }
+
+//       await client.futuresLeverage(symbol,LEVERAGE).catch(()=>{});
+//       const balances = await client.futuresBalance();
+//       const usdtBal = balances.find(b=>b.asset==="USDT");
+//       const bal = usdtBal?parseFloat(usdtBal.balance):0;
+//       if(!bal || bal<=0){ await sendMessage(`⚠️ User ${userId} has *NO USDT*. Trade skipped.`); continue; }
+
+//       let markPrice=0;
+//       try{ const mp = await client.futuresMarkPrice(symbol); markPrice = mp.markPrice?parseFloat(mp.markPrice):parseFloat(mp[0]?.markPrice||0); } catch{}
+//       if(!markPrice || markPrice<=0){ const k = await fetchFuturesKlines(symbol,"1m",1); markPrice = k&&k.length?k[0].close:0; }
+//       if(!markPrice || markPrice<=0){ log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`); continue; }
+
+//       const tradeValue = bal*TRADE_PERCENT;
+//       const rawQty = (tradeValue*LEVERAGE)/markPrice;
+
+//       let lotStep = 0.001;
+//       try{ const info = await client.futuresExchangeInfo(); const s = info.symbols.find(s=>s.symbol===symbol); if(s) lotStep=parseFloat(s.filters.find(f=>f.filterType==="LOT_SIZE")?.stepSize||lotStep); } catch{}
+
+//       const qty = floorToStep(rawQty,lotStep);
+//       if(!qty || qty<=0) continue;
+
+//       try{
+//         if(direction==="BUY") await client.futuresMarketBuy(symbol,qty);
+//         else await client.futuresMarketSell(symbol,qty);
+
+//         if(!activePositions[symbol]) activePositions[symbol]={};
+//         activePositions[symbol][userId] = {side:direction,entryPrice:markPrice,qty,openedAt:Date.now(),trailingStop:null,highest:markPrice,lowest:markPrice};
+//         // Start cooldown for this symbol
+//         symbolCooldowns[symbol] = Date.now();
+//         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+//       } catch(err){ log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message||err}`); }
+
+//     } catch(err){ log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message||err}`); }
+//   }
+// }
+
+// // --- Monitor positions (TP/SL/Trailing Stop) ---
+// async function monitorPositions(){
+//   for(const [symbol, users] of Object.entries(activePositions)){
+//     for(const [userId, pos] of Object.entries(users)){
+//       const client = userClients[userId];
+//       if(!client){ delete activePositions[symbol][userId]; continue; }
+
+//       try{
+//         const positions = await client.futuresPositionRisk();
+//         const p = Array.isArray(positions)?positions.find(x=>x.symbol===symbol):null;
+//         const amt = p?parseFloat(p.positionAmt||0):0;
+//         if(!p||amt===0){ delete activePositions[symbol][userId]; continue; }
+
+//         let mark = 0;
+//         try{ const mp = await client.futuresMarkPrice(symbol); mark = mp?.markPrice?parseFloat(mp.markPrice):0; } catch{}
+//         if(!mark||mark<=0) continue;
+
+//         // Trailing Stop
+//         if(pos.side==="BUY"){
+//           pos.highest = Math.max(pos.highest, mark);
+//           const trail = pos.highest*(1-TRAILING_STOP_PCT/100);
+//           if(!pos.trailingStop || trail>pos.trailingStop) pos.trailingStop=trail;
+//           if(mark<=pos.trailingStop){ await client.futuresMarketSell(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
+//         } else {
+//           pos.lowest = Math.min(pos.lowest, mark);
+//           const trail = pos.lowest*(1+TRAILING_STOP_PCT/100);
+//           if(!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop=trail;
+//           if(mark>=pos.trailingStop){ await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`); continue; }
+//         }
+
+//         // TP / SL
+//         const move = pos.side==="BUY"?((mark-pos.entryPrice)/pos.entryPrice)*100:((pos.entryPrice-mark)/pos.entryPrice)*100;
+//         if(move>=TP_PCT){ if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`); continue; }
+//         if(move<=-SL_PCT){ if(pos.side==="BUY") await client.futuresMarketSell(symbol,Math.abs(amt)); else await client.futuresMarketBuy(symbol,Math.abs(amt)); delete activePositions[symbol][userId]; await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`); continue; }
+
+//       } catch(err){ log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message||err}`); }
+//     }
+//   }
+// }
+// setInterval(monitorPositions, MONITOR_INTERVAL_MS);
+
+// // --- Manual cycle per symbol ---
+// let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
+
+// let symbolActive = {};
+// COIN_LIST.forEach(s => symbolActive[s] = true); // By default, all symbols active
+
+// // --- Full-auto STC + ATR combined scanning loop ---
+
+// let prevBullishFlip = [];
+// let prevBearishFlip = [];
+// let prevBullishContinuation = [];
+// let prevBearishContinuation = [];
+
+// let symbolCooldownsATR = {}; // per-symbol cooldown for ATR messages (1h)
+
+// setInterval(async () => {
+
+//   const now = Date.now();
+
+//   const bullishFlip = [];
+//   const bearishFlip = [];
+//   const bullishContinuation = [];
+//   const bearishContinuation = [];
+
+//   for (const symbol of COIN_LIST) {
+
+//     const isActive = symbolActive[symbol] ?? true;
+
+//     try {
+//       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+//       if (!candles1H || candles1H.length < 30) continue;
+
+//       const closedCandles1H = candles1H.slice(0, -1);
+//       const closes1H = closedCandles1H.map(c => c.close);
+
+//       // =============================
+//       // TRUE DAILY LEVELS
+//       // =============================
+//       const dailyCandles = await fetchFuturesKlines(symbol, "1d", 2);
+//       if (!dailyCandles || dailyCandles.length < 2) continue;
+
+//       const lastClosedDaily = dailyCandles[dailyCandles.length - 2];
+//       const dailyHigh = lastClosedDaily.high;
+//       const dailyLow = lastClosedDaily.low;
+
+//       const currPrice = closes1H[closes1H.length - 1];
+
+//       // =============================
+//       // ATR
+//       // =============================
+//       const atr = calculateATR(closedCandles1H, ATR_PERIOD);
+//       if (!atr) continue;
+
+//       const prevAtr = calculateATR(closedCandles1H.slice(0, -1), ATR_PERIOD) || atr;
+//       const atrContracting = atr < prevAtr;
+//       const atrExpanding = atr > prevAtr;
+
+//       const distToLow = currPrice - dailyLow;
+//       const distToHigh = dailyHigh - currPrice;
+
+//       const atrMsgCooldown = 60 * 60 * 1000;
+
+//       // =============================
+//       // 1H STC SLOPE
+//       // =============================
+//       const stcSeries1H = [];
+//       for (let i = 0; i < closes1H.length; i++) {
+//         const slice = closes1H.slice(0, i + 1);
+//         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+//         if (val !== null) stcSeries1H.push(val);
+//       }
+//       if (stcSeries1H.length < 2) continue;
+
+//       const prev1H = stcSeries1H[stcSeries1H.length - 2];
+//       const curr1H = stcSeries1H[stcSeries1H.length - 1];
+//       const stcRising = curr1H > prev1H;
+//       const stcFalling = curr1H < prev1H;
+
+//       // =====================================================
+//       // COMBINED ATR + STC SIGNALS
+//       // =====================================================
+//       if (!symbolCooldownsATR[symbol] || now - symbolCooldownsATR[symbol] > atrMsgCooldown) {
+
+//         // --- NEAR DAILY LOW ---
+//         if (distToLow / atr <= 0.2) {
+//           if (atrContracting && stcRising) {
+//             bullishFlip.push(symbol);
+//             await sendMessage(`🟢 *Bullish Flip*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR contracting + STC rising.`);
+//           }
+//           if (atrExpanding && stcFalling) {
+//             bearishContinuation.push(symbol);
+//             await sendMessage(`🔴 *Bearish Continuation*\n${symbol} near ATR LOW (${currPrice.toFixed(4)}) — ATR expanding + STC falling.`);
+//           }
+//         }
+
+//         // --- NEAR DAILY HIGH ---
+//         if (distToHigh / atr <= 0.2) {
+//           if (atrContracting && stcFalling) {
+//             bearishFlip.push(symbol);
+//             await sendMessage(`🔴 *Bearish Flip*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR contracting + STC falling.`);
+//           }
+//           if (atrExpanding && stcRising) {
+//             bullishContinuation.push(symbol);
+//             await sendMessage(`🟢 *Bullish Continuation*\n${symbol} near ATR HIGH (${currPrice.toFixed(4)}) — ATR expanding + STC rising.`);
+//           }
+//         }
+
+//         symbolCooldownsATR[symbol] = now;
+//       }
+
+//       // =====================================================
+//       // Skip trading if paused/inactive
+//       // =====================================================
+//       if (!isActive || BOT_PAUSED) continue;
+//       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
+
+//       // =====================================================
+//       // 1H STC CYCLE LOCK (if not manual)
+//       // =====================================================
+//       if (!currentCycle[symbol]) {
+//         if (MANUAL_CYCLE_BY_SYMBOL[symbol]) currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
+//         else if (MANUAL_CYCLE) currentCycle[symbol] = MANUAL_CYCLE;
+//         else currentCycle[symbol] = stcRising ? "BULL" : stcFalling ? "BEAR" : null;
+
+//         if (currentCycle[symbol]) {
+//           await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${currentCycle[symbol]}*`);
+//         }
+//       }
+
+//       const trendCycle = currentCycle[symbol];
+//       if (!trendCycle) continue;
+
+//       // =====================================================
+//       // 5M STC ENTRY
+//       // =====================================================
+//       const candles5 = await fetchFuturesKlines(symbol, "5m", 100);
+//       if (!candles5 || candles5.length < 30) continue;
+
+//       const closedCandles5 = candles5.slice(0, -1);
+//       const closes5 = closedCandles5.map(c => c.close);
+
+//       const stcSeries5 = [];
+//       for (let i = 0; i < closes5.length; i++) {
+//         const slice = closes5.slice(0, i + 1);
+//         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
+//         if (val !== null) stcSeries5.push(val);
+//       }
+//       if (stcSeries5.length < 2) continue;
+
+//       const prev5 = stcSeries5[stcSeries5.length - 2];
+//       const curr5 = stcSeries5[stcSeries5.length - 1];
+
+//       let direction = null;
+//       if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) direction = "BUY";
+//       if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) direction = "SELL";
+
+//       // =====================================================
+//       // EXECUTION
+//       // =====================================================
+//       if (direction) {
+//         await executeMarketOrderForAllUsers(symbol, direction);
+
+//         const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+//         const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+//         const totalVol = buyVol + sellVol;
+//         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
+//         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
+
+//         await sendMessage(
+//           `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`
+//         );
+
+//         symbolCooldowns[symbol] = now;
+//       }
+
+//     } catch (err) {
+//       log(`❌ STC + ATR scan error ${symbol}: ${err?.message || err}`);
+//     }
+//   }
+
+//   // =====================================================
+//   // 4-STATE SUMMARY (without price)
+//   // =====================================================
+//   const newBullishFlip = bullishFlip.filter(s => !prevBullishFlip.includes(s));
+//   const newBearishFlip = bearishFlip.filter(s => !prevBearishFlip.includes(s));
+//   const newBullishCont = bullishContinuation.filter(s => !prevBullishContinuation.includes(s));
+//   const newBearishCont = bearishContinuation.filter(s => !prevBearishContinuation.includes(s));
+
+//   if (newBullishFlip.length || newBearishFlip.length || newBullishCont.length || newBearishCont.length) {
+//     let summaryMsg = `⚡ *Ready to deploy bot*\n\n`;
+
+//     if (newBullishFlip.length) summaryMsg += `🟢 Bullish Flip (ATR Low + STC Rising):\n${newBullishFlip.join(", ")}\n\n`;
+//     if (newBearishFlip.length) summaryMsg += `🔴 Bearish Flip (ATR High + STC Falling):\n${newBearishFlip.join(", ")}\n\n`;
+//     if (newBullishCont.length) summaryMsg += `🟢 Bullish Continuation (ATR High + STC Rising):\n${newBullishCont.join(", ")}\n\n`;
+//     if (newBearishCont.length) summaryMsg += `🔴 Bearish Continuation (ATR Low + STC Falling):\n${newBearishCont.join(", ")}`;
+
+//     await sendMessage(summaryMsg);
+
+//     prevBullishFlip = bullishFlip;
+//     prevBearishFlip = bearishFlip;
+//     prevBullishContinuation = bullishContinuation;
+//     prevBearishContinuation = bearishContinuation;
+//   }
+
+// }, SIGNAL_CHECK_INTERVAL_MS);
+
+// // --- 4H ATR Volatility Tracker (every 4 hours) ---
+// let prevATR4H = {}; // store previous ATR for trend
+// const ATR_PERIOD_4H = 14;
+// const HIGH_ATR_THRESHOLD = 2;
+// const MEDIUM_ATR_THRESHOLD = 1;
+
+// setInterval(async () => {
+//   let highVol = [];
+//   let mediumVol = [];
+//   let lowVol = [];
+
+//   for (const symbol of COIN_LIST) {
+//     try {
+//       const candles4H = await fetchFuturesKlines(symbol, "4h", 50);
+//       if (!candles4H || candles4H.length < ATR_PERIOD_4H) continue;
+
+//       const closed4H = candles4H.slice(0, -1); // exclude forming candle
+//       const atr = calculateATR(closed4H, ATR_PERIOD_4H);
+//       if (!atr) continue;
+
+//       const prevATR = prevATR4H[symbol] || atr;
+//       let trendSymbol = "–"; // stable by default
+//       if (atr > prevATR) trendSymbol = "↑";
+//       else if (atr < prevATR) trendSymbol = "↓";
+
+//       prevATR4H[symbol] = atr; // update for next check
+
+//       // categorize by ATR magnitude
+//       if (atr >= HIGH_ATR_THRESHOLD) highVol.push({ symbol, atr, trendSymbol });
+//       else if (atr >= MEDIUM_ATR_THRESHOLD) mediumVol.push({ symbol, atr, trendSymbol });
+//       else lowVol.push({ symbol, atr, trendSymbol });
+
+//     } catch (err) {
+//       log(`❌ 4H ATR check failed for ${symbol}: ${err?.message || err}`);
+//     }
+//   }
+
+//   // Build grouped message
+//   let msg = `⚡ *4H ATR Volatility Summary*\n\n`;
+
+//   if (highVol.length) {
+//     msg += `🚀 *High Volatility Coins* (ATR ≥ ${HIGH_ATR_THRESHOLD})\n`;
+//     highVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+//     msg += `\n`;
+//   }
+
+//   if (mediumVol.length) {
+//     msg += `⚡ *Medium Volatility Coins* (ATR ${MEDIUM_ATR_THRESHOLD}-${HIGH_ATR_THRESHOLD})\n`;
+//     mediumVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+//     msg += `\n`;
+//   }
+
+//   if (lowVol.length) {
+//     msg += `🌱 *Low Volatility Coins* (ATR < ${MEDIUM_ATR_THRESHOLD})\n`;
+//     lowVol.forEach(v => msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`);
+//     msg += `\n`;
+//   }
+
+//   if (msg) await sendMessage(msg);
+
+// }, 4 * 60 * 60 * 1000); // every 4 hours
+
+// // --- 30M ADX Trend Tracker (every 30 minutes) ---
+// let prevADX30M = {}; // store previous ADX for trend comparison
+// const ADX_PERIOD = 14;
+
+// setInterval(async () => {
+//   let strongTrend = [];
+//   let mediumTrend = [];
+//   let weakTrend = [];
+
+//   for (const symbol of COIN_LIST) {
+//     try {
+//       const candles30M = await fetchFuturesKlines(symbol, "30m", 50);
+//       if (!candles30M || candles30M.length < ADX_PERIOD) continue;
+
+//       const closed30M = candles30M.slice(0, -1); // exclude current forming candle
+//       const adxData = calculateADX(closed30M, ADX_PERIOD); // returns { adx, plusDI, minusDI }
+//       if (!adxData) continue;
+
+//       const { adx, plusDI, minusDI } = adxData;
+//       const prev = prevADX30M[symbol] || adx;
+
+//       let trendSymbol = "–";
+//       if (adx > prev) trendSymbol = "↑";
+//       else if (adx < prev) trendSymbol = "↓";
+
+//       prevADX30M[symbol] = adx;
+
+//       const dirLabel = plusDI > minusDI ? "🟢 Bullish" : "🔴 Bearish";
+
+//       // categorize by ADX
+//       if (adx >= 30) strongTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
+//       else if (adx >= 20) mediumTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
+//       else weakTrend.push({ symbol, adx, trendSymbol, dirLabel, plusDI, minusDI });
+
+//     } catch (err) {
+//       log(`❌ 30M ADX check failed for ${symbol}: ${err?.message || err}`);
+//     }
+//   }
+
+//   // Build Telegram message
+//   let msg = `⚡ *30M ADX Trend Summary*\n\n`;
+
+//   if (strongTrend.length) {
+//     msg += `🔥 *Strong Trend Coins* (ADX ≥ 30)\n`;
+//     strongTrend.forEach(v => {
+
+//       const diff = Math.abs(v.plusDI - v.minusDI);
+//       const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
+
+//       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+//     });
+//     msg += `\n`;
+//   }
+
+//   if (mediumTrend.length) {
+//     msg += `⚡ *Medium Trend Coins* (ADX 20-30)\n`;
+//     mediumTrend.forEach(v => {
+
+//       const diff = Math.abs(v.plusDI - v.minusDI);
+//       const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
+
+//       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+//     });
+//     msg += `\n`;
+//   }
+
+//   if (weakTrend.length) {
+//     msg += `🌱 *Weak Trend Coins* (ADX < 20)\n`;
+//     weakTrend.forEach(v => {
+
+//       const diff = Math.abs(v.plusDI - v.minusDI);
+//       const tag = diff <= 6 ? " ⚠️ Potential change of Trend Soon" : "";
+
+//       msg += `*${v.symbol}* — ADX: ${v.adx.toFixed(2)} ${v.trendSymbol} ${v.dirLabel} (+DI: ${v.plusDI.toFixed(1)} > -DI: ${v.minusDI.toFixed(1)})${tag}\n`
+//     });
+//     msg += `\n`;
+//   }
+
+//   if (msg) await sendMessage(msg);
+
+// }, 30 * 60 * 1000); // every 30 minutes
+
+// const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
+
+// // Helper function to check admin
+// function isAdmin(msg) {
+//   return msg?.chat?.id === ADMIN_CHAT_ID;
+// }
+
+// // --- Telegram commands ---
+
+// // Pause bot completely
+// bot.onText(/\/pause/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   BOT_PAUSED = true;
+//   currentCycle = {};
+//   MANUAL_CYCLE = null;
+//   await sendMessage("⏸️ Bot paused. Cycles cleared.");
+// });
+
+// // Resume bot after pause
+// bot.onText(/\/resume/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   BOT_PAUSED = false;
+//   await sendMessage("▶️ Bot resumed.");
+// });
+
+// // Close all positions for all users
+// bot.onText(/\/closeall/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   for (const [symbol, users] of Object.entries(activePositions)) {
+//     for (const [userId, pos] of Object.entries(users)) {
+//       const client = userClients[userId];
+//       if (!client) continue;
+//       try {
+//         if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+//         else await client.futuresMarketBuy(symbol, pos.qty);
+//       } catch {}
+//     }
+//   }
+//   activePositions = {};
+//   await sendMessage("🛑 All positions closed.");
+// });
+
+// // Close a specific symbol for all users
+// bot.onText(/\/close (.+)/, async (msg, match) => {
+//   if (!isAdmin(msg)) return;
+//   const symbol = match[1].toUpperCase().trim();
+//   if (!activePositions[symbol]) {
+//     await sendMessage(`⚠️ No active position for *${symbol}*`);
+//     return;
+//   }
+//   for (const [userId, pos] of Object.entries(activePositions[symbol])) {
+//     const client = userClients[userId];
+//     if (!client) continue;
+//     try {
+//       if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
+//       else await client.futuresMarketBuy(symbol, pos.qty);
+//       await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
+//     } catch (err) {
+//       log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
+//     }
+//   }
+//   delete activePositions[symbol];
+//   await sendMessage(`✅ *${symbol}* fully closed for all users`);
+// });
+
+// // --- Global BULL/BEAR commands ---
+// bot.onText(/\/setbull$/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   MANUAL_CYCLE = "BULL";
+//   currentCycle = {};
+//   await sendMessage("🟢 MANUAL MODE: All symbols set to *BULLISH* cycle");
+// });
+
+// bot.onText(/\/setbear$/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   MANUAL_CYCLE = "BEAR";
+//   currentCycle = {};
+//   await sendMessage("🔴 MANUAL MODE: All symbols set to *BEARISH* cycle");
+// });
+
+// bot.onText(/\/setauto$/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   MANUAL_CYCLE = null;
+//   currentCycle = {};
+//   await sendMessage("🤖 AUTO MODE: 1H STC detection re-enabled");
+// });
+
+// // --- Per-symbol BULL/BEAR commands ---
+// bot.onText(/\/setbull (\w+)/, async (msg, match) => {
+//   if (!isAdmin(msg)) return;
+//   const symbol = match[1].toUpperCase();
+//   currentCycle[symbol] = "BULL";
+//   await sendMessage(`🟢 MANUAL MODE: *${symbol}* set to *BULLISH* cycle`);
+// });
+
+// bot.onText(/\/setbear (\w+)/, async (msg, match) => {
+//   if (!isAdmin(msg)) return;
+//   const symbol = match[1].toUpperCase();
+//   currentCycle[symbol] = "BEAR";
+//   await sendMessage(`🔴 MANUAL MODE: *${symbol}* set to *BEARISH* cycle`);
+// });
+
+// // --- Per-symbol ACTIVATE/DEACTIVATE commands ---
+// bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
+//   if (!isAdmin(msg)) return;
+//   const symbol = match[1].toUpperCase();
+//   if (!(symbol in symbolActive)) {
+//     await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
+//     return;
+//   }
+//   symbolActive[symbol] = false;
+//   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
+// });
+
+// bot.onText(/\/activate (\w+)/, async (msg, match) => {
+//   if (!isAdmin(msg)) return;
+//   const symbol = match[1].toUpperCase();
+//   if (!(symbol in symbolActive)) {
+//     await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
+//     return;
+//   }
+//   symbolActive[symbol] = true;
+//   await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol.`);
+// });
+
+// bot.onText(/\/deactivateall/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+//   COIN_LIST.forEach(symbol => {
+//     symbolActive[symbol] = false;
+//   });
+//   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
+// });
+
+// // --- Show all users Futures USDT balances ---
+// bot.onText(/\/balances$/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+
+//   const clients = Object.entries(userClients)
+//     .map(([userId, client]) => ({ userId, client }));
+
+//   if (!clients.length) {
+//     await sendMessage("⚠️ No active users.");
+//     return;
+//   }
+
+//   await sendMessage("📊 Fetching Futures balances...");
+
+//   try {
+//     const results = await Promise.all(
+//       clients.map(async ({ userId, client }) => {
+//         try {
+//           const balances = await client.futuresBalance();
+//           const usdt = balances.find(b => b.asset === "USDT");
+
+//           const wallet = usdt ? parseFloat(usdt.balance) : 0;
+//           const available = usdt ? parseFloat(usdt.availableBalance) : 0;
+//           const unrealized = usdt ? parseFloat(usdt.unrealizedProfit) : 0;
+
+//           return { userId, wallet, available, unrealized };
+//         } catch (err) {
+//           return { userId, error: true };
+//         }
+//       })
+//     );
+
+//     let totalWallet = 0;
+//     let totalAvailable = 0;
+//     let totalUnrealized = 0;
+
+//     let report = "💰 *Futures Wallet Summary:*\n\n";
+
+//     for (const r of results) {
+//       if (r.error) {
+//         report += `User ${r.userId}: ❌ Error fetching balance\n`;
+//         continue;
+//       }
+
+//       totalWallet += r.wallet;
+//       totalAvailable += r.available;
+//       totalUnrealized += r.unrealized;
+
+//       report +=
+//         `User ${r.userId}:\n` +
+//         `   Wallet: ${r.wallet.toFixed(2)} USDT\n` +
+//         `   Available: ${r.available.toFixed(2)} USDT\n` +
+//         `   Unrealized PnL: ${r.unrealized.toFixed(2)} USDT\n\n`;
+//     }
+
+//     report +=
+//       `📦 *Total Wallet:* ${totalWallet.toFixed(2)} USDT\n` +
+//       `💵 *Total Available:* ${totalAvailable.toFixed(2)} USDT\n` +
+//       `📈 *Total Unrealized:* ${totalUnrealized.toFixed(2)} USDT`;
+
+//     await sendMessage(report);
+
+//   } catch (err) {
+//     await sendMessage("❌ Failed to fetch balances.");
+//   }
+// });
+
+// // --- Monthly Report Command ---
+// bot.onText(/\/monthlyreport/, async (msg) => {
+//   if (!isAdmin(msg)) return;
+
+//   const PROFIT_SHARE_PERCENT = 30; // 30% profit share
+//   const users = loadUsers().filter(u => u.active);
+//   if (!users.length) {
+//     await sendMessage("⚠️ No active users found for monthly report.");
+//     return;
+//   }
+
+//   let reportMsg = `📊 *Monthly Trading Report*\n\n`;
+//   let totalNetProfit = 0;
+//   let totalProfitShare = 0;
+
+//   for (const user of users) {
+//     if (!monthlyReport[user.id]) monthlyReport[user.id] = {};
+
+//     const client = userClients[user.id];
+//     if (!client) continue;
+
+//     try {
+//       if (!monthlyReport[user.id].startBalance) {
+//         const balances = await client.futuresBalance();
+//         const usdtBal = balances.find(b => b.asset === "USDT");
+//         monthlyReport[user.id].startBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
+//       }
+
+//       const balances = await client.futuresBalance();
+//       const usdtBal = balances.find(b => b.asset === "USDT");
+//       const currentBalance = usdtBal ? parseFloat(usdtBal.balance) : 0;
+
+//       const startBalance = monthlyReport[user.id].startBalance || 0;
+//       const netProfit = currentBalance - startBalance;
+
+//       const tradesWon = monthlyReport[user.id].tradesWon || 0;
+//       const tradesLost = monthlyReport[user.id].tradesLost || 0;
+//       const totalTrades = tradesWon + tradesLost;
+//       const winRate = totalTrades ? ((tradesWon / totalTrades) * 100).toFixed(1) : "0.0";
+
+//       const profitShare = netProfit > 0 ? (netProfit * PROFIT_SHARE_PERCENT / 100) : 0;
+
+//       totalNetProfit += netProfit;
+//       totalProfitShare += profitShare;
+
+//       reportMsg += `👤 User: ${user.name || user.id}\n` +
+//                    `💰 Net Profit/Loss: ${netProfit.toFixed(2)} USDT\n` +
+//                    `🏆 Win Rate: ${winRate}%\n` +
+//                    `📈 Profit Share (${PROFIT_SHARE_PERCENT}%): ${profitShare.toFixed(2)} USDT\n\n`;
+
+//     } catch (err) {
+//       log(`❌ Failed to generate monthly report for ${user.id}: ${err?.message || err}`);
+//       reportMsg += `👤 User: ${user.name || user.id}\n⚠️ Report unavailable\n\n`;
+//     }
+//   }
+
+//   reportMsg += `💰 Total Net Profit (all users): ${totalNetProfit.toFixed(2)} USDT\n` +
+//                `📈 Total Profit Share Owed: ${totalProfitShare.toFixed(2)} USDT`;
+
+//   await sendMessage(reportMsg);
+// });
