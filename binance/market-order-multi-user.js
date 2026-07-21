@@ -33,7 +33,7 @@ const TRAILING_STOP_PCT = 3;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_TRADES = 7; // per user
-const COOLDOWN_MS = 2 * 60 * 1000; // 30 minutes
+const COOLDOWN_MS = 120 * 60 * 1000; // 2 hours
 const COIN_LIST = [
   "AVAXUSDT",
   "NEARUSDT",
