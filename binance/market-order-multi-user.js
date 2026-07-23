@@ -606,68 +606,1142 @@ setInterval(async () => {
   }
 }, SIGNAL_CHECK_INTERVAL_MS);
 
-// --- 4H ATR Volatility Tracker (every 4 hours) ---
-let prevATR4H = {}; // store previous ATR for trend
-const ATR_PERIOD_4H = 14;
-const HIGH_ATR_THRESHOLD = 2;
-const MEDIUM_ATR_THRESHOLD = 1;
+// =====================================================
+// COIN SCORE REPORT
+// 1H 10 SMA = CLOSED CANDLE CROSSOVER CONFIRMATION
+// 4H 10 SMA = LIVE PRICE FILTER
+// 2H STC = CLOSED CANDLE MOMENTUM
+// 2H OBV = CLOSED CANDLE VOLUME FLOW
+// ATR LOCATION = DAILY HIGH/LOW CONTEXT
+// VOLUME SPIKE = 1H CLOSED CANDLE VS 20-CANDLE AVERAGE
+//
+// REPORTING LOGIC:
+// - Report starts only after a confirmed 1H 10 SMA crossover.
+// - Bullish cycle = closed 1H candle crosses ABOVE 10 SMA.
+// - Bearish cycle = closed 1H candle crosses BELOW 10 SMA.
+// - Report repeats every hour while price remains on that side.
+// - If a closed 1H candle crosses back through the 10 SMA,
+//   the reporting cycle stops.
+// - 4H candle does NOT need to close.
+// =====================================================
 
-setInterval(
-  async () => {
-    let highVol = [];
-    let mediumVol = [];
-    let lowVol = [];
 
-    for (const symbol of COIN_LIST) {
-      try {
-        const candles4H = await fetchFuturesKlines(symbol, "4h", 50);
-        if (!candles4H || candles4H.length < ATR_PERIOD_4H) continue;
+// =====================================================
+// TRACK ACTIVE 1H SMA REPORTING CYCLE
+// =====================================================
 
-        const closed4H = candles4H.slice(0, -1); // exclude forming candle
-        const atr = calculateATR(closed4H, ATR_PERIOD_4H);
-        if (!atr) continue;
+let coinScoreCycle = {};
+// Example:
+// {
+//   BTCUSDT: "BULLISH",
+//   ETHUSDT: "BEARISH"
+// }
 
-        const prevATR = prevATR4H[symbol] || atr;
-        let trendSymbol = "–"; // stable by default
-        if (atr > prevATR) trendSymbol = "↑";
-        else if (atr < prevATR) trendSymbol = "↓";
 
-        prevATR4H[symbol] = atr; // update for next check
+// =====================================================
+// SMA CALCULATION
+// =====================================================
 
-        // categorize by ATR magnitude
-        if (atr >= HIGH_ATR_THRESHOLD) highVol.push({ symbol, atr, trendSymbol });
-        else if (atr >= MEDIUM_ATR_THRESHOLD) mediumVol.push({ symbol, atr, trendSymbol });
-        else lowVol.push({ symbol, atr, trendSymbol });
-      } catch (err) {
-        log(`❌ 4H ATR check failed for ${symbol}: ${err?.message || err}`);
+function calculateSMA(values, period = 10) {
+
+  if (!values || values.length < period) {
+    return null;
+  }
+
+  const slice = values.slice(-period);
+
+  return (
+    slice.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / period
+  );
+}
+
+
+// =====================================================
+// OBV CALCULATION
+// =====================================================
+
+function calculateOBV(candles) {
+
+  if (!candles || candles.length < 2) {
+    return null;
+  }
+
+  let obv = 0;
+
+  for (
+    let i = 1;
+    i < candles.length;
+    i++
+  ) {
+
+    if (
+      candles[i].close >
+      candles[i - 1].close
+    ) {
+
+      obv += candles[i].volume;
+
+    } else if (
+      candles[i].close <
+      candles[i - 1].close
+    ) {
+
+      obv -= candles[i].volume;
+    }
+  }
+
+  return obv;
+}
+
+
+// =====================================================
+// ATR LOCATION
+// =====================================================
+
+function getATRLocation(
+  price,
+  atr,
+  dailyHigh,
+  dailyLow
+) {
+
+  if (
+    !price ||
+    !atr ||
+    !dailyHigh ||
+    !dailyLow
+  ) {
+
+    return {
+      location: "UNKNOWN",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+  const distanceToLow =
+    price - dailyLow;
+
+  const distanceToHigh =
+    dailyHigh - price;
+
+  const nearLow =
+    distanceToLow >= 0 &&
+    distanceToLow <= atr * 0.5;
+
+  const nearHigh =
+    distanceToHigh >= 0 &&
+    distanceToHigh <= atr * 0.5;
+
+
+  // Near daily/ATR low
+  // Potential bullish reversal area
+
+  if (nearLow) {
+
+    return {
+      location: "NEAR ATR LOW",
+      bullishPoints: 10,
+      bearishPoints: 0
+    };
+  }
+
+
+  // Near daily/ATR high
+  // Potential bearish reversal area
+
+  if (nearHigh) {
+
+    return {
+      location: "NEAR ATR HIGH",
+      bullishPoints: 0,
+      bearishPoints: 10
+    };
+  }
+
+
+  return {
+    location: "MID-RANGE",
+    bullishPoints: 0,
+    bearishPoints: 0
+  };
+}
+
+
+// =====================================================
+// VOLUME SPIKE
+// =====================================================
+
+function calculateVolumeSpike(
+  closedCandles,
+  lookback = 20
+) {
+
+  if (
+    !closedCandles ||
+    closedCandles.length <
+    lookback + 1
+  ) {
+
+    return {
+      ratio: 0,
+      strength: "INSUFFICIENT DATA",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+
+  const currentCandle =
+    closedCandles[
+      closedCandles.length - 1
+    ];
+
+
+  const previousCandles =
+    closedCandles.slice(
+      -(lookback + 1),
+      -1
+    );
+
+
+  const averageVolume =
+    previousCandles.reduce(
+      (sum, candle) =>
+        sum + candle.volume,
+      0
+    ) / previousCandles.length;
+
+
+  if (!averageVolume) {
+
+    return {
+      ratio: 0,
+      strength: "NO DATA",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+
+  const ratio =
+    currentCandle.volume /
+    averageVolume;
+
+
+  let strength = "NORMAL";
+
+
+  if (ratio >= 2) {
+
+    strength =
+      "VERY STRONG";
+
+  } else if (ratio >= 1.5) {
+
+    strength =
+      "STRONG";
+
+  } else if (ratio >= 1.2) {
+
+    strength =
+      "MODERATE";
+  }
+
+
+  let bullishPoints = 0;
+  let bearishPoints = 0;
+
+
+  // Only reward significant volume
+
+  if (ratio >= 1.5) {
+
+    if (
+      currentCandle.close >
+      currentCandle.open
+    ) {
+
+      bullishPoints = 10;
+
+    } else if (
+      currentCandle.close <
+      currentCandle.open
+    ) {
+
+      bearishPoints = 10;
+    }
+  }
+
+
+  return {
+    ratio,
+    strength,
+    bullishPoints,
+    bearishPoints
+  };
+}
+
+
+// =====================================================
+// GENERATE COIN SCORE
+// =====================================================
+
+async function calculateCoinScore(
+  symbol
+) {
+
+  try {
+
+    // =================================================
+    // 1H DATA
+    // CLOSED CANDLE REQUIRED
+    // =================================================
+
+    const candles1H =
+      await fetchFuturesKlines(
+        symbol,
+        "1h",
+        100
+      );
+
+
+    if (
+      !candles1H ||
+      candles1H.length < 30
+    ) {
+
+      return null;
+    }
+
+
+    // Remove current forming 1H candle
+
+    const closed1H =
+      candles1H.slice(0, -1);
+
+
+    if (closed1H.length < 21) {
+
+      return null;
+    }
+
+
+    const closes1H =
+      closed1H.map(
+        c => c.close
+      );
+
+
+    // Latest CLOSED 1H candle
+
+    const currentClosed1H =
+      closed1H[
+        closed1H.length - 1
+      ];
+
+
+    // Previous CLOSED 1H candle
+
+    const previousClosed1H =
+      closed1H[
+        closed1H.length - 2
+      ];
+
+
+    // 10 SMA on latest CLOSED candle
+
+    const sma10Current1H =
+      calculateSMA(
+        closes1H,
+        10
+      );
+
+
+    // 10 SMA on previous CLOSED candle
+
+    const sma10Previous1H =
+      calculateSMA(
+        closes1H.slice(0, -1),
+        10
+      );
+
+
+    // =================================================
+    // 1H 10 SMA CROSSOVER
+    // 30 POINTS
+    // =================================================
+
+    let bullishScore = 0;
+    let bearishScore = 0;
+
+    let sma1HSignal =
+      "NO NEW CONFIRMED CROSSOVER";
+
+
+    // =================================================
+    // CHECK FOR NEW BULLISH CROSSOVER
+    // =================================================
+
+    const bullishCrossover =
+      previousClosed1H.close <=
+        sma10Previous1H &&
+      currentClosed1H.close >
+        sma10Current1H;
+
+
+    // =================================================
+    // CHECK FOR NEW BEARISH CROSSOVER
+    // =================================================
+
+    const bearishCrossover =
+      previousClosed1H.close >=
+        sma10Previous1H &&
+      currentClosed1H.close <
+        sma10Current1H;
+
+
+    // =================================================
+    // UPDATE ACTIVE REPORTING CYCLE
+    // =================================================
+
+    if (bullishCrossover) {
+
+      coinScoreCycle[symbol] =
+        "BULLISH";
+
+      sma1HSignal =
+        "BULLISH CROSSOVER CONFIRMED";
+
+    } else if (bearishCrossover) {
+
+      coinScoreCycle[symbol] =
+        "BEARISH";
+
+      sma1HSignal =
+        "BEARISH CROSSOVER CONFIRMED";
+
+    } else if (
+      coinScoreCycle[symbol] ===
+      "BULLISH"
+    ) {
+
+      // If the latest CLOSED candle
+      // remains above the 10 SMA,
+      // keep bullish cycle active.
+
+      if (
+        currentClosed1H.close >
+        sma10Current1H
+      ) {
+
+        sma1HSignal =
+          "BULLISH CYCLE ACTIVE";
+
+      } else {
+
+        // Closed candle has returned
+        // to/below the SMA.
+        // Stop reporting cycle.
+
+        delete coinScoreCycle[
+          symbol
+        ];
+
+        sma1HSignal =
+          "BULLISH CYCLE ENDED";
+      }
+
+    } else if (
+      coinScoreCycle[symbol] ===
+      "BEARISH"
+    ) {
+
+      // If the latest CLOSED candle
+      // remains below the 10 SMA,
+      // keep bearish cycle active.
+
+      if (
+        currentClosed1H.close <
+        sma10Current1H
+      ) {
+
+        sma1HSignal =
+          "BEARISH CYCLE ACTIVE";
+
+      } else {
+
+        // Closed candle has returned
+        // to/above the SMA.
+        // Stop reporting cycle.
+
+        delete coinScoreCycle[
+          symbol
+        ];
+
+        sma1HSignal =
+          "BEARISH CYCLE ENDED";
       }
     }
 
-    // Build grouped message
-    let msg = `⚡ *4H ATR Volatility Summary*\n\n`;
 
-    if (highVol.length) {
-      msg += `🚀 *High Volatility Coins* (ATR ≥ ${HIGH_ATR_THRESHOLD})\n`;
-      highVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
-      msg += `\n`;
+    // =================================================
+    // NO ACTIVE 1H CYCLE
+    // DO NOT SCORE OR REPORT THIS COIN
+    // =================================================
+
+    if (
+      !coinScoreCycle[symbol]
+    ) {
+
+      return null;
     }
 
-    if (mediumVol.length) {
-      msg += `⚡ *Medium Volatility Coins* (ATR ${MEDIUM_ATR_THRESHOLD}-${HIGH_ATR_THRESHOLD})\n`;
-      mediumVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
-      msg += `\n`;
+
+    // =================================================
+    // SCORE THE CONFIRMED 1H DIRECTION
+    // =================================================
+
+    if (
+      coinScoreCycle[symbol] ===
+      "BULLISH"
+    ) {
+
+      bullishScore += 30;
+
+    } else if (
+      coinScoreCycle[symbol] ===
+      "BEARISH"
+    ) {
+
+      bearishScore += 30;
     }
 
-    if (lowVol.length) {
-      msg += `🌱 *Low Volatility Coins* (ATR < ${MEDIUM_ATR_THRESHOLD})\n`;
-      lowVol.forEach((v) => (msg += `*${v.symbol}* — ATR: ${v.atr.toFixed(4)} ${v.trendSymbol}\n`));
-      msg += `\n`;
+
+    // =================================================
+    // 4H 10 SMA
+    // LIVE PRICE
+    // 20 POINTS
+    //
+    // 4H CANDLE DOES NOT NEED TO CLOSE
+    // =================================================
+
+    const candles4H =
+      await fetchFuturesKlines(
+        symbol,
+        "4h",
+        100
+      );
+
+
+    if (
+      !candles4H ||
+      candles4H.length < 20
+    ) {
+
+      return null;
     }
 
-    if (msg) await sendMessage(msg);
-  },
-  4 * 60 * 60 * 1000,
-); // every 4 hours
+
+    const closes4H =
+      candles4H.map(
+        c => c.close
+      );
+
+
+    const sma10_4H =
+      calculateSMA(
+        closes4H,
+        10
+      );
+
+
+    // Current LIVE price
+
+    let currentPrice =
+      currentClosed1H.close;
+
+
+    try {
+
+      const mp =
+        await fetch(
+          `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+        );
+
+
+      if (mp.ok) {
+
+        const priceData =
+          await mp.json();
+
+
+        if (priceData.price) {
+
+          currentPrice =
+            parseFloat(
+              priceData.price
+            );
+        }
+      }
+
+    } catch {}
+
+
+    let sma4HSignal =
+      "NEUTRAL";
+
+
+    // Current live price above 4H SMA
+
+    if (
+      currentPrice >
+      sma10_4H
+    ) {
+
+      bullishScore += 20;
+
+      sma4HSignal =
+        "BULLISH — PRICE ABOVE 4H 10 SMA";
+
+    }
+
+
+    // Current live price below 4H SMA
+
+    else if (
+      currentPrice <
+      sma10_4H
+    ) {
+
+      bearishScore += 20;
+
+      sma4HSignal =
+        "BEARISH — PRICE BELOW 4H 10 SMA";
+    }
+
+
+    // =================================================
+    // 2H STC
+    // CLOSED CANDLE
+    // 20 POINTS
+    // =================================================
+
+    const candles2H =
+      await fetchFuturesKlines(
+        symbol,
+        "2h",
+        100
+      );
+
+
+    if (
+      !candles2H ||
+      candles2H.length < 30
+    ) {
+
+      return null;
+    }
+
+
+    const closed2H =
+      candles2H.slice(0, -1);
+
+
+    const closes2H =
+      closed2H.map(
+        c => c.close
+      );
+
+
+    const stcSeries2H = [];
+
+
+    for (
+      let i = 0;
+      i < closes2H.length;
+      i++
+    ) {
+
+      const slice =
+        closes2H.slice(
+          0,
+          i + 1
+        );
+
+
+      const value =
+        calculateSTC(
+          slice,
+          {
+            cycle: 4,
+            fast: 10,
+            slow: 20
+          }
+        );
+
+
+      if (value !== null) {
+
+        stcSeries2H.push(
+          value
+        );
+      }
+    }
+
+
+    let stc2HSignal =
+      "NEUTRAL";
+
+
+    if (
+      stcSeries2H.length >= 2
+    ) {
+
+      const previousSTC =
+        stcSeries2H[
+          stcSeries2H.length - 2
+        ];
+
+
+      const currentSTC =
+        stcSeries2H[
+          stcSeries2H.length - 1
+        ];
+
+
+      if (
+        currentSTC >
+        previousSTC
+      ) {
+
+        bullishScore += 20;
+
+        stc2HSignal =
+          `BULLISH — RISING (${currentSTC.toFixed(1)})`;
+
+      } else if (
+        currentSTC <
+        previousSTC
+      ) {
+
+        bearishScore += 20;
+
+        stc2HSignal =
+          `BEARISH — FALLING (${currentSTC.toFixed(1)})`;
+      }
+    }
+
+
+    // =================================================
+    // 2H OBV
+    // CLOSED CANDLE
+    // 20 POINTS
+    // =================================================
+
+    let obv2HSignal =
+      "NEUTRAL";
+
+
+    if (
+      closed2H.length >= 4
+    ) {
+
+      const previousOBV =
+        calculateOBV(
+          closed2H.slice(0, -1)
+        );
+
+
+      const currentOBV =
+        calculateOBV(
+          closed2H
+        );
+
+
+      if (
+        currentOBV >
+        previousOBV
+      ) {
+
+        bullishScore += 20;
+
+        obv2HSignal =
+          "BULLISH — RISING";
+
+      } else if (
+        currentOBV <
+        previousOBV
+      ) {
+
+        bearishScore += 20;
+
+        obv2HSignal =
+          "BEARISH — FALLING";
+      }
+    }
+
+
+    // =================================================
+    // ATR LOCATION
+    // 10 POINTS
+    // =================================================
+
+    const atr =
+      calculateATR(
+        closed1H,
+        ATR_PERIOD
+      );
+
+
+    const dailyCandles =
+      await fetchFuturesKlines(
+        symbol,
+        "1d",
+        3
+      );
+
+
+    let atrLocation = {
+      location: "UNKNOWN",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+
+
+    if (
+      atr &&
+      dailyCandles &&
+      dailyCandles.length >= 2
+    ) {
+
+      const lastClosedDaily =
+        dailyCandles[
+          dailyCandles.length - 2
+        ];
+
+
+      atrLocation =
+        getATRLocation(
+          currentPrice,
+          atr,
+          lastClosedDaily.high,
+          lastClosedDaily.low
+        );
+
+
+      bullishScore +=
+        atrLocation.bullishPoints;
+
+
+      bearishScore +=
+        atrLocation.bearishPoints;
+    }
+
+
+    // =================================================
+    // VOLUME SPIKE
+    // 10 POINTS
+    // =================================================
+
+    const volumeSpike =
+      calculateVolumeSpike(
+        closed1H,
+        20
+      );
+
+
+    bullishScore +=
+      volumeSpike.bullishPoints;
+
+
+    bearishScore +=
+      volumeSpike.bearishPoints;
+
+
+    // =================================================
+    // FINAL DIRECTION
+    // =================================================
+
+    let direction =
+      "NEUTRAL";
+
+
+    if (
+      bullishScore >
+      bearishScore
+    ) {
+
+      direction =
+        "BULLISH";
+
+    } else if (
+      bearishScore >
+      bullishScore
+    ) {
+
+      direction =
+        "BEARISH";
+    }
+
+
+    return {
+
+      symbol,
+
+      price:
+        currentPrice,
+
+      bullishScore,
+
+      bearishScore,
+
+      direction,
+
+      sma1HSignal,
+
+      sma4HSignal,
+
+      stc2HSignal,
+
+      obv2HSignal,
+
+      atrLocation:
+        atrLocation.location,
+
+      volumeRatio:
+        volumeSpike.ratio,
+
+      volumeStrength:
+        volumeSpike.strength
+    };
+
+
+  } catch (err) {
+
+    log(
+      `❌ Coin score error ${symbol}: ${
+        err?.message || err
+      }`
+    );
+
+    return null;
+  }
+}
+
+
+// =====================================================
+// COIN SCORE REPORT
+// RUNS EVERY HOUR
+//
+// IMPORTANT:
+// Only coins with an ACTIVE confirmed 1H SMA cycle
+// are included.
+// =====================================================
+
+async function generateCoinScoreReport() {
+
+  const results = [];
+
+
+  for (
+    const symbol of COIN_LIST
+  ) {
+
+    const result =
+      await calculateCoinScore(
+        symbol
+      );
+
+
+    if (result) {
+
+      results.push(result);
+    }
+  }
+
+
+  // =================================================
+  // TOP BULLISH CANDIDATES
+  // =================================================
+
+  const bullish =
+    results
+      .filter(
+        r =>
+          r.direction ===
+          "BULLISH"
+      )
+      .sort(
+        (a, b) =>
+          b.bullishScore -
+          a.bullishScore
+      )
+      .slice(0, 5);
+
+
+  // =================================================
+  // TOP BEARISH CANDIDATES
+  // =================================================
+
+  const bearish =
+    results
+      .filter(
+        r =>
+          r.direction ===
+          "BEARISH"
+      )
+      .sort(
+        (a, b) =>
+          b.bearishScore -
+          a.bearishScore
+      )
+      .slice(0, 5);
+
+
+  // =================================================
+  // BUILD REPORT
+  // =================================================
+
+  let msg =
+    `⚡ *COIN DEPLOYMENT SCORE REPORT*\n\n`;
+
+
+  // =================================================
+  // BULLISH
+  // =================================================
+
+  if (
+    bullish.length
+  ) {
+
+    msg +=
+      `🟢 *TOP BULLISH CANDIDATES*\n\n`;
+
+
+    bullish.forEach(
+      (r, i) => {
+
+        msg +=
+          `${i + 1}. *${r.symbol}* — ` +
+          `🟢 ${r.bullishScore}/100\n`;
+
+
+        msg +=
+          `10 SMA 1H: ${r.sma1HSignal}\n`;
+
+
+        msg +=
+          `10 SMA 4H: ${r.sma4HSignal}\n`;
+
+
+        msg +=
+          `2H STC: ${r.stc2HSignal}\n`;
+
+
+        msg +=
+          `2H OBV: ${r.obv2HSignal}\n`;
+
+
+        msg +=
+          `ATR Location: ${r.atrLocation}\n`;
+
+
+        msg +=
+          `Volume: ${r.volumeStrength} ` +
+          `(${r.volumeRatio.toFixed(2)}x)\n\n`;
+      }
+    );
+  }
+
+
+  // =================================================
+  // BEARISH
+  // =================================================
+
+  if (
+    bearish.length
+  ) {
+
+    msg +=
+      `🔴 *TOP BEARISH CANDIDATES*\n\n`;
+
+
+    bearish.forEach(
+      (r, i) => {
+
+        msg +=
+          `${i + 1}. *${r.symbol}* — ` +
+          `🔴 ${r.bearishScore}/100\n`;
+
+
+        msg +=
+          `10 SMA 1H: ${r.sma1HSignal}\n`;
+
+
+        msg +=
+          `10 SMA 4H: ${r.sma4HSignal}\n`;
+
+
+        msg +=
+          `2H STC: ${r.stc2HSignal}\n`;
+
+
+        msg +=
+          `2H OBV: ${r.obv2HSignal}\n`;
+
+
+        msg +=
+          `ATR Location: ${r.atrLocation}\n`;
+
+
+        msg +=
+          `Volume: ${r.volumeStrength} ` +
+          `(${r.volumeRatio.toFixed(2)}x)\n\n`;
+      }
+    );
+  }
+
+
+  // =================================================
+  // NO ACTIVE CANDIDATES
+  // =================================================
+
+  if (
+    !bullish.length &&
+    !bearish.length
+  ) {
+
+    msg +=
+      `⚪ No active 1H SMA ` +
+      `crossover candidates at this time.`;
+  }
+
+
+  await sendMessage(
+    msg
+  );
+}
+
+
+// =====================================================
+// RUN EVERY HOUR
+// =====================================================
+
+setInterval(
+  generateCoinScoreReport,
+  60 * 60 * 1000
+);
+
+
+// =====================================================
+// RUN ONCE WHEN BOT STARTS
+// =====================================================
+
+generateCoinScoreReport();
 
 const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
 
