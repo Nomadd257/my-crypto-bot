@@ -1580,7 +1580,7 @@ async function generateCoinScoreReport() {
           b.bullishScore -
           a.bullishScore
       )
-      .slice(0, 5);
+      .slice(0, 7);
 
 
   // =================================================
@@ -1599,7 +1599,7 @@ async function generateCoinScoreReport() {
           b.bearishScore -
           a.bearishScore
       )
-      .slice(0, 5);
+      .slice(0, 7);
 
 
   // =================================================
