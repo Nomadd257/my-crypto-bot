@@ -619,6 +619,9 @@ setInterval(async () => {
 // - Report starts only after a confirmed 1H 10 SMA crossover.
 // - Bullish cycle = closed 1H candle crosses ABOVE 10 SMA.
 // - Bearish cycle = closed 1H candle crosses BELOW 10 SMA.
+// - Crossover candle must be checked for VOLUME + MOMENTUM.
+// - Strong crossover candles receive the full 30-point SMA score.
+// - Weak crossover candles receive NO SMA directional points.
 // - Report repeats every hour while price remains on that side.
 // - If a closed 1H candle crosses back through the 10 SMA,
 //   the reporting cycle stops.
@@ -631,6 +634,7 @@ setInterval(async () => {
 // =====================================================
 
 let coinScoreCycle = {};
+
 // Example:
 // {
 //   BTCUSDT: "BULLISH",
@@ -773,6 +777,7 @@ function getATRLocation(
 
 // =====================================================
 // VOLUME SPIKE
+// Used for general 1H volume scoring
 // =====================================================
 
 function calculateVolumeSpike(
@@ -887,6 +892,348 @@ function calculateVolumeSpike(
 
 
 // =====================================================
+// 1H CROSSOVER CANDLE VOLUME + MOMENTUM
+//
+// PURPOSE:
+// Prevent weak crossovers like ATOMUSDT from receiving
+// the same score as strong crossovers like UNIUSDT.
+//
+// VOLUME:
+// Crossover candle volume compared against previous
+// 20 CLOSED 1H candles.
+//
+// MOMENTUM:
+// Candle body size compared against 1H ATR.
+//
+// Strong crossover:
+// - Volume >= 1.5x average
+// - Candle body >= 0.5 ATR
+//
+// Very strong crossover:
+// - Volume >= 2.0x average
+// - Candle body >= 0.75 ATR
+// =====================================================
+
+function analyzeCrossoverCandle(
+  closedCandles,
+  crossoverCandle,
+  direction,
+  atrPeriod = 14,
+  volumeLookback = 20
+) {
+
+  if (
+    !closedCandles ||
+    !crossoverCandle ||
+    closedCandles.length <
+    volumeLookback + 1
+  ) {
+
+    return {
+      valid: false,
+      volumeRatio: 0,
+      volumeStrength: "INSUFFICIENT DATA",
+      momentumRatio: 0,
+      momentumStrength: "INSUFFICIENT DATA",
+      signal: "INSUFFICIENT DATA",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+
+  // =================================================
+  // VOLUME ANALYSIS
+  // =================================================
+
+  // Exclude crossover candle itself.
+  // Compare it against the PREVIOUS 20 closed candles.
+
+  const crossoverIndex =
+    closedCandles.length - 1;
+
+  const previousCandles =
+    closedCandles.slice(
+      Math.max(
+        0,
+        crossoverIndex - volumeLookback
+      ),
+      crossoverIndex
+    );
+
+
+  if (
+    previousCandles.length <
+    volumeLookback
+  ) {
+
+    return {
+      valid: false,
+      volumeRatio: 0,
+      volumeStrength: "INSUFFICIENT DATA",
+      momentumRatio: 0,
+      momentumStrength: "INSUFFICIENT DATA",
+      signal: "INSUFFICIENT DATA",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+
+  const averageVolume =
+    previousCandles.reduce(
+      (sum, candle) =>
+        sum + candle.volume,
+      0
+    ) /
+    previousCandles.length;
+
+
+  const volumeRatio =
+    averageVolume > 0
+      ? crossoverCandle.volume /
+        averageVolume
+      : 0;
+
+
+  let volumeStrength =
+    "WEAK";
+
+
+  if (
+    volumeRatio >= 2
+  ) {
+
+    volumeStrength =
+      "VERY STRONG";
+
+  } else if (
+    volumeRatio >= 1.5
+  ) {
+
+    volumeStrength =
+      "STRONG";
+
+  } else if (
+    volumeRatio >= 1.2
+  ) {
+
+    volumeStrength =
+      "MODERATE";
+  }
+
+
+  // =================================================
+  // MOMENTUM ANALYSIS
+  // =================================================
+
+  const atr =
+    calculateATR(
+      closedCandles,
+      atrPeriod
+    );
+
+
+  if (!atr || atr <= 0) {
+
+    return {
+      valid: false,
+      volumeRatio,
+      volumeStrength,
+      momentumRatio: 0,
+      momentumStrength: "NO ATR DATA",
+      signal: "NO ATR DATA",
+      bullishPoints: 0,
+      bearishPoints: 0
+    };
+  }
+
+
+  // Candle body size
+
+  const bodySize =
+    Math.abs(
+      crossoverCandle.close -
+      crossoverCandle.open
+    );
+
+
+  // Body relative to ATR
+
+  const momentumRatio =
+    bodySize / atr;
+
+
+  let momentumStrength =
+    "WEAK";
+
+
+  if (
+    momentumRatio >= 0.75
+  ) {
+
+    momentumStrength =
+      "VERY STRONG";
+
+  } else if (
+    momentumRatio >= 0.5
+  ) {
+
+    momentumStrength =
+      "STRONG";
+
+  } else if (
+    momentumRatio >= 0.3
+  ) {
+
+    momentumStrength =
+      "MODERATE";
+  }
+
+
+  // =================================================
+  // CANDLE DIRECTION
+  // =================================================
+
+  const bullishCandle =
+    crossoverCandle.close >
+    crossoverCandle.open;
+
+  const bearishCandle =
+    crossoverCandle.close <
+    crossoverCandle.open;
+
+
+  // =================================================
+  // FINAL CROSSOVER QUALITY
+  //
+  // Strong crossover requires:
+  //
+  // 1. Correct candle direction
+  // 2. Volume >= 1.5x average
+  // 3. Momentum >= 0.5 ATR
+  // =================================================
+
+  const strongVolume =
+    volumeRatio >= 1.5;
+
+  const strongMomentum =
+    momentumRatio >= 0.5;
+
+
+  let valid =
+    false;
+
+  let signal =
+    "WEAK CROSSOVER";
+
+
+  // =================================================
+  // BULLISH CROSSOVER
+  // =================================================
+
+  if (
+    direction === "BULLISH"
+  ) {
+
+    if (
+      bullishCandle &&
+      strongVolume &&
+      strongMomentum
+    ) {
+
+      valid = true;
+
+      signal =
+        "STRONG BULLISH CROSSOVER";
+
+    } else {
+
+      signal =
+        "WEAK BULLISH CROSSOVER";
+    }
+  }
+
+
+  // =================================================
+  // BEARISH CROSSOVER
+  // =================================================
+
+  else if (
+    direction === "BEARISH"
+  ) {
+
+    if (
+      bearishCandle &&
+      strongVolume &&
+      strongMomentum
+    ) {
+
+      valid = true;
+
+      signal =
+        "STRONG BEARISH CROSSOVER";
+
+    } else {
+
+      signal =
+        "WEAK BEARISH CROSSOVER";
+    }
+  }
+
+
+  // =================================================
+  // SCORE
+  //
+  // Strong crossover:
+  // Full 30 points
+  //
+  // Weak crossover:
+  // 0 points
+  // =================================================
+
+  let bullishPoints = 0;
+  let bearishPoints = 0;
+
+
+  if (
+    valid &&
+    direction === "BULLISH"
+  ) {
+
+    bullishPoints = 30;
+
+  } else if (
+    valid &&
+    direction === "BEARISH"
+  ) {
+
+    bearishPoints = 30;
+  }
+
+
+  return {
+
+    valid,
+
+    volumeRatio,
+
+    volumeStrength,
+
+    momentumRatio,
+
+    momentumStrength,
+
+    signal,
+
+    bullishPoints,
+
+    bearishPoints
+  };
+}
+
+
+// =====================================================
 // GENERATE COIN SCORE
 // =====================================================
 
@@ -971,12 +1318,12 @@ async function calculateCoinScore(
 
 
     // =================================================
-    // 1H 10 SMA CROSSOVER
-    // 30 POINTS
+    // INITIAL SCORE
     // =================================================
 
     let bullishScore = 0;
     let bearishScore = 0;
+
 
     let sma1HSignal =
       "NO NEW CONFIRMED CROSSOVER";
@@ -1005,32 +1352,128 @@ async function calculateCoinScore(
 
 
     // =================================================
-    // UPDATE ACTIVE REPORTING CYCLE
+    // CROSSOVER MOMENTUM + VOLUME ANALYSIS
     // =================================================
 
-    if (bullishCrossover) {
+    let crossoverAnalysis = {
+
+      valid: false,
+
+      volumeRatio: 0,
+
+      volumeStrength:
+        "NOT A NEW CROSSOVER",
+
+      momentumRatio: 0,
+
+      momentumStrength:
+        "NOT A NEW CROSSOVER",
+
+      signal:
+        "NO NEW CROSSOVER",
+
+      bullishPoints: 0,
+
+      bearishPoints: 0
+    };
+
+
+    // =================================================
+    // NEW BULLISH CROSSOVER
+    // =================================================
+
+    if (
+      bullishCrossover
+    ) {
+
+      // Start bullish cycle
 
       coinScoreCycle[symbol] =
         "BULLISH";
 
-      sma1HSignal =
-        "BULLISH CROSSOVER CONFIRMED";
 
-    } else if (bearishCrossover) {
+      // Analyze the actual crossover candle
+
+      crossoverAnalysis =
+        analyzeCrossoverCandle(
+          closed1H,
+          currentClosed1H,
+          "BULLISH",
+          ATR_PERIOD,
+          20
+        );
+
+
+      if (
+        crossoverAnalysis.valid
+      ) {
+
+        sma1HSignal =
+          "STRONG BULLISH CROSSOVER — VOLUME + MOMENTUM CONFIRMED";
+
+      } else {
+
+        sma1HSignal =
+          "WEAK BULLISH CROSSOVER — LOW VOLUME OR MOMENTUM";
+      }
+
+
+    }
+
+
+    // =================================================
+    // NEW BEARISH CROSSOVER
+    // =================================================
+
+    else if (
+      bearishCrossover
+    ) {
+
+      // Start bearish cycle
 
       coinScoreCycle[symbol] =
         "BEARISH";
 
-      sma1HSignal =
-        "BEARISH CROSSOVER CONFIRMED";
 
-    } else if (
+      // Analyze the actual crossover candle
+
+      crossoverAnalysis =
+        analyzeCrossoverCandle(
+          closed1H,
+          currentClosed1H,
+          "BEARISH",
+          ATR_PERIOD,
+          20
+        );
+
+
+      if (
+        crossoverAnalysis.valid
+      ) {
+
+        sma1HSignal =
+          "STRONG BEARISH CROSSOVER — VOLUME + MOMENTUM CONFIRMED";
+
+      } else {
+
+        sma1HSignal =
+          "WEAK BEARISH CROSSOVER — LOW VOLUME OR MOMENTUM";
+      }
+
+
+    }
+
+
+    // =================================================
+    // ACTIVE BULLISH CYCLE
+    // =================================================
+
+    else if (
       coinScoreCycle[symbol] ===
       "BULLISH"
     ) {
 
-      // If the latest CLOSED candle
-      // remains above the 10 SMA,
+      // If latest CLOSED candle remains above SMA,
       // keep bullish cycle active.
 
       if (
@@ -1043,9 +1486,8 @@ async function calculateCoinScore(
 
       } else {
 
-        // Closed candle has returned
-        // to/below the SMA.
-        // Stop reporting cycle.
+        // Candle returned to/below SMA.
+        // End reporting cycle.
 
         delete coinScoreCycle[
           symbol
@@ -1055,13 +1497,19 @@ async function calculateCoinScore(
           "BULLISH CYCLE ENDED";
       }
 
-    } else if (
+    }
+
+
+    // =================================================
+    // ACTIVE BEARISH CYCLE
+    // =================================================
+
+    else if (
       coinScoreCycle[symbol] ===
       "BEARISH"
     ) {
 
-      // If the latest CLOSED candle
-      // remains below the 10 SMA,
+      // If latest CLOSED candle remains below SMA,
       // keep bearish cycle active.
 
       if (
@@ -1074,9 +1522,8 @@ async function calculateCoinScore(
 
       } else {
 
-        // Closed candle has returned
-        // to/above the SMA.
-        // Stop reporting cycle.
+        // Candle returned to/above SMA.
+        // End reporting cycle.
 
         delete coinScoreCycle[
           symbol
@@ -1102,13 +1549,38 @@ async function calculateCoinScore(
 
 
     // =================================================
-    // SCORE THE CONFIRMED 1H DIRECTION
+    // SCORE 1H CROSSOVER
+    //
+    // IMPORTANT:
+    //
+    // NEW CROSSOVER:
+    // Only strong volume + momentum gets 30 points.
+    //
+    // ACTIVE CYCLE:
+    // The original 30-point directional bias remains
+    // active after the initial crossover.
     // =================================================
 
     if (
+      bullishCrossover
+    ) {
+
+      bullishScore +=
+        crossoverAnalysis.bullishPoints;
+
+    } else if (
+      bearishCrossover
+    ) {
+
+      bearishScore +=
+        crossoverAnalysis.bearishPoints;
+
+    } else if (
       coinScoreCycle[symbol] ===
       "BULLISH"
     ) {
+
+      // Existing active bullish cycle
 
       bullishScore += 30;
 
@@ -1116,6 +1588,8 @@ async function calculateCoinScore(
       coinScoreCycle[symbol] ===
       "BEARISH"
     ) {
+
+      // Existing active bearish cycle
 
       bearishScore += 30;
     }
@@ -1159,7 +1633,9 @@ async function calculateCoinScore(
       );
 
 
-    // Current LIVE price
+    // =================================================
+    // CURRENT LIVE PRICE
+    // =================================================
 
     let currentPrice =
       currentClosed1H.close;
@@ -1179,7 +1655,9 @@ async function calculateCoinScore(
           await mp.json();
 
 
-        if (priceData.price) {
+        if (
+          priceData.price
+        ) {
 
           currentPrice =
             parseFloat(
@@ -1195,7 +1673,9 @@ async function calculateCoinScore(
       "NEUTRAL";
 
 
-    // Current live price above 4H SMA
+    // =================================================
+    // LIVE PRICE ABOVE 4H SMA
+    // =================================================
 
     if (
       currentPrice >
@@ -1210,7 +1690,9 @@ async function calculateCoinScore(
     }
 
 
-    // Current live price below 4H SMA
+    // =================================================
+    // LIVE PRICE BELOW 4H SMA
+    // =================================================
 
     else if (
       currentPrice <
@@ -1224,7 +1706,7 @@ async function calculateCoinScore(
     }
 
 
-    // =================================================
+  // =================================================
     // 2H STC
     // CLOSED CANDLE
     // 20 POINTS
@@ -1284,7 +1766,9 @@ async function calculateCoinScore(
         );
 
 
-      if (value !== null) {
+      if (
+        value !== null
+      ) {
 
         stcSeries2H.push(
           value
@@ -1406,9 +1890,15 @@ async function calculateCoinScore(
 
 
     let atrLocation = {
-      location: "UNKNOWN",
-      bullishPoints: 0,
-      bearishPoints: 0
+
+      location:
+        "UNKNOWN",
+
+      bullishPoints:
+        0,
+
+      bearishPoints:
+        0
     };
 
 
@@ -1443,7 +1933,7 @@ async function calculateCoinScore(
 
 
     // =================================================
-    // VOLUME SPIKE
+    // GENERAL VOLUME SPIKE
     // 10 POINTS
     // =================================================
 
@@ -1488,6 +1978,10 @@ async function calculateCoinScore(
     }
 
 
+    // =================================================
+    // RETURN RESULT
+    // =================================================
+
     return {
 
       symbol,
@@ -1516,7 +2010,26 @@ async function calculateCoinScore(
         volumeSpike.ratio,
 
       volumeStrength:
-        volumeSpike.strength
+        volumeSpike.strength,
+
+      // =================================================
+      // NEW CROSSOVER METRICS
+      // =================================================
+
+      crossoverSignal:
+        crossoverAnalysis.signal,
+
+      crossoverVolumeRatio:
+        crossoverAnalysis.volumeRatio,
+
+      crossoverVolumeStrength:
+        crossoverAnalysis.volumeStrength,
+
+      crossoverMomentumRatio:
+        crossoverAnalysis.momentumRatio,
+
+      crossoverMomentumStrength:
+        crossoverAnalysis.momentumStrength
     };
 
 
@@ -1540,6 +2053,9 @@ async function calculateCoinScore(
 // IMPORTANT:
 // Only coins with an ACTIVE confirmed 1H SMA cycle
 // are included.
+//
+// TOP 7 BULLISH
+// TOP 7 BEARISH
 // =====================================================
 
 async function generateCoinScoreReport() {
@@ -1635,6 +2151,18 @@ async function generateCoinScoreReport() {
 
 
         msg +=
+          `Crossover Volume: ` +
+          `${r.crossoverVolumeStrength} ` +
+          `(${r.crossoverVolumeRatio.toFixed(2)}x)\n`;
+
+
+        msg +=
+          `Crossover Momentum: ` +
+          `${r.crossoverMomentumStrength} ` +
+          `(${r.crossoverMomentumRatio.toFixed(2)} ATR)\n`;
+
+
+        msg +=
           `10 SMA 4H: ${r.sma4HSignal}\n`;
 
 
@@ -1680,6 +2208,18 @@ async function generateCoinScoreReport() {
 
         msg +=
           `10 SMA 1H: ${r.sma1HSignal}\n`;
+
+
+        msg +=
+          `Crossover Volume: ` +
+          `${r.crossoverVolumeStrength} ` +
+          `(${r.crossoverVolumeRatio.toFixed(2)}x)\n`;
+
+
+        msg +=
+          `Crossover Momentum: ` +
+          `${r.crossoverMomentumStrength} ` +
+          `(${r.crossoverMomentumRatio.toFixed(2)} ATR)\n`;
 
 
         msg +=
