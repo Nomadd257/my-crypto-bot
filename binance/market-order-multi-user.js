@@ -1877,3 +1877,161 @@ bot.onText(/\/monthlyreport/, async (msg) => {
 
   await sendMessage(reportMsg);
 });
+
+// =====================================================
+// /activecoins
+// Shows:
+// 1. Coins currently active for trading
+// 2. Coins for which the bot has executed trades
+// =====================================================
+
+bot.onText(/^\/activecoins$/, async (msg) => {
+
+    try {
+
+        // =================================================
+        // CURRENTLY ACTIVE COINS
+        // =================================================
+
+        const activeCoins = COIN_LIST.filter(
+            symbol => symbolActive[symbol] !== false
+        );
+
+
+        // =================================================
+        // COINS WITH EXECUTED TRADES
+        // =================================================
+
+        const tradedCoins = Object.keys(
+            symbolCooldowns || {}
+        ).filter(symbol =>
+            symbolCooldowns[symbol] &&
+            COIN_LIST.includes(symbol)
+        );
+
+
+        // =================================================
+        // COMBINE BOTH LISTS
+        // Remove duplicates
+        // =================================================
+
+        const allCoins = [
+            ...new Set([
+                ...activeCoins,
+                ...tradedCoins
+            ])
+        ];
+
+
+        // =================================================
+        // NO COINS
+        // =================================================
+
+        if (!allCoins.length) {
+
+            await sendMessage(
+                "⚪ *BOT TRADING STATUS*\n\n" +
+                "No active or traded coins found."
+            );
+
+            return;
+        }
+
+
+        // =================================================
+        // BUILD MESSAGE
+        // =================================================
+
+        let message =
+`⚡ *BOT TRADING STATUS*
+
+`;
+
+
+        allCoins.forEach((symbol, index) => {
+
+            const isActive =
+                symbolActive[symbol] !== false;
+
+            const hasTraded =
+                tradedCoins.includes(symbol);
+
+
+            let status;
+
+
+            // Active AND has executed a trade
+
+            if (
+                isActive &&
+                hasTraded
+            ) {
+
+                status =
+                    "🟢 ACTIVE + TRADED";
+
+            }
+
+
+            // Active but no trade yet
+
+            else if (
+                isActive
+            ) {
+
+                status =
+                    "🟢 ACTIVE — NO TRADE YET";
+
+            }
+
+
+            // Has traded but currently inactive
+
+            else if (
+                hasTraded
+            ) {
+
+                status =
+                    "🔵 TRADED";
+
+            }
+
+
+            message +=
+`${index + 1}. *${symbol}* — ${status}\n`;
+
+        });
+
+
+        // =================================================
+        // SUMMARY
+        // =================================================
+
+        message +=
+`\n📊 Total Coins: *${allCoins.length}*`;
+
+        message +=
+`\n🟢 Active: *${activeCoins.length}*`;
+
+        message +=
+`\n🔵 Traded: *${tradedCoins.length}*`;
+
+
+        // =================================================
+        // SEND TELEGRAM MESSAGE
+        // =================================================
+
+        await sendMessage(message);
+
+
+    } catch (err) {
+
+        log(
+            `❌ /activecoins error: ${
+                err?.message || err
+            }`
+        );
+
+    }
+
+});
