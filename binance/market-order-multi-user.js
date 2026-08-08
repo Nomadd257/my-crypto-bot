@@ -609,7 +609,7 @@ setInterval(async () => {
 //======================================================
 // COIN DEPLOYMENT REPORT
 //
-// VERSION 3
+// VERSION 4
 //
 // COMPONENTS
 //
@@ -662,7 +662,6 @@ function calculateEMA(values, period = 10) {
     }
 
     return ema;
-
 }
 
 
@@ -676,7 +675,9 @@ function getSessionCandles(candles) {
         return [];
 
     const latest =
-        new Date(candles[candles.length - 1].openTime);
+        new Date(
+            candles[candles.length - 1].openTime
+        );
 
     const sessionStart =
         new Date(latest);
@@ -698,15 +699,20 @@ function getSessionCandles(candles) {
 
     return candles.filter(candle =>
 
-        candle.openTime >= sessionStart.getTime()
+        candle.openTime >=
+        sessionStart.getTime()
 
     );
-
 }
 
 
 //======================================================
 // SESSION CUMULATIVE DELTA
+//
+// Green candle = buying volume
+// Red candle   = selling volume
+//
+// Delta resets at the beginning of each session.
 //======================================================
 
 function calculateCumulativeDelta(candles) {
@@ -723,13 +729,19 @@ function calculateCumulativeDelta(candles) {
 
     for (const candle of sessionCandles) {
 
-        if (candle.close > candle.open) {
+        if (
+            candle.close >
+            candle.open
+        ) {
 
             delta += candle.volume;
 
         }
 
-        else if (candle.close < candle.open) {
+        else if (
+            candle.close <
+            candle.open
+        ) {
 
             delta -= candle.volume;
 
@@ -740,7 +752,6 @@ function calculateCumulativeDelta(candles) {
     }
 
     return cumulative;
-
 }
 
 
@@ -755,20 +766,33 @@ function calculateOBV(candles) {
 
     let obv = 0;
 
-    for (let i = 1; i < candles.length; i++) {
+    for (
+        let i = 1;
+        i < candles.length;
+        i++
+    ) {
 
-        if (candles[i].close > candles[i - 1].close)
+        if (
+            candles[i].close >
+            candles[i - 1].close
+        ) {
 
             obv += candles[i].volume;
 
-        else if (candles[i].close < candles[i - 1].close)
+        }
+
+        else if (
+            candles[i].close <
+            candles[i - 1].close
+        ) {
 
             obv -= candles[i].volume;
+
+        }
 
     }
 
     return obv;
-
 }
 
 
@@ -789,6 +813,11 @@ function getATRLocation(
     const distHigh =
         dailyHigh - price;
 
+
+    //==================================================
+    // NEAR ATR LOW
+    //==================================================
+
     if (
         distLow >= 0 &&
         distLow <= atr * 0.5
@@ -796,15 +825,23 @@ function getATRLocation(
 
         return {
 
-            location: "NEAR ATR LOW",
+            location:
+                "NEAR ATR LOW",
 
-            bullishPoints: 20,
+            bullishPoints:
+                20,
 
-            bearishPoints: 0
+            bearishPoints:
+                0
 
         };
 
     }
+
+
+    //==================================================
+    // NEAR ATR HIGH
+    //==================================================
 
     if (
         distHigh >= 0 &&
@@ -813,23 +850,30 @@ function getATRLocation(
 
         return {
 
-            location: "NEAR ATR HIGH",
+            location:
+                "NEAR ATR HIGH",
 
-            bullishPoints: 0,
+            bullishPoints:
+                0,
 
-            bearishPoints: 20
+            bearishPoints:
+                20
 
         };
 
     }
 
+
     return {
 
-        location: "MID RANGE",
+        location:
+            "MID RANGE",
 
-        bullishPoints: 0,
+        bullishPoints:
+            0,
 
-        bearishPoints: 0
+        bearishPoints:
+            0
 
     };
 
@@ -838,6 +882,15 @@ function getATRLocation(
 
 //======================================================
 // SESSION CUMULATIVE DELTA ANALYSIS
+//
+// CLOSED 1H CUMULATIVE DELTA
+// compared with
+// EMA(10) OF CUMULATIVE DELTA
+//
+// ABOVE EMA  = BUYERS IN CONTROL
+// BELOW EMA  = SELLERS IN CONTROL
+//
+// The Delta and EMA do NOT need to be rising/falling.
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
@@ -851,23 +904,30 @@ function analyzeDelta(cumulativeDelta) {
 
     }
 
+
     const deltaEMA =
         calculateEMA(
             cumulativeDelta,
             10
         );
 
-    if (deltaEMA.length < 2)
+
+    if (
+        deltaEMA.length < 1
+    ) {
+
         return null;
+
+    }
+
+
+    //==================================================
+    // CURRENT CLOSED 1H VALUES
+    //==================================================
 
     const currentDelta =
         cumulativeDelta[
             cumulativeDelta.length - 1
-        ];
-
-    const previousDelta =
-        cumulativeDelta[
-            cumulativeDelta.length - 2
         ];
 
     const currentEMA =
@@ -875,22 +935,10 @@ function analyzeDelta(cumulativeDelta) {
             deltaEMA.length - 1
         ];
 
-    const previousEMA =
-        deltaEMA[
-            deltaEMA.length - 2
-        ];
 
-    const emaRising =
-        currentEMA > previousEMA;
-
-    const emaFalling =
-        currentEMA < previousEMA;
-
-    const deltaRising =
-        currentDelta > previousDelta;
-
-    const deltaFalling =
-        currentDelta < previousDelta;
+    //==================================================
+    // INITIAL STATE
+    //==================================================
 
     let bullishPoints = 0;
 
@@ -901,17 +949,12 @@ function analyzeDelta(cumulativeDelta) {
 
 
     //==================================================
-    // BUYERS DOMINATING
+    // BUYERS IN CONTROL
     //==================================================
 
     if (
-
-        currentDelta > currentEMA &&
-
-        deltaRising &&
-
-        emaRising
-
+        currentDelta >
+        currentEMA
     ) {
 
         bullishPoints = 40;
@@ -923,17 +966,12 @@ function analyzeDelta(cumulativeDelta) {
 
 
     //==================================================
-    // SELLERS DOMINATING
+    // SELLERS IN CONTROL
     //==================================================
 
     else if (
-
-        currentDelta < currentEMA &&
-
-        deltaFalling &&
-
-        emaFalling
-
+        currentDelta <
+        currentEMA
     ) {
 
         bearishPoints = 40;
@@ -952,14 +990,6 @@ function analyzeDelta(cumulativeDelta) {
 
         currentEMA,
 
-        deltaRising,
-
-        deltaFalling,
-
-        emaRising,
-
-        emaFalling,
-
         bullishPoints,
 
         bearishPoints
@@ -967,6 +997,7 @@ function analyzeDelta(cumulativeDelta) {
     };
 
 }
+
 
 //======================================================
 // CALCULATE COIN SCORE
@@ -987,6 +1018,7 @@ async function calculateCoinScore(symbol) {
                 120
             );
 
+
         if (
             !candles1H ||
             candles1H.length < 50
@@ -996,13 +1028,18 @@ async function calculateCoinScore(symbol) {
 
         }
 
-        // Remove current forming candle
+
+        // Remove current forming 1H candle
 
         const closed1H =
             candles1H.slice(0, -1);
 
+
         const closes1H =
-            closed1H.map(c => c.close);
+            closed1H.map(
+                c => c.close
+            );
+
 
         const currentPrice =
             closes1H[
@@ -1028,13 +1065,16 @@ async function calculateCoinScore(symbol) {
                 closed1H
             );
 
+
         const deltaAnalysis =
             analyzeDelta(
                 cumulativeDelta
             );
 
+
         if (!deltaAnalysis)
             return null;
+
 
         bullishScore +=
             deltaAnalysis.bullishPoints;
@@ -1054,6 +1094,7 @@ async function calculateCoinScore(symbol) {
                 120
             );
 
+
         if (
             !candles2H ||
             candles2H.length < 50
@@ -1063,13 +1104,19 @@ async function calculateCoinScore(symbol) {
 
         }
 
+
         const closed2H =
             candles2H.slice(0, -1);
 
+
         const closes2H =
-            closed2H.map(c => c.close);
+            closed2H.map(
+                c => c.close
+            );
+
 
         const stcSeries = [];
+
 
         for (
             let i = 0;
@@ -1086,29 +1133,30 @@ async function calculateCoinScore(symbol) {
                     ),
 
                     {
-
-                        cycle:4,
-
-                        fast:10,
-
-                        slow:20
-
+                        cycle: 4,
+                        fast: 10,
+                        slow: 20
                     }
 
                 );
+
 
             if (
                 value !== null
             ) {
 
-                stcSeries.push(value);
+                stcSeries.push(
+                    value
+                );
 
             }
 
         }
 
+
         let stcSignal =
             "NEUTRAL";
+
 
         if (
             stcSeries.length >= 2
@@ -1119,13 +1167,16 @@ async function calculateCoinScore(symbol) {
                     stcSeries.length - 2
                 ];
 
+
             const current =
                 stcSeries[
                     stcSeries.length - 1
                 ];
 
+
             if (
-                current > previous
+                current >
+                previous
             ) {
 
                 bullishScore += 20;
@@ -1136,7 +1187,8 @@ async function calculateCoinScore(symbol) {
             }
 
             else if (
-                current < previous
+                current <
+                previous
             ) {
 
                 bearishScore += 20;
@@ -1156,6 +1208,7 @@ async function calculateCoinScore(symbol) {
         let obvSignal =
             "NEUTRAL";
 
+
         const previousOBV =
             calculateOBV(
 
@@ -1166,10 +1219,12 @@ async function calculateCoinScore(symbol) {
 
             );
 
+
         const currentOBV =
             calculateOBV(
                 closed2H
             );
+
 
         if (
             currentOBV >
@@ -1202,12 +1257,10 @@ async function calculateCoinScore(symbol) {
 
         const atr =
             calculateATR(
-
                 closed1H,
-
                 ATR_PERIOD
-
             );
+
 
         if (!atr)
             return null;
@@ -1215,14 +1268,11 @@ async function calculateCoinScore(symbol) {
 
         const daily =
             await fetchFuturesKlines(
-
                 symbol,
-
                 "1d",
-
                 3
-
             );
+
 
         if (
             !daily ||
@@ -1233,10 +1283,12 @@ async function calculateCoinScore(symbol) {
 
         }
 
+
         const previousDay =
             daily[
                 daily.length - 2
             ];
+
 
         const atrLocation =
             getATRLocation(
@@ -1251,8 +1303,10 @@ async function calculateCoinScore(symbol) {
 
             );
 
+
         bullishScore +=
             atrLocation.bullishPoints;
+
 
         bearishScore +=
             atrLocation.bearishPoints;
@@ -1264,6 +1318,7 @@ async function calculateCoinScore(symbol) {
 
         let direction =
             "NEUTRAL";
+
 
         if (
             bullishScore >
@@ -1309,17 +1364,19 @@ async function calculateCoinScore(symbol) {
             deltaEMA:
                 deltaAnalysis.currentEMA,
 
-            deltaTrend:
+            deltaPosition:
 
-                deltaAnalysis.emaRising
+                deltaAnalysis.currentDelta >
+                deltaAnalysis.currentEMA
 
-                    ? "EMA RISING"
+                    ? "DELTA ABOVE EMA(10)"
 
-                    : deltaAnalysis.emaFalling
+                    : deltaAnalysis.currentDelta <
+                      deltaAnalysis.currentEMA
 
-                        ? "EMA FALLING"
+                        ? "DELTA BELOW EMA(10)"
 
-                        : "EMA FLAT",
+                        : "DELTA AT EMA(10)",
 
             stcSignal,
 
@@ -1348,6 +1405,7 @@ async function calculateCoinScore(symbol) {
 
 }
 
+
 //======================================================
 // GENERATE COIN DEPLOYMENT REPORT
 //======================================================
@@ -1356,22 +1414,29 @@ async function generateCoinScoreReport() {
 
     const results = [];
 
+
     //--------------------------------------------------
     // Scan every symbol
     //--------------------------------------------------
 
-    for (const symbol of COIN_LIST) {
+    for (
+        const symbol of COIN_LIST
+    ) {
 
         const score =
-            await calculateCoinScore(symbol);
+            await calculateCoinScore(
+                symbol
+            );
+
 
         if (score)
             results.push(score);
 
     }
 
+
     //--------------------------------------------------
-    // Bullish
+    // BULLISH
     //--------------------------------------------------
 
     const bullish =
@@ -1379,7 +1444,9 @@ async function generateCoinScoreReport() {
         results
 
             .filter(
-                x => x.direction === "BULLISH"
+                x =>
+                    x.direction ===
+                    "BULLISH"
             )
 
             .sort(
@@ -1390,8 +1457,9 @@ async function generateCoinScoreReport() {
 
             .slice(0, 7);
 
+
     //--------------------------------------------------
-    // Bearish
+    // BEARISH
     //--------------------------------------------------
 
     const bearish =
@@ -1399,7 +1467,9 @@ async function generateCoinScoreReport() {
         results
 
             .filter(
-                x => x.direction === "BEARISH"
+                x =>
+                    x.direction ===
+                    "BEARISH"
             )
 
             .sort(
@@ -1410,8 +1480,9 @@ async function generateCoinScoreReport() {
 
             .slice(0, 7);
 
+
     //--------------------------------------------------
-    // Build Telegram Message
+    // BUILD TELEGRAM MESSAGE
     //--------------------------------------------------
 
     let msg =
@@ -1419,27 +1490,32 @@ async function generateCoinScoreReport() {
 
 `;
 
+
     //--------------------------------------------------
-    // Bullish
+    // BULLISH
     //--------------------------------------------------
 
-    if (bullish.length) {
+    if (
+        bullish.length
+    ) {
 
         msg +=
 `🟢 *TOP BULLISH CANDIDATES*
 
 `;
 
-        bullish.forEach((coin, index) => {
 
-            msg +=
+        bullish.forEach(
+            (coin, index) => {
+
+                msg +=
 
 `${index + 1}. *${coin.symbol}*
 🟢 ${coin.bullishScore}/100
 
 📊 Order Flow
 ${coin.deltaSignal}
-${coin.deltaTrend}
+${coin.deltaPosition}
 
 ⚡ Momentum
 ${coin.stcSignal}
@@ -1452,31 +1528,37 @@ ${coin.atrLocation}
 
 `;
 
-        });
+            }
+        );
 
     }
 
+
     //--------------------------------------------------
-    // Bearish
+    // BEARISH
     //--------------------------------------------------
 
-    if (bearish.length) {
+    if (
+        bearish.length
+    ) {
 
         msg +=
 `🔴 *TOP BEARISH CANDIDATES*
 
 `;
 
-        bearish.forEach((coin, index) => {
 
-            msg +=
+        bearish.forEach(
+            (coin, index) => {
+
+                msg +=
 
 `${index + 1}. *${coin.symbol}*
 🔴 ${coin.bearishScore}/100
 
 📊 Order Flow
 ${coin.deltaSignal}
-${coin.deltaTrend}
+${coin.deltaPosition}
 
 ⚡ Momentum
 ${coin.stcSignal}
@@ -1489,12 +1571,14 @@ ${coin.atrLocation}
 
 `;
 
-        });
+            }
+        );
 
     }
 
+
     //--------------------------------------------------
-    // No Candidates
+    // NO CANDIDATES
     //--------------------------------------------------
 
     if (
@@ -1507,18 +1591,20 @@ ${coin.atrLocation}
 
     }
 
+
     //--------------------------------------------------
-    // Telegram
+    // TELEGRAM
     //--------------------------------------------------
 
-    await sendMessage(msg);
+    await sendMessage(
+        msg
+    );
 
 }
 
 
-
 //======================================================
-// Schedule
+// SCHEDULE
 //======================================================
 
 generateCoinScoreReport();
