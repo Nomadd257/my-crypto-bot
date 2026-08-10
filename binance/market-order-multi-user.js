@@ -890,7 +890,7 @@ function getATRLocation(
 // ABOVE EMA  = BUYERS IN CONTROL
 // BELOW EMA  = SELLERS IN CONTROL
 //
-// The Delta and EMA do NOT need to be rising/falling.
+// Delta and EMA do NOT need to be rising/falling.
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
@@ -1029,7 +1029,7 @@ async function calculateCoinScore(symbol) {
         }
 
 
-        // Remove current forming 1H candle
+        // Remove current forming candle
 
         const closed1H =
             candles1H.slice(0, -1);
@@ -1405,7 +1405,6 @@ async function calculateCoinScore(symbol) {
 
 }
 
-
 //======================================================
 // GENERATE COIN DEPLOYMENT REPORT
 //======================================================
@@ -1436,17 +1435,38 @@ async function generateCoinScoreReport() {
 
 
     //--------------------------------------------------
+    // IMPORTANT
+    //
+    // Only NEW DELTA CROSSOVERS are deployment
+    // candidates.
+    //
+    // This prevents a coin that has simply remained
+    // above/below the EMA from appearing as a new
+    // deployment signal every hour.
+    //--------------------------------------------------
+
+    const crossoverResults =
+        results.filter(
+            coin =>
+                coin.deltaCrossover ===
+                    "BULLISH CROSSOVER" ||
+                coin.deltaCrossover ===
+                    "BEARISH CROSSOVER"
+        );
+
+
+    //--------------------------------------------------
     // BULLISH
     //--------------------------------------------------
 
     const bullish =
 
-        results
+        crossoverResults
 
             .filter(
                 x =>
-                    x.direction ===
-                    "BULLISH"
+                    x.deltaCrossover ===
+                    "BULLISH CROSSOVER"
             )
 
             .sort(
@@ -1464,12 +1484,12 @@ async function generateCoinScoreReport() {
 
     const bearish =
 
-        results
+        crossoverResults
 
             .filter(
                 x =>
-                    x.direction ===
-                    "BEARISH"
+                    x.deltaCrossover ===
+                    "BEARISH CROSSOVER"
             )
 
             .sort(
@@ -1500,7 +1520,7 @@ async function generateCoinScoreReport() {
     ) {
 
         msg +=
-`🟢 *TOP BULLISH CANDIDATES*
+`🟢 *BULLISH DELTA CROSSOVERS*
 
 `;
 
@@ -1511,19 +1531,19 @@ async function generateCoinScoreReport() {
                 msg +=
 
 `${index + 1}. *${coin.symbol}*
-🟢 ${coin.bullishScore}/100
+🟢 Score: ${coin.bullishScore}/100
 
-📊 Order Flow
-${coin.deltaSignal}
+📊 *Cumulative Delta*
+🟢 ${coin.deltaCrossover}
 ${coin.deltaPosition}
 
-⚡ Momentum
+⚡ *2H STC*
 ${coin.stcSignal}
 
-📈 Volume Flow
+📈 *2H OBV*
 ${coin.obvSignal}
 
-📍 Location
+📍 *ATR Location*
 ${coin.atrLocation}
 
 `;
@@ -1543,7 +1563,7 @@ ${coin.atrLocation}
     ) {
 
         msg +=
-`🔴 *TOP BEARISH CANDIDATES*
+`🔴 *BEARISH DELTA CROSSOVERS*
 
 `;
 
@@ -1554,19 +1574,19 @@ ${coin.atrLocation}
                 msg +=
 
 `${index + 1}. *${coin.symbol}*
-🔴 ${coin.bearishScore}/100
+🔴 Score: ${coin.bearishScore}/100
 
-📊 Order Flow
-${coin.deltaSignal}
+📊 *Cumulative Delta*
+🔴 ${coin.deltaCrossover}
 ${coin.deltaPosition}
 
-⚡ Momentum
+⚡ *2H STC*
 ${coin.stcSignal}
 
-📈 Volume Flow
+📈 *2H OBV*
 ${coin.obvSignal}
 
-📍 Location
+📍 *ATR Location*
 ${coin.atrLocation}
 
 `;
@@ -1578,7 +1598,7 @@ ${coin.atrLocation}
 
 
     //--------------------------------------------------
-    // NO CANDIDATES
+    // NO NEW CROSSOVERS
     //--------------------------------------------------
 
     if (
@@ -1587,7 +1607,7 @@ ${coin.atrLocation}
     ) {
 
         msg +=
-`⚪ No deployment candidates found.`;
+`⚪ No new Delta/EMA(10) crossovers detected.`;
 
     }
 
@@ -1599,7 +1619,6 @@ ${coin.atrLocation}
     await sendMessage(
         msg
     );
-
 }
 
 
