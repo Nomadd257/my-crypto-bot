@@ -653,26 +653,38 @@ let delta15MState = {};
 // EMA
 //======================================================
 
-function calculateEMA(values, period = 10) {
+function calculateEMA(values, period = 5) {
 
-    if (!values || values.length < period)
+    if (
+        !values ||
+        values.length < period
+    ) {
         return [];
+    }
+
+    const ema = [];
 
     const multiplier =
         2 / (period + 1);
 
-    const ema = [];
-
+    // First EMA value
     let previous =
         values
             .slice(0, period)
             .reduce(
-                (a, b) => a + b,
+                (sum, value) =>
+                    sum + value,
                 0
             ) / period;
 
+    // Keep array aligned with values
+    for (let i = 0; i < period - 1; i++) {
+        ema.push(null);
+    }
+
     ema.push(previous);
 
+    // Calculate remaining EMA values
     for (
         let i = period;
         i < values.length;
@@ -915,77 +927,62 @@ function getATRLocation(
 // The distance from EMA does NOT matter.
 //======================================================
 
-function analyzeDelta(
-    cumulativeDelta
-) {
+function analyzeDelta(cumulativeDelta) {
 
     if (
         !cumulativeDelta ||
-        cumulativeDelta.length < 10
+        cumulativeDelta.length < 6
     ) {
-
         return null;
     }
-
 
     const deltaEMA =
         calculateEMA(
             cumulativeDelta,
-            10
+            5
         );
 
+    const currentIndex =
+        cumulativeDelta.length - 1;
 
-    if (
-        deltaEMA.length < 2
-    )
-        return null;
-
+    const previousIndex =
+        currentIndex - 1;
 
     const currentDelta =
-        cumulativeDelta[
-            cumulativeDelta.length - 1
-        ];
+        cumulativeDelta[currentIndex];
 
     const previousDelta =
-        cumulativeDelta[
-            cumulativeDelta.length - 2
-        ];
+        cumulativeDelta[previousIndex];
 
     const currentEMA =
-        deltaEMA[
-            deltaEMA.length - 1
-        ];
+        deltaEMA[currentIndex];
 
     const previousEMA =
-        deltaEMA[
-            deltaEMA.length - 2
-        ];
+        deltaEMA[previousIndex];
 
+    if (
+        currentEMA === null ||
+        previousEMA === null
+    ) {
+        return null;
+    }
 
     const bullishCrossover =
-        previousDelta <=
-            previousEMA &&
-        currentDelta >
-            currentEMA;
-
+        previousDelta <= previousEMA &&
+        currentDelta > currentEMA;
 
     const bearishCrossover =
-        previousDelta >=
-            previousEMA &&
-        currentDelta <
-            currentEMA;
-
+        previousDelta >= previousEMA &&
+        currentDelta < currentEMA;
 
     let signal =
         "BALANCED ORDER FLOW";
 
-    let bullishPoints = 0;
-
-    let bearishPoints = 0;
-
     let crossover =
         "NO NEW 1H CROSSOVER";
 
+    let bullishPoints = 0;
+    let bearishPoints = 0;
 
     if (
         currentDelta >
@@ -996,9 +993,8 @@ function analyzeDelta(
 
         signal =
             "BUYERS IN CONTROL";
-    }
 
-    else if (
+    } else if (
         currentDelta <
         currentEMA
     ) {
@@ -1009,7 +1005,6 @@ function analyzeDelta(
             "SELLERS IN CONTROL";
     }
 
-
     if (
         bullishCrossover
     ) {
@@ -1017,9 +1012,7 @@ function analyzeDelta(
         crossover =
             "BULLISH CROSSOVER";
 
-    }
-
-    else if (
+    } else if (
         bearishCrossover
     ) {
 
@@ -1027,27 +1020,21 @@ function analyzeDelta(
             "BEARISH CROSSOVER";
     }
 
-
     return {
 
         signal,
-
         crossover,
 
         currentDelta,
-
         previousDelta,
 
         currentEMA,
-
         previousEMA,
 
         bullishPoints,
-
         bearishPoints
     };
 }
-
 
 //======================================================
 // 15M DELTA CROSSOVER
@@ -1092,8 +1079,10 @@ function analyze15MDelta(
         );
 
 
+    // EMA(5) needs at least 5 candles
+
     if (
-        sessionCandles.length < 11
+        sessionCandles.length < 6
     ) {
 
         return null;
@@ -1130,39 +1119,77 @@ function analyze15MDelta(
     }
 
 
+    //==================================================
+    // EMA(5)
+    //==================================================
+
     const deltaEMA =
         calculateEMA(
             cumulativeDelta,
-            10
+            5
         );
 
 
     if (
-        deltaEMA.length < 2
-    )
+        deltaEMA.length !==
+        cumulativeDelta.length
+    ) {
+
         return null;
+    }
+
+
+    //==================================================
+    // CURRENT CLOSED 15M CANDLE
+    //==================================================
+
+    const currentIndex =
+        cumulativeDelta.length - 1;
+
+    const previousIndex =
+        currentIndex - 1;
 
 
     const currentDelta =
         cumulativeDelta[
-            cumulativeDelta.length - 1
+            currentIndex
         ];
 
     const previousDelta =
         cumulativeDelta[
-            cumulativeDelta.length - 2
+            previousIndex
         ];
+
 
     const currentEMA =
         deltaEMA[
-            deltaEMA.length - 1
+            currentIndex
         ];
 
     const previousEMA =
         deltaEMA[
-            deltaEMA.length - 2
+            previousIndex
         ];
 
+
+    if (
+        currentEMA === null ||
+        previousEMA === null
+    ) {
+
+        return null;
+    }
+
+
+    //==================================================
+    // BULLISH CROSSOVER
+    //
+    // Previous closed candle:
+    // Delta BELOW or AT EMA(5)
+    //
+    // Current closed candle:
+    // Delta ABOVE EMA(5)
+    //==================================================
 
     const bullishCrossover =
         previousDelta <=
@@ -1171,12 +1198,26 @@ function analyze15MDelta(
             currentEMA;
 
 
+    //==================================================
+    // BEARISH CROSSOVER
+    //
+    // Previous closed candle:
+    // Delta ABOVE or AT EMA(5)
+    //
+    // Current closed candle:
+    // Delta BELOW EMA(5)
+    //==================================================
+
     const bearishCrossover =
         previousDelta >=
             previousEMA &&
         currentDelta <
             currentEMA;
 
+
+    //==================================================
+    // CURRENT STATE
+    //==================================================
 
     const state =
         currentDelta >
