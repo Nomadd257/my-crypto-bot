@@ -643,12 +643,17 @@ setInterval(async () => {
 // SESSION SETTINGS
 //======================================================
 
-// 0 = 00:00 UTC
 const SESSION_START_HOUR = 0;
 
 
 //======================================================
 // GET CURRENT SESSION CANDLES
+//
+// Kept available for other parts of the bot.
+//
+// IMPORTANT:
+// The order-flow report does NOT depend on this
+// function anymore.
 //======================================================
 
 function getSessionCandles(candles) {
@@ -697,7 +702,7 @@ function getSessionCandles(candles) {
 
     return candles.filter(
         candle =>
-            candle.openTime >=
+            Number(candle.openTime) >=
             sessionStart.getTime()
     );
 
@@ -705,26 +710,32 @@ function getSessionCandles(candles) {
 
 
 //======================================================
-// SESSION CUMULATIVE DELTA
+// CUMULATIVE DELTA
+//
+// IMPORTANT CHANGE:
+//
+// We DO NOT use getSessionCandles() here.
+//
+// The report uses all CLOSED candles supplied to it.
+//
+// 30M = current short-term order flow
+// 3H  = broader order-flow context
 //
 // Green candle = positive volume
 // Red candle   = negative volume
 //
-// Delta resets at session start.
+// This prevents the Delta from becoming
+// DATA UNAVAILABLE simply because the current
+// UTC session contains too few candles.
 //======================================================
 
 function calculateCumulativeDelta(
     candles
 ) {
 
-    const sessionCandles =
-        getSessionCandles(
-            candles
-        );
-
-
     if (
-        sessionCandles.length < 3
+        !candles ||
+        candles.length < 2
     ) {
 
         return [];
@@ -738,28 +749,51 @@ function calculateCumulativeDelta(
 
 
     for (
-        const candle of sessionCandles
+        const candle of candles
     ) {
 
+        const open =
+            Number(candle.open);
+
+        const close =
+            Number(candle.close);
+
+        const volume =
+            Number(candle.volume);
+
+
         if (
-            candle.close >
-            candle.open
+            !Number.isFinite(open) ||
+            !Number.isFinite(close) ||
+            !Number.isFinite(volume)
         ) {
 
-            delta +=
-                candle.volume;
+            continue;
+
+        }
+
+
+        if (
+            close >
+            open
+        ) {
+
+            delta += volume;
 
         }
 
         else if (
-            candle.close <
-            candle.open
+            close <
+            open
         ) {
 
-            delta -=
-                candle.volume;
+            delta -= volume;
 
         }
+
+
+        // Do not modify delta on a
+        // neutral candle.
 
 
         cumulativeDelta.push(
@@ -777,31 +811,20 @@ function calculateCumulativeDelta(
 //======================================================
 // ANALYZE DELTA
 //
-// NO EMA.
-//
 // Determines:
 //
-// • Current Delta
-// • Previous Delta
-// • Delta change
-// • Higher Positive
-// • Lower Positive
-// • Lower Negative
-// • Higher Negative
+// HIGHER POSITIVE
+// LOWER POSITIVE
+// LOWER NEGATIVE
+// HIGHER NEGATIVE
+// POSITIVE / FLAT
+// NEGATIVE / FLAT
+// AT ZERO
 //
 // IMPORTANT:
 //
-// Higher Positive
-// = buying strengthening
-//
-// Lower Positive
-// = buying weakening
-//
-// Lower Negative
-// = selling strengthening
-//
-// Higher Negative
-// = selling weakening
+// This does NOT use EMA.
+// This does NOT require a crossover.
 //======================================================
 
 function analyzeDelta(
@@ -827,15 +850,29 @@ function analyzeDelta(
 
 
     const currentDelta =
-        cumulativeDelta[
-            currentIndex
-        ];
+        Number(
+            cumulativeDelta[
+                currentIndex
+            ]
+        );
 
 
     const previousDelta =
-        cumulativeDelta[
-            previousIndex
-        ];
+        Number(
+            cumulativeDelta[
+                previousIndex
+            ]
+        );
+
+
+    if (
+        !Number.isFinite(currentDelta) ||
+        !Number.isFinite(previousDelta)
+    ) {
+
+        return null;
+
+    }
 
 
     const deltaChange =
@@ -851,9 +888,12 @@ function analyzeDelta(
         "BALANCED";
 
 
-    let bullishPoints = 0;
+    let bullishPoints =
+        0;
 
-    let bearishPoints = 0;
+
+    let bearishPoints =
+        0;
 
 
     //==================================================
@@ -873,7 +913,7 @@ function analyzeDelta(
                 "HIGHER POSITIVE";
 
             pressure =
-                "BUYERS IN CONTROL";
+                "BUYING STRENGTHENING";
 
             bullishPoints =
                 20;
@@ -929,7 +969,7 @@ function analyzeDelta(
                 "LOWER NEGATIVE";
 
             pressure =
-                "SELLERS IN CONTROL";
+                "SELLING STRENGTHENING";
 
             bearishPoints =
                 20;
@@ -969,7 +1009,7 @@ function analyzeDelta(
 
 
     //==================================================
-    // ZERO / BALANCED
+    // ZERO
     //==================================================
 
     else {
@@ -979,6 +1019,53 @@ function analyzeDelta(
 
         pressure =
             "BALANCED";
+
+    }
+
+
+    //==================================================
+    // CURRENT ORDER-FLOW CONTROL
+    //==================================================
+
+    let control =
+        "BALANCED";
+
+
+    if (
+        currentDelta > 0 &&
+        deltaChange > 0
+    ) {
+
+        control =
+            "BUYERS IN CONTROL";
+
+    }
+
+    else if (
+        currentDelta < 0 &&
+        deltaChange < 0
+    ) {
+
+        control =
+            "SELLERS IN CONTROL";
+
+    }
+
+    else if (
+        currentDelta > 0
+    ) {
+
+        control =
+            "BUYERS ACTIVE";
+
+    }
+
+    else if (
+        currentDelta < 0
+    ) {
+
+        control =
+            "SELLERS ACTIVE";
 
     }
 
@@ -995,6 +1082,8 @@ function analyzeDelta(
 
         pressure,
 
+        control,
+
         bullishPoints,
 
         bearishPoints
@@ -1007,12 +1096,9 @@ function analyzeDelta(
 //======================================================
 // DELTA RELATIONSHIP
 //
-// 3H = BROADER ORDER FLOW
-// 30M = CURRENT ORDER FLOW
+// INFORMATIONAL ONLY.
 //
-// This is INFORMATIONAL.
-//
-// Alignment is NOT required.
+// Alignment is NOT required for a coin to appear.
 //======================================================
 
 function getDeltaAlignment(
@@ -1030,9 +1116,11 @@ function getDeltaAlignment(
             alignment:
                 "INSUFFICIENT DATA",
 
-            bullishPoints: 0,
+            bullishPoints:
+                0,
 
-            bearishPoints: 0
+            bearishPoints:
+                0
 
         };
 
@@ -1055,10 +1143,6 @@ function getDeltaAlignment(
         delta30M.deltaChange < 0;
 
 
-    //==================================================
-    // BOTH IMPROVING
-    //==================================================
-
     if (
         bullish3H &&
         bullish30M
@@ -1067,10 +1151,10 @@ function getDeltaAlignment(
         return {
 
             alignment:
-                "3H + 30M BUYING PRESSURE",
+                "3H + 30M BULLISH",
 
             bullishPoints:
-                20,
+                10,
 
             bearishPoints:
                 0
@@ -1080,10 +1164,6 @@ function getDeltaAlignment(
     }
 
 
-    //==================================================
-    // BOTH SELLING
-    //==================================================
-
     if (
         bearish3H &&
         bearish30M
@@ -1092,22 +1172,18 @@ function getDeltaAlignment(
         return {
 
             alignment:
-                "3H + 30M SELLING PRESSURE",
+                "3H + 30M BEARISH",
 
             bullishPoints:
                 0,
 
             bearishPoints:
-                20
+                10
 
         };
 
     }
 
-
-    //==================================================
-    // 3H BUYING / 30M SELLING
-    //==================================================
 
     if (
         bullish3H &&
@@ -1117,22 +1193,18 @@ function getDeltaAlignment(
         return {
 
             alignment:
-                "3H BUYING / 30M SELLING",
+                "30M BEARISH / 3H BULLISH",
 
             bullishPoints:
-                10,
+                0,
 
             bearishPoints:
-                10
+                0
 
         };
 
     }
 
-
-    //==================================================
-    // 3H SELLING / 30M BUYING
-    //==================================================
 
     if (
         bearish3H &&
@@ -1142,13 +1214,13 @@ function getDeltaAlignment(
         return {
 
             alignment:
-                "3H SELLING / 30M BUYING",
+                "30M BULLISH / 3H BEARISH",
 
             bullishPoints:
-                10,
+                0,
 
             bearishPoints:
-                10
+                0
 
         };
 
@@ -1170,163 +1242,23 @@ function getDeltaAlignment(
 
 }
 
-
-//======================================================
-// OBV
-//======================================================
-
-function calculateOBV(
-    candles
-) {
-
-    if (
-        !candles ||
-        candles.length < 2
-    ) {
-
-        return 0;
-
-    }
-
-
-    let obv = 0;
-
-
-    for (
-        let i = 1;
-        i < candles.length;
-        i++
-    ) {
-
-        if (
-            candles[i].close >
-            candles[i - 1].close
-        ) {
-
-            obv +=
-                candles[i].volume;
-
-        }
-
-        else if (
-            candles[i].close <
-            candles[i - 1].close
-        ) {
-
-            obv -=
-                candles[i].volume;
-
-        }
-
-    }
-
-
-    return obv;
-
-}
-
-
-//======================================================
-// ATR LOCATION
-//======================================================
-
-function getATRLocation(
-    price,
-    atr,
-    dailyHigh,
-    dailyLow
-) {
-
-    const distLow =
-        price -
-        dailyLow;
-
-
-    const distHigh =
-        dailyHigh -
-        price;
-
-
-    //==================================================
-    // NEAR ATR LOW
-    //==================================================
-
-    if (
-        distLow >= 0 &&
-        distLow <= atr * 0.5
-    ) {
-
-        return {
-
-            location:
-                "NEAR ATR LOW",
-
-            bullishPoints:
-                20,
-
-            bearishPoints:
-                0
-
-        };
-
-    }
-
-
-    //==================================================
-    // NEAR ATR HIGH
-    //==================================================
-
-    if (
-        distHigh >= 0 &&
-        distHigh <= atr * 0.5
-    ) {
-
-        return {
-
-            location:
-                "NEAR ATR HIGH",
-
-            bullishPoints:
-                0,
-
-            bearishPoints:
-                20
-
-        };
-
-    }
-
-
-    return {
-
-        location:
-            "MID RANGE",
-
-        bullishPoints:
-            0,
-
-        bearishPoints:
-            0
-
-    };
-
-}
-
 //======================================================
 // CALCULATE COIN SCORE
 //
 // INFORMATIONAL ORDER-FLOW MODEL
 //
-// 3H Delta  = broader order-flow context
-// 30M Delta = current order-flow pressure
+// 30M = CURRENT ORDER FLOW
+// 3H  = BROADER ORDER FLOW
+// 2H STC = SUPPORTING MOMENTUM
+// 2H OBV = VOLUME PRESSURE
+// ATR = PRICE LOCATION
 //
 // IMPORTANT:
 //
 // • Alignment is NOT required
 // • Crossover is NOT required
 // • Delta direction is NOT required
-// • STC/OBV/ATR are supporting information
-// • Score is ONLY used to rank Top 7
+// • Score is ONLY for ranking
 //======================================================
 
 async function calculateCoinScore(
@@ -1335,20 +1267,13 @@ async function calculateCoinScore(
 
     try {
 
-        //================================================
-        // INITIAL VALUES
-        //================================================
+        let bullishScore = 0;
 
-        let bullishScore =
-            0;
-
-        let bearishScore =
-            0;
+        let bearishScore = 0;
 
 
         let delta30M =
             null;
-
 
         let delta3H =
             null;
@@ -1408,7 +1333,7 @@ async function calculateCoinScore(
 
         if (
             candles30M &&
-            candles30M.length >= 20
+            candles30M.length >= 3
         ) {
 
             const closed30M =
@@ -1418,33 +1343,41 @@ async function calculateCoinScore(
                 );
 
 
-            currentPrice =
-                closed30M[
-                    closed30M.length - 1
-                ].close;
-
-
-            const delta30MSeries =
-                calculateCumulativeDelta(
-                    closed30M
-                );
-
-
-            delta30M =
-                analyzeDelta(
-                    delta30MSeries
-                );
-
-
             if (
-                delta30M
+                closed30M.length >= 2
             ) {
 
-                bullishScore +=
-                    delta30M.bullishPoints;
+                currentPrice =
+                    Number(
+                        closed30M[
+                            closed30M.length - 1
+                        ].close
+                    );
 
-                bearishScore +=
-                    delta30M.bearishPoints;
+
+                const delta30MSeries =
+                    calculateCumulativeDelta(
+                        closed30M
+                    );
+
+
+                delta30M =
+                    analyzeDelta(
+                        delta30MSeries
+                    );
+
+
+                if (
+                    delta30M
+                ) {
+
+                    bullishScore +=
+                        delta30M.bullishPoints;
+
+                    bearishScore +=
+                        delta30M.bearishPoints;
+
+                }
 
             }
 
@@ -1465,7 +1398,7 @@ async function calculateCoinScore(
 
         if (
             candles3H &&
-            candles3H.length >= 20
+            candles3H.length >= 3
         ) {
 
             const closed3H =
@@ -1475,31 +1408,40 @@ async function calculateCoinScore(
                 );
 
 
-            const delta3HSeries =
-                calculateCumulativeDelta(
-                    closed3H
-                );
-
-
-            delta3H =
-                analyzeDelta(
-                    delta3HSeries
-                );
-
-
             if (
-                delta3H
+                closed3H.length >= 2
             ) {
 
-                bullishScore +=
-                    Math.floor(
-                        delta3H.bullishPoints / 2
+                const delta3HSeries =
+                    calculateCumulativeDelta(
+                        closed3H
                     );
 
-                bearishScore +=
-                    Math.floor(
-                        delta3H.bearishPoints / 2
+
+                delta3H =
+                    analyzeDelta(
+                        delta3HSeries
                     );
+
+
+                if (
+                    delta3H
+                ) {
+
+                    // 3H gets half the
+                    // Delta weight.
+
+                    bullishScore +=
+                        Math.floor(
+                            delta3H.bullishPoints / 2
+                        );
+
+                    bearishScore +=
+                        Math.floor(
+                            delta3H.bearishPoints / 2
+                        );
+
+                }
 
             }
 
@@ -1509,9 +1451,7 @@ async function calculateCoinScore(
         //================================================
         // DELTA RELATIONSHIP
         //
-        // INFORMATIONAL ONLY.
-        //
-        // It does NOT filter coins.
+        // Informational only.
         //================================================
 
         if (
@@ -1524,7 +1464,6 @@ async function calculateCoinScore(
                     delta3H,
                     delta30M
                 );
-
 
             bullishScore +=
                 deltaAlignment.bullishPoints;
@@ -1561,11 +1500,13 @@ async function calculateCoinScore(
 
             const closes2H =
                 closed2H.map(
-                    c => c.close
+                    c =>
+                        Number(c.close)
                 );
 
 
-            const stcSeries = [];
+            const stcSeries =
+                [];
 
 
             for (
@@ -1592,11 +1533,14 @@ async function calculateCoinScore(
 
 
                 if (
-                    value !== null
+                    value !== null &&
+                    Number.isFinite(
+                        Number(value)
+                    )
                 ) {
 
                     stcSeries.push(
-                        value
+                        Number(value)
                     );
 
                 }
@@ -1664,7 +1608,7 @@ async function calculateCoinScore(
 
         if (
             candles2H &&
-            candles2H.length >= 50
+            candles2H.length >= 3
         ) {
 
             const closed2H =
@@ -1674,51 +1618,57 @@ async function calculateCoinScore(
                 );
 
 
-            const previousOBV =
-                calculateOBV(
-                    closed2H.slice(
-                        0,
-                        -1
-                    )
-                );
-
-
-            const currentOBV =
-                calculateOBV(
-                    closed2H
-                );
-
-
             if (
-                currentOBV >
-                previousOBV
+                closed2H.length >= 2
             ) {
 
-                bullishScore +=
-                    20;
+                const previousOBV =
+                    calculateOBV(
+                        closed2H.slice(
+                            0,
+                            -1
+                        )
+                    );
 
-                obvSignal =
-                    "BUYING PRESSURE";
 
-            }
+                const currentOBV =
+                    calculateOBV(
+                        closed2H
+                    );
 
-            else if (
-                currentOBV <
-                previousOBV
-            ) {
 
-                bearishScore +=
-                    20;
+                if (
+                    currentOBV >
+                    previousOBV
+                ) {
 
-                obvSignal =
-                    "SELLING PRESSURE";
+                    bullishScore +=
+                        20;
 
-            }
+                    obvSignal =
+                        "BUYING PRESSURE";
 
-            else {
+                }
 
-                obvSignal =
-                    "BALANCED";
+                else if (
+                    currentOBV <
+                    previousOBV
+                ) {
+
+                    bearishScore +=
+                        20;
+
+                    obvSignal =
+                        "SELLING PRESSURE";
+
+                }
+
+                else {
+
+                    obvSignal =
+                        "BALANCED";
+
+                }
 
             }
 
@@ -1732,7 +1682,8 @@ async function calculateCoinScore(
         if (
             candles30M &&
             candles30M.length >= 20 &&
-            currentPrice !== null
+            currentPrice !== null &&
+            Number.isFinite(currentPrice)
         ) {
 
             const closed30M =
@@ -1779,9 +1730,13 @@ async function calculateCoinScore(
 
                             atr,
 
-                            previousDay.high,
+                            Number(
+                                previousDay.high
+                            ),
 
-                            previousDay.low
+                            Number(
+                                previousDay.low
+                            )
 
                         );
 
@@ -1802,9 +1757,7 @@ async function calculateCoinScore(
         //================================================
         // FINAL DIRECTION
         //
-        // ONLY FOR RANKING.
-        //
-        // NOT A TRADING SIGNAL.
+        // ONLY USED FOR RANKING.
         //================================================
 
         let direction =
@@ -1865,7 +1818,6 @@ async function calculateCoinScore(
 
     }
 
-
     catch (err) {
 
         log(
@@ -1875,9 +1827,6 @@ async function calculateCoinScore(
         );
 
 
-        // One coin failing must NOT
-        // stop the entire scanner.
-
         return null;
 
     }
@@ -1886,7 +1835,21 @@ async function calculateCoinScore(
 
 
 //======================================================
-// GENERATE TOP 7 COIN ORDER FLOW REPORT
+// GENERATE COIN ORDER FLOW REPORT
+//
+// IMPORTANT:
+//
+// This ALWAYS attempts to show the strongest
+// 7 coins from all successfully scanned coins.
+//
+// It does NOT require:
+//
+// • 3H/30M alignment
+// • Delta crossover
+// • Bullish Delta
+// • Bearish Delta
+//
+// The report is informational.
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1902,18 +1865,18 @@ async function generateCoinScoreReport() {
         const symbol of COIN_LIST
     ) {
 
-        const coin =
+        const score =
             await calculateCoinScore(
                 symbol
             );
 
 
         if (
-            coin
+            score
         ) {
 
             results.push(
-                coin
+                score
             );
 
         }
@@ -1922,43 +1885,41 @@ async function generateCoinScoreReport() {
 
 
     //==================================================
-    // RANK ALL COINS
+    // TOP 7
     //
-    // The score is ONLY used to determine
-    // which 7 coins have the strongest
-    // overall order-flow information.
+    // Rank by the strength of the directional
+    // difference between bullish and bearish scores.
     //
-    // Alignment is NOT required.
+    // This ensures that the report is not dependent
+    // on having separate bullish/bearish lists.
     //==================================================
 
     const top7 =
         results
-
             .sort(
                 (a, b) => {
 
-                    const scoreA =
-                        Math.max(
-                            a.bullishScore || 0,
-                            a.bearishScore || 0
+                    const strengthA =
+                        Math.abs(
+                            a.bullishScore -
+                            a.bearishScore
                         );
 
 
-                    const scoreB =
-                        Math.max(
-                            b.bullishScore || 0,
-                            b.bearishScore || 0
+                    const strengthB =
+                        Math.abs(
+                            b.bullishScore -
+                            b.bearishScore
                         );
 
 
                     return (
-                        scoreB -
-                        scoreA
+                        strengthB -
+                        strengthA
                     );
 
                 }
             )
-
             .slice(
                 0,
                 7
@@ -1966,7 +1927,7 @@ async function generateCoinScoreReport() {
 
 
     //==================================================
-    // MESSAGE HEADER
+    // HEADER
     //==================================================
 
     let msg =
@@ -1982,7 +1943,7 @@ async function generateCoinScoreReport() {
 
 
     //==================================================
-    // DISPLAY TOP 7
+    // TOP 7 DISPLAY
     //==================================================
 
     if (
@@ -1995,53 +1956,95 @@ async function generateCoinScoreReport() {
                 const d30 =
                     coin.delta30M;
 
-
                 const d3 =
                     coin.delta3H;
-
-
-                msg +=
-`${index + 1}. *${coin.symbol}*
-
-`;
 
 
                 //========================================
                 // 30M ORDER FLOW
                 //========================================
 
-                msg +=
-`⚡ *30M ORDER FLOW*
-`;
+                let orderFlowIcon =
+                    "⚪";
+
+                let orderFlowText =
+                    "DATA UNAVAILABLE";
+
+                let deltaText =
+                    "N/A";
+
+                let trendText =
+                    "N/A";
 
 
                 if (
                     d30
                 ) {
 
-                    const icon =
+                    deltaText =
+                        d30.currentDelta
+                            .toFixed(0);
+
+                    trendText =
+                        d30.trend;
+
+
+                    if (
+                        d30.control ===
+                        "BUYERS IN CONTROL"
+                    ) {
+
+                        orderFlowIcon =
+                            "🟢";
+
+                        orderFlowText =
+                            "BUYERS IN CONTROL";
+
+                    }
+
+                    else if (
+                        d30.control ===
+                        "SELLERS IN CONTROL"
+                    ) {
+
+                        orderFlowIcon =
+                            "🔴";
+
+                        orderFlowText =
+                            "SELLERS IN CONTROL";
+
+                    }
+
+                    else if (
                         d30.currentDelta > 0
-                            ? "🟢"
-                            : d30.currentDelta < 0
-                                ? "🔴"
-                                : "⚪";
+                    ) {
 
+                        orderFlowIcon =
+                            "🟢";
 
-                    msg +=
-`${icon} *${d30.pressure}*
-Delta: ${d30.currentDelta.toFixed(0)}
-${d30.trend}
+                        orderFlowText =
+                            "BUYERS ACTIVE";
 
-`;
+                    }
 
-                }
+                    else if (
+                        d30.currentDelta < 0
+                    ) {
 
-                else {
+                        orderFlowIcon =
+                            "🔴";
 
-                    msg +=
-`⚪ *DATA UNAVAILABLE*
+                        orderFlowText =
+                            "SELLERS ACTIVE";
 
-`;
+                    }
+
+                    else {
+
+                        orderFlowText =
+                            "BALANCED";
+
+                    }
 
                 }
 
@@ -2050,112 +2053,101 @@ ${d30.trend}
                 // 3H BROADER FLOW
                 //========================================
 
-                msg +=
-`📊 *3H BROADER FLOW*
-`;
+                let broaderIcon =
+                    "⚪";
+
+                let broaderDelta =
+                    "N/A";
+
+                let broaderTrend =
+                    "N/A";
 
 
                 if (
                     d3
                 ) {
 
-                    const icon =
+                    broaderDelta =
+                        d3.currentDelta
+                            .toFixed(0);
+
+                    broaderTrend =
+                        d3.trend;
+
+
+                    if (
                         d3.currentDelta > 0
-                            ? "🟢"
-                            : d3.currentDelta < 0
-                                ? "🔴"
-                                : "⚪";
+                    ) {
 
+                        broaderIcon =
+                            "🟢";
 
-                    msg +=
-`${icon} ${d3.currentDelta.toFixed(0)}
-${d3.trend}
+                    }
 
-`;
+                    else if (
+                        d3.currentDelta < 0
+                    ) {
 
-                }
+                        broaderIcon =
+                            "🔴";
 
-                else {
-
-                    msg +=
-`⚪ DATA UNAVAILABLE
-
-`;
+                    }
 
                 }
 
-
-                //========================================
-                // DELTA RELATIONSHIP
-                //========================================
 
                 msg +=
-`🔗 *DELTA RELATIONSHIP*
+
+`${index + 1}. *${coin.symbol}*
+
+${orderFlowIcon} *30M ORDER FLOW*
+${orderFlowText}
+Delta: ${deltaText}
+${trendText}
+
+${broaderIcon} *3H BROADER FLOW*
+${broaderDelta}
+${broaderTrend}
+
+🔗 *DELTA RELATIONSHIP*
 ${coin.deltaAlignment.alignment}
 
-`;
-
-
-                //========================================
-                // STC
-                //========================================
-
-                msg +=
-`⚡ *2H STC*
+⚡ *2H STC*
 ${coin.stcSignal}
 
-`;
-
-
-                //========================================
-                // OBV
-                //========================================
-
-                msg +=
-`📈 *2H OBV*
+📈 *2H OBV*
 ${coin.obvSignal}
 
-`;
-
-
-                //========================================
-                // ATR
-                //========================================
-
-                msg +=
-`📍 *ATR LOCATION*
+📍 *ATR LOCATION*
 ${coin.atrLocation}
 
-`;
-
-
-                //========================================
-                // SEPARATOR
-                //========================================
-
-                if (
-                    index <
-                    top7.length - 1
-                ) {
-
-                    msg +=
-`━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━
 
 `;
-
-                }
 
             }
         );
 
     }
 
+
+    //==================================================
+    // NO DATA
+    //==================================================
+
     else {
 
         msg +=
 `⚪ *NO DATA AVAILABLE*
 
-The scanner is still monitoring all coins.`;
+The scanner is still monitoring all coins.
+
+Possible causes:
+• Futures kline request failed
+• COIN_LIST is empty
+• Exchange data unavailable
+
+`;
 
     }
 
@@ -2169,10 +2161,8 @@ The scanner is still monitoring all coins.`;
     ) {
 
         msg +=
-`
-━━━━━━━━━━━━━━━━━━━━
 
-📌 *ORDER FLOW GUIDE*
+`📌 *ORDER FLOW GUIDE*
 
 🟢 Higher Positive = buying strengthening
 🟢 Higher Negative = selling weakening
@@ -2185,6 +2175,7 @@ The scanner is still monitoring all coins.`;
 
 The Top 7 ranking is informational only.
 3H/30M alignment is NOT required.
+
 `;
 
     }
