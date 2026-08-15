@@ -628,37 +628,43 @@ setInterval(async () => {
 // • Delta crossover
 // • 30M/3H relationship
 // • Delta alignment filter
+// • Directional filtering
 //
 // REPORT INTERVAL = 30 MINUTES
 //
 // PURPOSE:
 //
-// This is an INFORMATIONAL order-flow report.
-//
-// It tells the trader whether buyers or sellers
-// are currently exerting greater volume pressure.
+// INFORMATIONAL ORDER-FLOW REPORT
 //
 // 30M = CURRENT ORDER FLOW
 // 3H  = BROADER ORDER FLOW
+//
+// The report tells the trader whether the
+// current completed candle data shows buyers
+// or sellers exerting greater volume pressure.
+//
+// IMPORTANT:
+//
+// This cumulative delta is a candle-volume proxy:
+//
+// Green candle = positive volume
+// Red candle   = negative volume
+//
+// It is NOT true aggressive buy/sell trade delta.
 //======================================================
 
 
 //======================================================
 // CUMULATIVE DELTA
 //
-// Green candle = positive volume
-// Red candle   = negative volume
-//
 // IMPORTANT:
 //
-// We intentionally do NOT use session filtering here.
+// No session filtering is used.
 //
-// The supplied candles are used directly.
+// The supplied candles are processed directly.
 //
-// This makes the calculation independent of
-// SESSION_START_HOUR and avoids the previous
-// "NO DATA AVAILABLE" problem caused by session
-// filtering.
+// This means the calculation is independent of
+// SESSION_START_HOUR.
 //======================================================
 
 function calculateCumulativeDelta(candles) {
@@ -702,9 +708,10 @@ function calculateCumulativeDelta(candles) {
 
         }
 
+        // Do nothing when:
+        //
+        // candle.close === candle.open
 
-        // Do nothing for a candle where
-        // close === open.
 
         cumulativeDelta.push(
             delta
@@ -730,22 +737,7 @@ function calculateCumulativeDelta(candles) {
 // • Lower Positive
 // • Higher Negative
 // • Lower Negative
-//
-// IMPORTANT:
-//
-// The terminology:
-//
-// HIGHER POSITIVE
-// = Delta is positive and increasing.
-//
-// LOWER POSITIVE
-// = Delta is still positive but decreasing.
-//
-// LOWER NEGATIVE
-// = Delta is negative and becoming more negative.
-//
-// HIGHER NEGATIVE
-// = Delta is negative but moving upward toward zero.
+// • Buyers/Sellers in control
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
@@ -918,19 +910,38 @@ function analyzeDelta(cumulativeDelta) {
 //
 // IMPORTANT:
 //
-// • No alignment requirement
-// • No crossover requirement
+// • No scoring
+// • No alignment
+// • No crossover
 // • No STC
 // • No OBV
 // • No ATR
 // • No EMA
 //
-// A coin only needs valid Delta data.
+// A coin qualifies as long as valid 30M Delta
+// data is available.
+//
+// 3H is informational only.
+//
+// The 3H calculation uses completed historical
+// 3H candles immediately.
+//
+// It does NOT wait for three hours after startup.
+//
+// Once running:
+//
+// 30M → updates every 30 minutes
+// 3H  → changes only when a new 3H candle closes
 //======================================================
 
 async function calculateCoinScore(symbol) {
 
     try {
+
+        let delta30M = null;
+
+        let delta3H = null;
+
 
         //================================================
         // 30M DATA
@@ -958,7 +969,9 @@ async function calculateCoinScore(symbol) {
         }
 
 
-        // Remove currently forming candle.
+        //================================================
+        // REMOVE CURRENTLY FORMING 30M CANDLE
+        //================================================
 
         const closed30M =
             candles30M.slice(
@@ -971,10 +984,18 @@ async function calculateCoinScore(symbol) {
             closed30M.length < 2
         ) {
 
+            log(
+                `Not enough completed 30M candles for ${symbol}`
+            );
+
             return null;
 
         }
 
+
+        //================================================
+        // CALCULATE 30M DELTA
+        //================================================
 
         const delta30MSeries =
             calculateCumulativeDelta(
@@ -982,7 +1003,7 @@ async function calculateCoinScore(symbol) {
             );
 
 
-        const delta30M =
+        delta30M =
             analyzeDelta(
                 delta30MSeries
             );
@@ -1001,6 +1022,21 @@ async function calculateCoinScore(symbol) {
 
         //================================================
         // 3H DATA
+        //
+        // 3H = BROADER ORDER-FLOW CONTEXT
+        //
+        // IMPORTANT:
+        //
+        // We use historical 3H candles supplied by
+        // the exchange.
+        //
+        // We remove ONLY the currently forming
+        // 3H candle.
+        //
+        // Therefore historical completed candles
+        // are available immediately.
+        //
+        // We do NOT wait three hours after startup.
         //================================================
 
         const candles3H =
@@ -1011,13 +1047,12 @@ async function calculateCoinScore(symbol) {
             );
 
 
-        let delta3H = null;
-
-
         if (
             candles3H &&
             candles3H.length >= 3
         ) {
+
+            // Remove currently forming 3H candle.
 
             const closed3H =
                 candles3H.slice(
@@ -1025,6 +1060,10 @@ async function calculateCoinScore(symbol) {
                     -1
                 );
 
+
+            // Need at least two completed candles
+            // because analyzeDelta() compares the
+            // current Delta with the previous Delta.
 
             if (
                 closed3H.length >= 2
@@ -1043,15 +1082,34 @@ async function calculateCoinScore(symbol) {
 
             }
 
+            else {
+
+                log(
+                    `Not enough completed 3H candles for ${symbol}`
+                );
+
+            }
+
+        }
+
+        else {
+
+            log(
+                `3H data unavailable for ${symbol}`
+            );
+
         }
 
 
         //================================================
         // 30M ORDER-FLOW STRENGTH
         //
-        // Used ONLY to rank the Top 7.
+        // Used ONLY for Top 7 ranking.
         //
-        // It is not a trading signal.
+        // Stronger absolute change in the latest
+        // completed 30M Delta = higher ranking.
+        //
+        // This is NOT a trading signal.
         //================================================
 
         const orderFlowStrength =
@@ -1064,6 +1122,8 @@ async function calculateCoinScore(symbol) {
         // 3H BROADER STRENGTH
         //
         // Informational only.
+        //
+        // Not used for ranking.
         //================================================
 
         const broaderStrength =
@@ -1097,10 +1157,12 @@ async function calculateCoinScore(symbol) {
 
     catch (err) {
 
+        //================================================
         // IMPORTANT:
         //
-        // One failed coin must NOT stop
-        // the entire scanner.
+        // One failed coin must NOT stop the
+        // entire scanner.
+        //================================================
 
         log(
             `Order Flow Error ${symbol}: ${
@@ -1114,6 +1176,7 @@ async function calculateCoinScore(symbol) {
     }
 
 }
+
 
 //======================================================
 // GENERATE COIN ORDER FLOW REPORT
@@ -1129,11 +1192,14 @@ async function calculateCoinScore(symbol) {
 // Every coin with valid 30M Delta data can
 // qualify for the Top 7.
 //
-// Ranking:
+// RANKING:
 //
 // Strongest 30M Delta CHANGE first.
 //
-// This is only for presentation.
+// 3H is NOT used to rank the coins.
+//
+// This keeps the Top 7 focused on CURRENT
+// order-flow activity.
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1185,7 +1251,7 @@ async function generateCoinScoreReport() {
         //================================================
         // TOP 7
         //
-        // Ranked by 30M Delta movement.
+        // Ranked by absolute 30M Delta movement.
         //================================================
 
         const top7 =
@@ -1311,7 +1377,11 @@ ${d30.trend}
 📊 *3H BROADER FLOW*
 ${
     d3
-        ? `${d3.currentDelta >= 0 ? "🟢" : "🔴"} ${d3.currentDelta.toFixed(0)}
+        ? `${
+            d3.currentDelta >= 0
+                ? "🟢"
+                : "🔴"
+        } ${d3.currentDelta.toFixed(0)}
 ${d3.control}
 ${d3.trend}`
         : "⚪ DATA UNAVAILABLE"
@@ -1320,7 +1390,9 @@ ${d3.trend}`
 `;
 
 
-                    // Separator between coins.
+                    //================================================
+                    // SEPARATOR
+                    //================================================
 
                     if (
                         index <
