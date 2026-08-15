@@ -1730,6 +1730,22 @@ async function calculateCoinScore(
 
 //======================================================
 // GENERATE COIN DEPLOYMENT REPORT
+//
+// IMPORTANT:
+//
+// This report is INFORMATIONAL.
+//
+// It does NOT require:
+// • 3H and 30M Delta alignment
+// • A Delta crossover
+// • A specific Delta direction
+//
+// The purpose is to show the current order flow
+// across the scanned coins so the trader can make
+// an informed decision.
+//
+// 3H Delta  = broader order-flow context
+// 30M Delta = shorter-term order-flow pressure
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1763,7 +1779,12 @@ async function generateCoinScoreReport() {
 
 
     //==================================================
-    // TOP BULLISH
+    // SORT BULLISH
+    //
+    // This is ONLY for presentation.
+    //
+    // It does NOT mean the coin must have
+    // aligned Delta.
     //==================================================
 
     const bullish =
@@ -1772,8 +1793,8 @@ async function generateCoinScoreReport() {
 
             .filter(
                 coin =>
-                    coin.direction ===
-                    "BULLISH"
+                    coin.bullishScore >
+                    coin.bearishScore
             )
 
             .sort(
@@ -1789,7 +1810,7 @@ async function generateCoinScoreReport() {
 
 
     //==================================================
-    // TOP BEARISH
+    // SORT BEARISH
     //==================================================
 
     const bearish =
@@ -1798,8 +1819,8 @@ async function generateCoinScoreReport() {
 
             .filter(
                 coin =>
-                    coin.direction ===
-                    "BEARISH"
+                    coin.bearishScore >
+                    coin.bullishScore
             )
 
             .sort(
@@ -1819,14 +1840,17 @@ async function generateCoinScoreReport() {
     //==================================================
 
     let msg =
-`⚡ *COIN DEPLOYMENT REPORT*
+`⚡ *COIN ORDER FLOW REPORT*
 🕐 30-MINUTE UPDATE
+
+📊 3H = BROADER ORDER FLOW
+⚡ 30M = SHORT-TERM ORDER FLOW
 
 `;
 
 
     //==================================================
-    // BULLISH
+    // BULLISH ORDER FLOW
     //==================================================
 
     if (
@@ -1834,7 +1858,7 @@ async function generateCoinScoreReport() {
     ) {
 
         msg +=
-`🟢 *TOP BULLISH CANDIDATES*
+`🟢 *BULLISH ORDER FLOW*
 
 `;
 
@@ -1864,7 +1888,7 @@ ${d30.currentDelta >= 0 ? "🟢" : "🔴"} ${d30.currentDelta.toFixed(0)}
 ${d30.trend}
 ${d30.pressure}
 
-🔗 *DELTA ALIGNMENT*
+🔗 *DELTA RELATIONSHIP*
 ${coin.deltaAlignment.alignment}
 
 ⚡ *2H STC*
@@ -1885,7 +1909,7 @@ ${coin.atrLocation}
 
 
     //==================================================
-    // BEARISH
+    // BEARISH ORDER FLOW
     //==================================================
 
     if (
@@ -1893,7 +1917,7 @@ ${coin.atrLocation}
     ) {
 
         msg +=
-`🔴 *TOP BEARISH CANDIDATES*
+`🔴 *BEARISH ORDER FLOW*
 
 `;
 
@@ -1923,7 +1947,7 @@ ${d30.currentDelta >= 0 ? "🟢" : "🔴"} ${d30.currentDelta.toFixed(0)}
 ${d30.trend}
 ${d30.pressure}
 
-🔗 *DELTA ALIGNMENT*
+🔗 *DELTA RELATIONSHIP*
 ${coin.deltaAlignment.alignment}
 
 ⚡ *2H STC*
@@ -1944,18 +1968,117 @@ ${coin.atrLocation}
 
 
     //==================================================
-    // NO CANDIDATES
+    // BALANCED / MIXED ORDER FLOW
+    //
+    // These coins are important because they may
+    // show a transition between bullish and bearish
+    // conditions.
     //==================================================
 
+    const balanced =
+
+        results
+
+            .filter(
+                coin =>
+                    coin.bullishScore ===
+                    coin.bearishScore
+            )
+
+            .slice(
+                0,
+                5
+            );
+
+
     if (
-        bullish.length === 0 &&
-        bearish.length === 0
+        balanced.length
     ) {
 
         msg +=
-`⚪ No strong Delta candidates found.
+`⚪ *BALANCED / MIXED ORDER FLOW*
+
+`;
+
+        balanced.forEach(
+            (coin, index) => {
+
+                const d3 =
+                    coin.delta3H;
+
+                const d30 =
+                    coin.delta30M;
+
+
+                msg +=
+
+`${index + 1}. *${coin.symbol}*
+
+📊 3H Delta
+${d3.currentDelta >= 0 ? "🟢" : "🔴"} ${d3.currentDelta.toFixed(0)}
+${d3.trend}
+${d3.pressure}
+
+⚡ 30M Delta
+${d30.currentDelta >= 0 ? "🟢" : "🔴"} ${d30.currentDelta.toFixed(0)}
+${d30.trend}
+${d30.pressure}
+
+🔗 ${coin.deltaAlignment.alignment}
+
+⚡ STC: ${coin.stcSignal}
+📈 OBV: ${coin.obvSignal}
+📍 ATR: ${coin.atrLocation}
+
+`;
+
+            }
+        );
+
+    }
+
+
+    //==================================================
+    // NO DATA
+    //==================================================
+
+    if (
+        results.length === 0
+    ) {
+
+        msg +=
+`⚪ *NO DATA AVAILABLE*
 
 The scanner is still monitoring all coins.`;
+
+    }
+
+
+    //==================================================
+    // REPORT FOOTER
+    //==================================================
+
+    if (
+        results.length
+    ) {
+
+        msg +=
+`━━━━━━━━━━━━━━━━━━━━
+
+📌 *ORDER FLOW SUMMARY*
+
+3H Delta = broader pressure
+30M Delta = immediate pressure
+
+🟢 Higher Positive = buying strengthening
+🟢 Higher Negative = selling weakening
+🔴 Lower Negative = selling strengthening
+🔴 Lower Positive = buying weakening
+
+🔗 Delta alignment is informational only.
+It is NOT required for a coin to appear in this report.
+
+`;
 
     }
 
