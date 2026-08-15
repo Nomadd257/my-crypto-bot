@@ -1279,6 +1279,19 @@ function getATRLocation(
 
 //======================================================
 // CALCULATE COIN SCORE
+//
+// INFORMATIONAL ORDER-FLOW MODEL
+//
+// 3H Delta  = broader order-flow context
+// 30M Delta = short-term order-flow pressure
+//
+// IMPORTANT:
+//
+// • 3H/30M alignment is NOT required
+// • Delta crossover is NOT required
+// • A coin is NOT rejected because 3H/30M disagree
+// • STC/OBV/ATR are supporting information
+// • Score is used only for ranking
 //======================================================
 
 async function calculateCoinScore(
@@ -1286,6 +1299,55 @@ async function calculateCoinScore(
 ) {
 
     try {
+
+        //================================================
+        // INITIAL VALUES
+        //================================================
+
+        let bullishScore = 0;
+
+        let bearishScore = 0;
+
+
+        let delta30M = null;
+
+        let delta3H = null;
+
+        let deltaAlignment = {
+
+            alignment:
+                "INSUFFICIENT DATA",
+
+            bullishPoints: 0,
+
+            bearishPoints: 0
+
+        };
+
+
+        let stcSignal =
+            "DATA UNAVAILABLE";
+
+
+        let obvSignal =
+            "DATA UNAVAILABLE";
+
+
+        let atrLocation = {
+
+            location:
+                "DATA UNAVAILABLE",
+
+            bullishPoints: 0,
+
+            bearishPoints: 0
+
+        };
+
+
+        let currentPrice =
+            null;
+
 
         //================================================
         // 30M DATA
@@ -1300,36 +1362,46 @@ async function calculateCoinScore(
 
 
         if (
-            !candles30M ||
-            candles30M.length < 20
+            candles30M &&
+            candles30M.length >= 20
         ) {
 
-            return null;
+            const closed30M =
+                candles30M.slice(
+                    0,
+                    -1
+                );
+
+
+            currentPrice =
+                closed30M[
+                    closed30M.length - 1
+                ].close;
+
+
+            const delta30MSeries =
+                calculateCumulativeDelta(
+                    closed30M
+                );
+
+
+            delta30M =
+                analyzeDelta(
+                    delta30MSeries
+                );
+
+
+            if (delta30M) {
+
+                bullishScore +=
+                    delta30M.bullishPoints;
+
+                bearishScore +=
+                    delta30M.bearishPoints;
+
+            }
 
         }
-
-
-        const closed30M =
-            candles30M.slice(
-                0,
-                -1
-            );
-
-
-        const delta30MSeries =
-            calculateCumulativeDelta(
-                closed30M
-            );
-
-
-        const delta30M =
-            analyzeDelta(
-                delta30MSeries
-            );
-
-
-        if (!delta30M)
-            return null;
 
 
         //================================================
@@ -1345,92 +1417,85 @@ async function calculateCoinScore(
 
 
         if (
-            !candles3H ||
-            candles3H.length < 20
+            candles3H &&
+            candles3H.length >= 20
         ) {
 
-            return null;
+            const closed3H =
+                candles3H.slice(
+                    0,
+                    -1
+                );
+
+
+            const delta3HSeries =
+                calculateCumulativeDelta(
+                    closed3H
+                );
+
+
+            delta3H =
+                analyzeDelta(
+                    delta3HSeries
+                );
+
+
+            if (delta3H) {
+
+                //========================================
+                // 3H IS BROADER CONTEXT
+                //
+                // Give it less weight than 30M.
+                //========================================
+
+                bullishScore +=
+                    Math.floor(
+                        delta3H.bullishPoints / 2
+                    );
+
+                bearishScore +=
+                    Math.floor(
+                        delta3H.bearishPoints / 2
+                    );
+
+            }
 
         }
 
 
-        const closed3H =
-            candles3H.slice(
-                0,
-                -1
-            );
-
-
-        const delta3HSeries =
-            calculateCumulativeDelta(
-                closed3H
-            );
-
-
-        const delta3H =
-            analyzeDelta(
-                delta3HSeries
-            );
-
-
-        if (!delta3H)
-            return null;
-
-
         //================================================
-        // DELTA ALIGNMENT
+        // DELTA RELATIONSHIP
+        //
+        // INFORMATIONAL ONLY.
+        //
+        // Alignment is NEVER used as a filter.
         //================================================
 
-        const deltaAlignment =
-            getDeltaAlignment(
-                delta3H,
-                delta30M
-            );
+        if (
+            delta3H &&
+            delta30M
+        ) {
+
+            deltaAlignment =
+                getDeltaAlignment(
+                    delta3H,
+                    delta30M
+                );
 
 
-        //================================================
-        // INITIAL SCORE
-        //================================================
+            bullishScore +=
+                deltaAlignment.bullishPoints;
 
-        let bullishScore =
-            delta30M.bullishPoints;
+            bearishScore +=
+                deltaAlignment.bearishPoints;
 
-        let bearishScore =
-            delta30M.bearishPoints;
-
-
-        // Add broader 3H information
-        bullishScore +=
-            Math.floor(
-                delta3H.bullishPoints / 2
-            );
-
-        bearishScore +=
-            Math.floor(
-                delta3H.bearishPoints / 2
-            );
-
-
-        // Add alignment
-        bullishScore +=
-            deltaAlignment.bullishPoints;
-
-        bearishScore +=
-            deltaAlignment.bearishPoints;
-
-
-        //================================================
-        // CURRENT PRICE
-        //================================================
-
-        const currentPrice =
-            closed30M[
-                closed30M.length - 1
-            ].close;
+        }
 
 
         //================================================
         // 2H STC
+        //
+        // SUPPORTING MOMENTUM INFORMATION
         //================================================
 
         const candles2H =
@@ -1442,108 +1507,108 @@ async function calculateCoinScore(
 
 
         if (
-            !candles2H ||
-            candles2H.length < 50
+            candles2H &&
+            candles2H.length >= 50
         ) {
 
-            return null;
-
-        }
-
-
-        const closed2H =
-            candles2H.slice(
-                0,
-                -1
-            );
-
-
-        const closes2H =
-            closed2H.map(
-                c => c.close
-            );
-
-
-        const stcSeries = [];
-
-
-        for (
-            let i = 0;
-            i < closes2H.length;
-            i++
-        ) {
-
-            const value =
-                calculateSTC(
-
-                    closes2H.slice(
-                        0,
-                        i + 1
-                    ),
-
-                    {
-                        cycle: 4,
-                        fast: 10,
-                        slow: 20
-                    }
-
+            const closed2H =
+                candles2H.slice(
+                    0,
+                    -1
                 );
 
 
-            if (
-                value !== null
-            ) {
-
-                stcSeries.push(
-                    value
+            const closes2H =
+                closed2H.map(
+                    c => c.close
                 );
 
+
+            const stcSeries = [];
+
+
+            for (
+                let i = 0;
+                i < closes2H.length;
+                i++
+            ) {
+
+                const value =
+                    calculateSTC(
+
+                        closes2H.slice(
+                            0,
+                            i + 1
+                        ),
+
+                        {
+                            cycle: 4,
+                            fast: 10,
+                            slow: 20
+                        }
+
+                    );
+
+
+                if (
+                    value !== null
+                ) {
+
+                    stcSeries.push(
+                        value
+                    );
+
+                }
+
             }
-
-        }
-
-
-        let stcSignal =
-            "NEUTRAL";
-
-
-        if (
-            stcSeries.length >= 2
-        ) {
-
-            const previous =
-                stcSeries[
-                    stcSeries.length - 2
-                ];
-
-
-            const current =
-                stcSeries[
-                    stcSeries.length - 1
-                ];
 
 
             if (
-                current >
-                previous
+                stcSeries.length >= 2
             ) {
 
-                bullishScore += 20;
+                const previous =
+                    stcSeries[
+                        stcSeries.length - 2
+                    ];
 
-                stcSignal =
-                    `BULLISH (${current.toFixed(1)})`;
 
-            }
+                const current =
+                    stcSeries[
+                        stcSeries.length - 1
+                    ];
 
-            else if (
-                current <
-                previous
-            ) {
 
-                bearishScore += 20;
+                if (
+                    current >
+                    previous
+                ) {
 
-                stcSignal =
-                    `BEARISH (${current.toFixed(1)})`;
+                    bullishScore += 20;
+
+                    stcSignal =
+                        `BULLISH (${current.toFixed(1)})`;
+
+                }
+
+                else if (
+                    current <
+                    previous
+                ) {
+
+                    bearishScore += 20;
+
+                    stcSignal =
+                        `BEARISH (${current.toFixed(1)})`;
+
+                }
+
+                else {
+
+                    stcSignal =
+                        `FLAT (${current.toFixed(1)})`;
+
+                }
 
             }
 
@@ -1554,112 +1619,149 @@ async function calculateCoinScore(
         // 2H OBV
         //================================================
 
-        let obvSignal =
-            "NEUTRAL";
+        if (
+            candles2H &&
+            candles2H.length >= 50
+        ) {
 
-
-        const previousOBV =
-            calculateOBV(
-                closed2H.slice(
+            const closed2H =
+                candles2H.slice(
                     0,
                     -1
-                )
-            );
+                );
 
 
-        const currentOBV =
-            calculateOBV(
-                closed2H
-            );
+            const previousOBV =
+                calculateOBV(
+                    closed2H.slice(
+                        0,
+                        -1
+                    )
+                );
 
 
-        if (
-            currentOBV >
-            previousOBV
-        ) {
+            const currentOBV =
+                calculateOBV(
+                    closed2H
+                );
 
-            bullishScore += 20;
 
-            obvSignal =
-                "BUYING PRESSURE";
+            if (
+                currentOBV >
+                previousOBV
+            ) {
 
-        }
+                bullishScore += 20;
 
-        else if (
-            currentOBV <
-            previousOBV
-        ) {
+                obvSignal =
+                    "BUYING PRESSURE";
 
-            bearishScore += 20;
+            }
 
-            obvSignal =
-                "SELLING PRESSURE";
+            else if (
+                currentOBV <
+                previousOBV
+            ) {
+
+                bearishScore += 20;
+
+                obvSignal =
+                    "SELLING PRESSURE";
+
+            }
+
+            else {
+
+                obvSignal =
+                    "BALANCED";
+
+            }
 
         }
 
 
         //================================================
-        // ATR
+        // ATR LOCATION
         //================================================
 
-        const atr =
-            calculateATR(
-                closed30M,
-                ATR_PERIOD
-            );
-
-
-        if (!atr)
-            return null;
-
-
-        const daily =
-            await fetchFuturesKlines(
-                symbol,
-                "1d",
-                3
-            );
-
-
         if (
-            !daily ||
-            daily.length < 2
+            candles30M &&
+            candles30M.length >= 20 &&
+            currentPrice !== null
         ) {
 
-            return null;
+            const closed30M =
+                candles30M.slice(
+                    0,
+                    -1
+                );
+
+
+            const atr =
+                calculateATR(
+                    closed30M,
+                    ATR_PERIOD
+                );
+
+
+            if (atr) {
+
+                const daily =
+                    await fetchFuturesKlines(
+                        symbol,
+                        "1d",
+                        3
+                    );
+
+
+                if (
+                    daily &&
+                    daily.length >= 2
+                ) {
+
+                    const previousDay =
+                        daily[
+                            daily.length - 2
+                        ];
+
+
+                    atrLocation =
+                        getATRLocation(
+
+                            currentPrice,
+
+                            atr,
+
+                            previousDay.high,
+
+                            previousDay.low
+
+                        );
+
+
+                    bullishScore +=
+                        atrLocation.bullishPoints;
+
+                    bearishScore +=
+                        atrLocation.bearishPoints;
+
+                }
+
+            }
 
         }
-
-
-        const previousDay =
-            daily[
-                daily.length - 2
-            ];
-
-
-        const atrLocation =
-            getATRLocation(
-                currentPrice,
-                atr,
-                previousDay.high,
-                previousDay.low
-            );
-
-
-        bullishScore +=
-            atrLocation.bullishPoints;
-
-
-        bearishScore +=
-            atrLocation.bearishPoints;
 
 
         //================================================
         // FINAL DIRECTION
+        //
+        // ONLY FOR REPORT ORGANIZATION.
+        //
+        // It is NOT a trading signal.
         //================================================
 
         let direction =
-            "NEUTRAL";
+            "BALANCED";
 
 
         if (
@@ -1697,6 +1799,8 @@ async function calculateCoinScore(
 
             bearishScore,
 
+            currentPrice,
+
             delta3H,
 
             delta30M,
@@ -1721,6 +1825,11 @@ async function calculateCoinScore(
                 err.message
             }`
         );
+
+
+        // IMPORTANT:
+        // One coin failing must NOT stop
+        // the entire scanner.
 
         return null;
 
