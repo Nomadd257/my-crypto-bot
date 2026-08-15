@@ -613,16 +613,17 @@ setInterval(async () => {
 //
 // COMPONENTS
 //
-// • Session Cumulative Delta
-// • EMA(10) of Session Cumulative Delta
-// • 15M Delta/EMA(10) Early Warning
-// • 1H Delta/EMA(10) Confirmation
+// • 3H Cumulative Delta
+// • 30M Cumulative Delta
+// • 3H / 30M Delta Alignment
 // • 2H STC
 // • 2H OBV
 // • ATR Location
 //
-// 15M = Early signal
-// 1H  = Confirmation
+// EMA CROSSOVER REMOVED
+// 15M DELTA REMOVED
+//
+// REPORT INTERVAL = 30 MINUTES
 //
 // Maximum Score = 100
 //======================================================
@@ -637,75 +638,6 @@ const SESSION_START_HOUR = 0;
 
 
 //======================================================
-// 15M CROSSOVER STATE
-//
-//  1 = Delta above EMA
-// -1 = Delta below EMA
-//  0 = unknown
-//
-// Prevents repeated alerts for the same crossover.
-//======================================================
-
-let delta15MState = {};
-
-
-//======================================================
-// EMA
-//======================================================
-
-function calculateEMA(values, period = 5) {
-
-    if (
-        !values ||
-        values.length < period
-    ) {
-        return [];
-    }
-
-    const ema = [];
-
-    const multiplier =
-        2 / (period + 1);
-
-    // First EMA value
-    let previous =
-        values
-            .slice(0, period)
-            .reduce(
-                (sum, value) =>
-                    sum + value,
-                0
-            ) / period;
-
-    // Keep array aligned with values
-    for (let i = 0; i < period - 1; i++) {
-        ema.push(null);
-    }
-
-    ema.push(previous);
-
-    // Calculate remaining EMA values
-    for (
-        let i = period;
-        i < values.length;
-        i++
-    ) {
-
-        previous =
-            previous +
-            (
-                (values[i] - previous)
-                * multiplier
-            );
-
-        ema.push(previous);
-    }
-
-    return ema;
-}
-
-
-//======================================================
 // GET CURRENT SESSION CANDLES
 //======================================================
 
@@ -714,8 +646,11 @@ function getSessionCandles(candles) {
     if (
         !candles ||
         !candles.length
-    )
+    ) {
+
         return [];
+
+    }
 
     const latest =
         new Date(
@@ -724,8 +659,10 @@ function getSessionCandles(candles) {
             ].openTime
         );
 
+
     const sessionStart =
         new Date(latest);
+
 
     sessionStart.setUTCHours(
         SESSION_START_HOUR,
@@ -733,6 +670,7 @@ function getSessionCandles(candles) {
         0,
         0
     );
+
 
     if (
         latest <
@@ -742,350 +680,44 @@ function getSessionCandles(candles) {
         sessionStart.setUTCDate(
             sessionStart.getUTCDate() - 1
         );
+
     }
+
 
     return candles.filter(
         candle =>
             candle.openTime >=
             sessionStart.getTime()
     );
+
 }
 
 
 //======================================================
 // SESSION CUMULATIVE DELTA
 //
-// Green candle = buying volume
-// Red candle   = selling volume
+// Green candle = positive volume
+// Red candle   = negative volume
 //
 // Delta resets at session start.
 //======================================================
 
-function calculateCumulativeDelta(candles) {
-
-    const sessionCandles =
-        getSessionCandles(candles);
-
-    if (
-        sessionCandles.length < 10
-    )
-        return [];
-
-    let delta = 0;
-
-    const cumulative = [];
-
-    for (
-        const candle of sessionCandles
-    ) {
-
-        if (
-            candle.close >
-            candle.open
-        ) {
-
-            delta += candle.volume;
-
-        }
-
-        else if (
-            candle.close <
-            candle.open
-        ) {
-
-            delta -= candle.volume;
-        }
-
-        cumulative.push(delta);
-    }
-
-    return cumulative;
-}
-
-
-//======================================================
-// OBV
-//======================================================
-
-function calculateOBV(candles) {
-
-    if (
-        !candles ||
-        candles.length < 2
-    )
-        return 0;
-
-    let obv = 0;
-
-    for (
-        let i = 1;
-        i < candles.length;
-        i++
-    ) {
-
-        if (
-            candles[i].close >
-            candles[i - 1].close
-        ) {
-
-            obv +=
-                candles[i].volume;
-        }
-
-        else if (
-            candles[i].close <
-            candles[i - 1].close
-        ) {
-
-            obv -=
-                candles[i].volume;
-        }
-    }
-
-    return obv;
-}
-
-
-//======================================================
-// ATR LOCATION
-//======================================================
-
-function getATRLocation(
-    price,
-    atr,
-    dailyHigh,
-    dailyLow
+function calculateCumulativeDelta(
+    candles
 ) {
-
-    const distLow =
-        price - dailyLow;
-
-    const distHigh =
-        dailyHigh - price;
-
-
-    if (
-        distLow >= 0 &&
-        distLow <= atr * 0.5
-    ) {
-
-        return {
-
-            location:
-                "NEAR ATR LOW",
-
-            bullishPoints:
-                20,
-
-            bearishPoints:
-                0
-        };
-    }
-
-
-    if (
-        distHigh >= 0 &&
-        distHigh <= atr * 0.5
-    ) {
-
-        return {
-
-            location:
-                "NEAR ATR HIGH",
-
-            bullishPoints:
-                0,
-
-            bearishPoints:
-                20
-        };
-    }
-
-
-    return {
-
-        location:
-            "MID RANGE",
-
-        bullishPoints:
-            0,
-
-        bearishPoints:
-            0
-    };
-}
-
-
-//======================================================
-// DELTA ANALYSIS
-//
-// Used for the CLOSED 1H candle.
-//
-// Above EMA = buyers
-// Below EMA = sellers
-//
-// The distance from EMA does NOT matter.
-//======================================================
-
-function analyzeDelta(cumulativeDelta) {
-
-    if (
-        !cumulativeDelta ||
-        cumulativeDelta.length < 6
-    ) {
-        return null;
-    }
-
-    const deltaEMA =
-        calculateEMA(
-            cumulativeDelta,
-            5
-        );
-
-    const currentIndex =
-        cumulativeDelta.length - 1;
-
-    const previousIndex =
-        currentIndex - 1;
-
-    const currentDelta =
-        cumulativeDelta[currentIndex];
-
-    const previousDelta =
-        cumulativeDelta[previousIndex];
-
-    const currentEMA =
-        deltaEMA[currentIndex];
-
-    const previousEMA =
-        deltaEMA[previousIndex];
-
-    if (
-        currentEMA === null ||
-        previousEMA === null
-    ) {
-        return null;
-    }
-
-    const bullishCrossover =
-        previousDelta <= previousEMA &&
-        currentDelta > currentEMA;
-
-    const bearishCrossover =
-        previousDelta >= previousEMA &&
-        currentDelta < currentEMA;
-
-    let signal =
-        "BALANCED ORDER FLOW";
-
-    let crossover =
-        "NO NEW 1H CROSSOVER";
-
-    let bullishPoints = 0;
-    let bearishPoints = 0;
-
-    if (
-        currentDelta >
-        currentEMA
-    ) {
-
-        bullishPoints = 40;
-
-        signal =
-            "BUYERS IN CONTROL";
-
-    } else if (
-        currentDelta <
-        currentEMA
-    ) {
-
-        bearishPoints = 40;
-
-        signal =
-            "SELLERS IN CONTROL";
-    }
-
-    if (
-        bullishCrossover
-    ) {
-
-        crossover =
-            "BULLISH CROSSOVER";
-
-    } else if (
-        bearishCrossover
-    ) {
-
-        crossover =
-            "BEARISH CROSSOVER";
-    }
-
-    return {
-
-        signal,
-        crossover,
-
-        currentDelta,
-        previousDelta,
-
-        currentEMA,
-        previousEMA,
-
-        bullishPoints,
-        bearishPoints
-    };
-}
-
-//======================================================
-// 15M DELTA CROSSOVER
-//
-// ONLY CLOSED 15M CANDLES ARE USED.
-//
-// Bullish:
-//
-// Previous Delta <= Previous EMA
-// Current Delta  > Current EMA
-//
-// Bearish:
-//
-// Previous Delta >= Previous EMA
-// Current Delta  < Current EMA
-//
-// Distance from EMA does NOT matter.
-//======================================================
-
-function analyze15MDelta(
-    candles15M
-) {
-
-    if (
-        !candles15M ||
-        candles15M.length < 20
-    ) {
-
-        return null;
-    }
-
-
-    // Remove current forming candle
-
-    const closed15M =
-        candles15M.slice(0, -1);
-
 
     const sessionCandles =
         getSessionCandles(
-            closed15M
+            candles
         );
 
 
-    // EMA(5) needs at least 5 candles
-
     if (
-        sessionCandles.length < 6
+        sessionCandles.length < 3
     ) {
 
-        return null;
+        return [];
+
     }
 
 
@@ -1103,7 +735,8 @@ function analyze15MDelta(
             candle.open
         ) {
 
-            delta += candle.volume;
+            delta +=
+                candle.volume;
 
         }
 
@@ -1112,39 +745,61 @@ function analyze15MDelta(
             candle.open
         ) {
 
-            delta -= candle.volume;
+            delta -=
+                candle.volume;
+
         }
 
-        cumulativeDelta.push(delta);
+
+        cumulativeDelta.push(
+            delta
+        );
+
     }
 
 
-    //==================================================
-    // EMA(5)
-    //==================================================
+    return cumulativeDelta;
 
-    const deltaEMA =
-        calculateEMA(
-            cumulativeDelta,
-            5
-        );
+}
 
+
+//======================================================
+// ANALYZE DELTA
+//
+// This does NOT use EMA.
+//
+// It determines:
+//
+// 1. Current delta
+// 2. Previous delta
+// 3. Whether delta is becoming
+//    more positive
+// 4. Whether delta is becoming
+//    less positive
+// 5. Whether delta is becoming
+//    more negative
+// 6. Whether delta is becoming
+//    less negative
+//
+//======================================================
+
+function analyzeDelta(
+    cumulativeDelta
+) {
 
     if (
-        deltaEMA.length !==
-        cumulativeDelta.length
+        !cumulativeDelta ||
+        cumulativeDelta.length < 2
     ) {
 
         return null;
+
     }
 
 
-    //==================================================
-    // CURRENT CLOSED 15M CANDLE
-    //==================================================
-
     const currentIndex =
         cumulativeDelta.length - 1;
+
 
     const previousIndex =
         currentIndex - 1;
@@ -1155,120 +810,470 @@ function analyze15MDelta(
             currentIndex
         ];
 
+
     const previousDelta =
         cumulativeDelta[
             previousIndex
         ];
 
 
-    const currentEMA =
-        deltaEMA[
-            currentIndex
-        ];
+    const deltaChange =
+        currentDelta -
+        previousDelta;
 
-    const previousEMA =
-        deltaEMA[
-            previousIndex
-        ];
 
+    let trend =
+        "FLAT";
+
+
+    let pressure =
+        "BALANCED";
+
+
+    let bullishPoints = 0;
+
+    let bearishPoints = 0;
+
+
+    //==================================================
+    // POSITIVE DELTA
+    //==================================================
 
     if (
-        currentEMA === null ||
-        previousEMA === null
+        currentDelta > 0
     ) {
 
-        return null;
+        if (
+            currentDelta >
+            previousDelta
+        ) {
+
+            trend =
+                "HIGHER POSITIVE";
+
+            pressure =
+                "BUYING STRENGTHENING";
+
+            bullishPoints = 20;
+
+        }
+
+        else if (
+            currentDelta <
+            previousDelta
+        ) {
+
+            trend =
+                "LOWER POSITIVE";
+
+            pressure =
+                "BUYING WEAKENING";
+
+            bullishPoints = 10;
+
+        }
+
+        else {
+
+            trend =
+                "POSITIVE / FLAT";
+
+            pressure =
+                "BUYING STABLE";
+
+            bullishPoints = 10;
+
+        }
+
     }
 
 
     //==================================================
-    // BULLISH CROSSOVER
-    //
-    // Previous closed candle:
-    // Delta BELOW or AT EMA(5)
-    //
-    // Current closed candle:
-    // Delta ABOVE EMA(5)
+    // NEGATIVE DELTA
     //==================================================
-
-    const bullishCrossover =
-        previousDelta <=
-            previousEMA &&
-        currentDelta >
-            currentEMA;
-
-
-    //==================================================
-    // BEARISH CROSSOVER
-    //
-    // Previous closed candle:
-    // Delta ABOVE or AT EMA(5)
-    //
-    // Current closed candle:
-    // Delta BELOW EMA(5)
-    //==================================================
-
-    const bearishCrossover =
-        previousDelta >=
-            previousEMA &&
-        currentDelta <
-            currentEMA;
-
-
-    //==================================================
-    // CURRENT STATE
-    //==================================================
-
-    const state =
-        currentDelta >
-            currentEMA
-            ? 1
-            : currentDelta <
-              currentEMA
-                ? -1
-                : 0;
-
-
-    let crossover =
-        "NO NEW 15M CROSSOVER";
-
-
-    if (
-        bullishCrossover
-    ) {
-
-        crossover =
-            "BULLISH EARLY WARNING";
-
-    }
 
     else if (
-        bearishCrossover
+        currentDelta < 0
     ) {
 
-        crossover =
-            "BEARISH EARLY WARNING";
+        if (
+            currentDelta <
+            previousDelta
+        ) {
+
+            trend =
+                "LOWER NEGATIVE";
+
+            pressure =
+                "SELLING STRENGTHENING";
+
+            bearishPoints = 20;
+
+        }
+
+        else if (
+            currentDelta >
+            previousDelta
+        ) {
+
+            trend =
+                "HIGHER NEGATIVE";
+
+            pressure =
+                "SELLING WEAKENING";
+
+            bearishPoints = 10;
+
+        }
+
+        else {
+
+            trend =
+                "NEGATIVE / FLAT";
+
+            pressure =
+                "SELLING STABLE";
+
+            bearishPoints = 10;
+
+        }
+
+    }
+
+
+    //==================================================
+    // ZERO / BALANCED
+    //==================================================
+
+    else {
+
+        trend =
+            "AT ZERO";
+
+        pressure =
+            "BALANCED";
+
     }
 
 
     return {
 
-        crossover,
-
-        state,
-
         currentDelta,
-
-        currentEMA,
 
         previousDelta,
 
-        previousEMA,
+        deltaChange,
 
-        bullishCrossover,
+        trend,
 
-        bearishCrossover
+        pressure,
+
+        bullishPoints,
+
+        bearishPoints
+
     };
+
+}
+
+
+//======================================================
+// DELTA ALIGNMENT
+//
+// 3H = BROADER CONTEXT
+// 30M = SHORTER-TERM PRESSURE
+//
+// IMPORTANT:
+// Raw delta values are NOT compared directly.
+//
+// We compare the direction of Delta movement.
+//======================================================
+
+function getDeltaAlignment(
+    delta3H,
+    delta30M
+) {
+
+    if (
+        !delta3H ||
+        !delta30M
+    ) {
+
+        return {
+
+            alignment:
+                "INSUFFICIENT DATA",
+
+            bullishPoints: 0,
+
+            bearishPoints: 0
+
+        };
+
+    }
+
+
+    const bullish3H =
+        delta3H.deltaChange > 0;
+
+
+    const bearish3H =
+        delta3H.deltaChange < 0;
+
+
+    const bullish30M =
+        delta30M.deltaChange > 0;
+
+
+    const bearish30M =
+        delta30M.deltaChange < 0;
+
+
+    //==================================================
+    // STRONG BULLISH ALIGNMENT
+    //==================================================
+
+    if (
+        bullish3H &&
+        bullish30M
+    ) {
+
+        return {
+
+            alignment:
+                "STRONG BULLISH ALIGNMENT",
+
+            bullishPoints: 20,
+
+            bearishPoints: 0
+
+        };
+
+    }
+
+
+    //==================================================
+    // STRONG BEARISH ALIGNMENT
+    //==================================================
+
+    if (
+        bearish3H &&
+        bearish30M
+    ) {
+
+        return {
+
+            alignment:
+                "STRONG BEARISH ALIGNMENT",
+
+            bullishPoints: 0,
+
+            bearishPoints: 20
+
+        };
+
+    }
+
+
+    //==================================================
+    // 3H BULLISH / 30M BEARISH
+    //==================================================
+
+    if (
+        bullish3H &&
+        bearish30M
+    ) {
+
+        return {
+
+            alignment:
+                "30M BEARISH / 3H BULLISH",
+
+            bullishPoints: 10,
+
+            bearishPoints: 10
+
+        };
+
+    }
+
+
+    //==================================================
+    // 3H BEARISH / 30M BULLISH
+    //==================================================
+
+    if (
+        bearish3H &&
+        bullish30M
+    ) {
+
+        return {
+
+            alignment:
+                "30M BULLISH / 3H BEARISH",
+
+            bullishPoints: 10,
+
+            bearishPoints: 10
+
+        };
+
+    }
+
+
+    return {
+
+        alignment:
+            "MIXED / FLAT",
+
+        bullishPoints: 0,
+
+        bearishPoints: 0
+
+    };
+
+}
+
+
+//======================================================
+// OBV
+//======================================================
+
+function calculateOBV(
+    candles
+) {
+
+    if (
+        !candles ||
+        candles.length < 2
+    ) {
+
+        return 0;
+
+    }
+
+
+    let obv = 0;
+
+
+    for (
+        let i = 1;
+        i < candles.length;
+        i++
+    ) {
+
+        if (
+            candles[i].close >
+            candles[i - 1].close
+        ) {
+
+            obv +=
+                candles[i].volume;
+
+        }
+
+        else if (
+            candles[i].close <
+            candles[i - 1].close
+        ) {
+
+            obv -=
+                candles[i].volume;
+
+        }
+
+    }
+
+
+    return obv;
+
+}
+
+
+//======================================================
+// ATR LOCATION
+//======================================================
+
+function getATRLocation(
+    price,
+    atr,
+    dailyHigh,
+    dailyLow
+) {
+
+    const distLow =
+        price -
+        dailyLow;
+
+
+    const distHigh =
+        dailyHigh -
+        price;
+
+
+    //==================================================
+    // NEAR ATR LOW
+    //==================================================
+
+    if (
+        distLow >= 0 &&
+        distLow <= atr * 0.5
+    ) {
+
+        return {
+
+            location:
+                "NEAR ATR LOW",
+
+            bullishPoints:
+                20,
+
+            bearishPoints:
+                0
+
+        };
+
+    }
+
+
+    //==================================================
+    // NEAR ATR HIGH
+    //==================================================
+
+    if (
+        distHigh >= 0 &&
+        distHigh <= atr * 0.5
+    ) {
+
+        return {
+
+            location:
+                "NEAR ATR HIGH",
+
+            bullishPoints:
+                0,
+
+            bearishPoints:
+                20
+
+        };
+
+    }
+
+
+    return {
+
+        location:
+            "MID RANGE",
+
+        bullishPoints:
+            0,
+
+        bearishPoints:
+            0
+
+    };
+
 }
 
 
@@ -1282,151 +1287,151 @@ async function calculateCoinScore(
 
     try {
 
-        //--------------------------------------------------
-        // 1H DATA
-        //--------------------------------------------------
+        //================================================
+        // 30M DATA
+        //================================================
 
-        const candles1H =
+        const candles30M =
             await fetchFuturesKlines(
                 symbol,
-                "1h",
+                "30m",
                 120
             );
 
 
         if (
-            !candles1H ||
-            candles1H.length < 50
+            !candles30M ||
+            candles30M.length < 20
         ) {
 
             return null;
+
         }
 
 
-        // Remove current forming candle
+        const closed30M =
+            candles30M.slice(
+                0,
+                -1
+            );
 
-        const closed1H =
-            candles1H.slice(0, -1);
 
+        const delta30MSeries =
+            calculateCumulativeDelta(
+                closed30M
+            );
+
+
+        const delta30M =
+            analyzeDelta(
+                delta30MSeries
+            );
+
+
+        if (!delta30M)
+            return null;
+
+
+        //================================================
+        // 3H DATA
+        //================================================
+
+        const candles3H =
+            await fetchFuturesKlines(
+                symbol,
+                "3h",
+                120
+            );
+
+
+        if (
+            !candles3H ||
+            candles3H.length < 20
+        ) {
+
+            return null;
+
+        }
+
+
+        const closed3H =
+            candles3H.slice(
+                0,
+                -1
+            );
+
+
+        const delta3HSeries =
+            calculateCumulativeDelta(
+                closed3H
+            );
+
+
+        const delta3H =
+            analyzeDelta(
+                delta3HSeries
+            );
+
+
+        if (!delta3H)
+            return null;
+
+
+        //================================================
+        // DELTA ALIGNMENT
+        //================================================
+
+        const deltaAlignment =
+            getDeltaAlignment(
+                delta3H,
+                delta30M
+            );
+
+
+        //================================================
+        // INITIAL SCORE
+        //================================================
+
+        let bullishScore =
+            delta30M.bullishPoints;
+
+        let bearishScore =
+            delta30M.bearishPoints;
+
+
+        // Add broader 3H information
+        bullishScore +=
+            Math.floor(
+                delta3H.bullishPoints / 2
+            );
+
+        bearishScore +=
+            Math.floor(
+                delta3H.bearishPoints / 2
+            );
+
+
+        // Add alignment
+        bullishScore +=
+            deltaAlignment.bullishPoints;
+
+        bearishScore +=
+            deltaAlignment.bearishPoints;
+
+
+        //================================================
+        // CURRENT PRICE
+        //================================================
 
         const currentPrice =
-            closed1H[
-                closed1H.length - 1
+            closed30M[
+                closed30M.length - 1
             ].close;
 
 
-        //--------------------------------------------------
-        // INITIAL SCORE
-        //--------------------------------------------------
-
-        let bullishScore = 0;
-
-        let bearishScore = 0;
-
-
-        //--------------------------------------------------
-        // 1H CUMULATIVE DELTA
-        //--------------------------------------------------
-
-        const cumulativeDelta =
-            calculateCumulativeDelta(
-                closed1H
-            );
-
-
-        const deltaAnalysis =
-            analyzeDelta(
-                cumulativeDelta
-            );
-
-
-        if (!deltaAnalysis)
-            return null;
-
-
-        bullishScore +=
-            deltaAnalysis.bullishPoints;
-
-        bearishScore +=
-            deltaAnalysis.bearishPoints;
-
-
-        //--------------------------------------------------
-        // 15M EARLY SIGNAL
-        //--------------------------------------------------
-
-        const candles15M =
-            await fetchFuturesKlines(
-                symbol,
-                "15m",
-                120
-            );
-
-
-        const earlyDelta =
-            analyze15MDelta(
-                candles15M
-            );
-
-
-        if (!earlyDelta)
-            return null;
-
-
-        let new15MCrossover =
-            false;
-
-
-        if (
-            earlyDelta.crossover ===
-            "BULLISH EARLY WARNING"
-        ) {
-
-            if (
-                delta15MState[symbol] !== 1
-            ) {
-
-                new15MCrossover = true;
-
-                delta15MState[symbol] = 1;
-            }
-
-        }
-
-        else if (
-            earlyDelta.crossover ===
-            "BEARISH EARLY WARNING"
-        ) {
-
-            if (
-                delta15MState[symbol] !== -1
-            ) {
-
-                new15MCrossover = true;
-
-                delta15MState[symbol] = -1;
-            }
-
-        }
-
-        else {
-
-            // Initialize state without
-            // generating an alert.
-
-            if (
-                !delta15MState[symbol]
-            ) {
-
-                delta15MState[symbol] =
-                    earlyDelta.state;
-            }
-        }
-
-
-        //--------------------------------------------------
+        //================================================
         // 2H STC
-        //--------------------------------------------------
+        //================================================
 
         const candles2H =
             await fetchFuturesKlines(
@@ -1442,11 +1447,15 @@ async function calculateCoinScore(
         ) {
 
             return null;
+
         }
 
 
         const closed2H =
-            candles2H.slice(0, -1);
+            candles2H.slice(
+                0,
+                -1
+            );
 
 
         const closes2H =
@@ -1477,6 +1486,7 @@ async function calculateCoinScore(
                         fast: 10,
                         slow: 20
                     }
+
                 );
 
 
@@ -1487,7 +1497,9 @@ async function calculateCoinScore(
                 stcSeries.push(
                     value
                 );
+
             }
+
         }
 
 
@@ -1503,6 +1515,7 @@ async function calculateCoinScore(
                 stcSeries[
                     stcSeries.length - 2
                 ];
+
 
             const current =
                 stcSeries[
@@ -1531,13 +1544,15 @@ async function calculateCoinScore(
 
                 stcSignal =
                     `BEARISH (${current.toFixed(1)})`;
+
             }
+
         }
 
 
-        //--------------------------------------------------
+        //================================================
         // 2H OBV
-        //--------------------------------------------------
+        //================================================
 
         let obvSignal =
             "NEUTRAL";
@@ -1579,16 +1594,17 @@ async function calculateCoinScore(
 
             obvSignal =
                 "SELLING PRESSURE";
+
         }
 
 
-        //--------------------------------------------------
-        // ATR LOCATION
-        //--------------------------------------------------
+        //================================================
+        // ATR
+        //================================================
 
         const atr =
             calculateATR(
-                closed1H,
+                closed30M,
                 ATR_PERIOD
             );
 
@@ -1611,6 +1627,7 @@ async function calculateCoinScore(
         ) {
 
             return null;
+
         }
 
 
@@ -1622,13 +1639,9 @@ async function calculateCoinScore(
 
         const atrLocation =
             getATRLocation(
-
                 currentPrice,
-
                 atr,
-
                 previousDay.high,
-
                 previousDay.low
             );
 
@@ -1636,13 +1649,14 @@ async function calculateCoinScore(
         bullishScore +=
             atrLocation.bullishPoints;
 
+
         bearishScore +=
             atrLocation.bearishPoints;
 
 
-        //--------------------------------------------------
+        //================================================
         // FINAL DIRECTION
-        //--------------------------------------------------
+        //================================================
 
         let direction =
             "NEUTRAL";
@@ -1665,12 +1679,13 @@ async function calculateCoinScore(
 
             direction =
                 "BEARISH";
+
         }
 
 
-        //--------------------------------------------------
+        //================================================
         // RETURN
-        //--------------------------------------------------
+        //================================================
 
         return {
 
@@ -1682,59 +1697,11 @@ async function calculateCoinScore(
 
             bearishScore,
 
+            delta3H,
 
-            // 1H Delta
+            delta30M,
 
-            deltaSignal:
-                deltaAnalysis.signal,
-
-            deltaCrossover:
-                deltaAnalysis.crossover,
-
-            deltaValue:
-                deltaAnalysis.currentDelta,
-
-            deltaEMA:
-                deltaAnalysis.currentEMA,
-
-            deltaPosition:
-
-                deltaAnalysis.currentDelta >
-                deltaAnalysis.currentEMA
-
-                    ? "DELTA ABOVE EMA(10)"
-
-                    : deltaAnalysis.currentDelta <
-                      deltaAnalysis.currentEMA
-
-                        ? "DELTA BELOW EMA(10)"
-
-                        : "DELTA AT EMA(10)",
-
-
-            // 15M Delta
-
-            earlyDeltaCrossover:
-                earlyDelta.crossover,
-
-            new15MCrossover,
-
-            earlyDeltaPosition:
-
-                earlyDelta.currentDelta >
-                earlyDelta.currentEMA
-
-                    ? "15M DELTA ABOVE EMA(10)"
-
-                    : earlyDelta.currentDelta <
-                      earlyDelta.currentEMA
-
-                        ? "15M DELTA BELOW EMA(10)"
-
-                        : "15M DELTA AT EMA(10)",
-
-
-            // Other indicators
+            deltaAlignment,
 
             stcSignal,
 
@@ -1742,6 +1709,7 @@ async function calculateCoinScore(
 
             atrLocation:
                 atrLocation.location
+
         };
 
     }
@@ -1749,11 +1717,15 @@ async function calculateCoinScore(
     catch (err) {
 
         log(
-            `Coin Score Error ${symbol}: ${err.message}`
+            `Coin Score Error ${symbol}: ${
+                err.message
+            }`
         );
 
         return null;
+
     }
+
 }
 
 //======================================================
@@ -1765,9 +1737,9 @@ async function generateCoinScoreReport() {
     const results = [];
 
 
-    //--------------------------------------------------
-    // SCAN EVERY SYMBOL
-    //--------------------------------------------------
+    //==================================================
+    // SCAN ALL COINS
+    //==================================================
 
     for (
         const symbol of COIN_LIST
@@ -1778,119 +1750,122 @@ async function generateCoinScoreReport() {
                 symbol
             );
 
-        if (score)
-            results.push(score);
+
+        if (score) {
+
+            results.push(
+                score
+            );
+
+        }
+
     }
 
 
-    //--------------------------------------------------
-    // NEW 1H CONFIRMED CROSSOVERS
-    //--------------------------------------------------
+    //==================================================
+    // TOP BULLISH
+    //==================================================
 
-    const confirmedBullish =
+    const bullish =
+
         results
+
             .filter(
                 coin =>
-                    coin.deltaCrossover ===
-                    "BULLISH CROSSOVER"
+                    coin.direction ===
+                    "BULLISH"
             )
+
             .sort(
                 (a, b) =>
                     b.bullishScore -
                     a.bullishScore
             )
-            .slice(0, 7);
+
+            .slice(
+                0,
+                7
+            );
 
 
-    const confirmedBearish =
+    //==================================================
+    // TOP BEARISH
+    //==================================================
+
+    const bearish =
+
         results
+
             .filter(
                 coin =>
-                    coin.deltaCrossover ===
-                    "BEARISH CROSSOVER"
+                    coin.direction ===
+                    "BEARISH"
             )
+
             .sort(
                 (a, b) =>
                     b.bearishScore -
                     a.bearishScore
             )
-            .slice(0, 7);
+
+            .slice(
+                0,
+                7
+            );
 
 
-    //--------------------------------------------------
-    // NEW 15M EARLY WARNINGS
-    //--------------------------------------------------
-
-    const earlyBullish =
-        results
-            .filter(
-                coin =>
-                    coin.new15MCrossover === true &&
-                    coin.earlyDeltaCrossover ===
-                    "BULLISH EARLY WARNING"
-            )
-            .sort(
-                (a, b) =>
-                    b.bullishScore -
-                    a.bullishScore
-            )
-            .slice(0, 7);
-
-
-    const earlyBearish =
-        results
-            .filter(
-                coin =>
-                    coin.new15MCrossover === true &&
-                    coin.earlyDeltaCrossover ===
-                    "BEARISH EARLY WARNING"
-            )
-            .sort(
-                (a, b) =>
-                    b.bearishScore -
-                    a.bearishScore
-            )
-            .slice(0, 7);
-
-
-    //--------------------------------------------------
-    // BUILD TELEGRAM MESSAGE
-    //--------------------------------------------------
+    //==================================================
+    // MESSAGE HEADER
+    //==================================================
 
     let msg =
 `⚡ *COIN DEPLOYMENT REPORT*
+🕐 30-MINUTE UPDATE
 
 `;
 
 
-    //--------------------------------------------------
-    // 15M BULLISH EARLY WARNINGS
-    //--------------------------------------------------
+    //==================================================
+    // BULLISH
+    //==================================================
 
     if (
-        earlyBullish.length
+        bullish.length
     ) {
 
         msg +=
-`⚠️ *15M BULLISH EARLY WARNINGS*
+`🟢 *TOP BULLISH CANDIDATES*
 
 `;
 
-        earlyBullish.forEach(
+
+        bullish.forEach(
             (coin, index) => {
+
+                const d3 =
+                    coin.delta3H;
+
+                const d30 =
+                    coin.delta30M;
+
 
                 msg +=
 
 `${index + 1}. *${coin.symbol}*
-⚠️ Early Signal
 🟢 Score: ${coin.bullishScore}/100
 
-📊 *Cumulative Delta*
-⚠️ 15M BULLISH CROSSOVER
-${coin.earlyDeltaPosition}
+📊 *3H CUMULATIVE DELTA*
+${d3.currentDelta >= 0 ? "🟢" : "🔴"} ${d3.currentDelta.toFixed(0)}
+${d3.trend}
+${d3.pressure}
 
-⏳ *1H Confirmation*
-WAITING FOR 1H BULLISH CROSSOVER
+⚡ *30M CUMULATIVE DELTA*
+${d30.currentDelta >= 0 ? "🟢" : "🔴"} ${d30.currentDelta.toFixed(0)}
+${d30.trend}
+${d30.pressure}
+
+🔗 *DELTA ALIGNMENT*
+${coin.deltaAlignment.alignment}
 
 ⚡ *2H STC*
 ${coin.stcSignal}
@@ -1898,84 +1873,58 @@ ${coin.stcSignal}
 📈 *2H OBV*
 ${coin.obvSignal}
 
-📍 *ATR Location*
+📍 *ATR LOCATION*
 ${coin.atrLocation}
 
 `;
+
             }
         );
+
     }
 
 
-    //--------------------------------------------------
-    // 15M BEARISH EARLY WARNINGS
-    //--------------------------------------------------
+    //==================================================
+    // BEARISH
+    //==================================================
 
     if (
-        earlyBearish.length
+        bearish.length
     ) {
 
         msg +=
-`⚠️ *15M BEARISH EARLY WARNINGS*
+`🔴 *TOP BEARISH CANDIDATES*
 
 `;
 
-        earlyBearish.forEach(
+
+        bearish.forEach(
             (coin, index) => {
+
+                const d3 =
+                    coin.delta3H;
+
+                const d30 =
+                    coin.delta30M;
+
 
                 msg +=
 
 `${index + 1}. *${coin.symbol}*
-⚠️ Early Signal
 🔴 Score: ${coin.bearishScore}/100
 
-📊 *Cumulative Delta*
-⚠️ 15M BEARISH CROSSOVER
-${coin.earlyDeltaPosition}
+📊 *3H CUMULATIVE DELTA*
+${d3.currentDelta >= 0 ? "🟢" : "🔴"} ${d3.currentDelta.toFixed(0)}
+${d3.trend}
+${d3.pressure}
 
-⏳ *1H Confirmation*
-WAITING FOR 1H BEARISH CROSSOVER
+⚡ *30M CUMULATIVE DELTA*
+${d30.currentDelta >= 0 ? "🟢" : "🔴"} ${d30.currentDelta.toFixed(0)}
+${d30.trend}
+${d30.pressure}
 
-⚡ *2H STC*
-${coin.stcSignal}
-
-📈 *2H OBV*
-${coin.obvSignal}
-
-📍 *ATR Location*
-${coin.atrLocation}
-
-`;
-            }
-        );
-    }
-
-
-    //--------------------------------------------------
-    // 1H CONFIRMED BULLISH
-    //--------------------------------------------------
-
-    if (
-        confirmedBullish.length
-    ) {
-
-        msg +=
-`🟢 *1H CONFIRMED BULLISH CROSSOVERS*
-
-`;
-
-        confirmedBullish.forEach(
-            (coin, index) => {
-
-                msg +=
-
-`${index + 1}. *${coin.symbol}*
-🟢 CONFIRMED DEPLOYMENT
-🟢 Score: ${coin.bullishScore}/100
-
-📊 *Cumulative Delta*
-🟢 1H BULLISH CROSSOVER
-${coin.deltaPosition}
+🔗 *DELTA ALIGNMENT*
+${coin.deltaAlignment.alignment}
 
 ⚡ *2H STC*
 ${coin.stcSignal}
@@ -1983,77 +1932,42 @@ ${coin.stcSignal}
 📈 *2H OBV*
 ${coin.obvSignal}
 
-📍 *ATR Location*
+📍 *ATR LOCATION*
 ${coin.atrLocation}
 
 `;
+
             }
         );
+
     }
 
 
-    //--------------------------------------------------
-    // 1H CONFIRMED BEARISH
-    //--------------------------------------------------
+    //==================================================
+    // NO CANDIDATES
+    //==================================================
 
     if (
-        confirmedBearish.length
+        bullish.length === 0 &&
+        bearish.length === 0
     ) {
 
         msg +=
-`🔴 *1H CONFIRMED BEARISH CROSSOVERS*
+`⚪ No strong Delta candidates found.
 
-`;
+The scanner is still monitoring all coins.`;
 
-        confirmedBearish.forEach(
-            (coin, index) => {
-
-                msg +=
-
-`${index + 1}. *${coin.symbol}*
-🔴 CONFIRMED DEPLOYMENT
-🔴 Score: ${coin.bearishScore}/100
-
-📊 *Cumulative Delta*
-🔴 1H BEARISH CROSSOVER
-${coin.deltaPosition}
-
-⚡ *2H STC*
-${coin.stcSignal}
-
-📈 *2H OBV*
-${coin.obvSignal}
-
-📍 *ATR Location*
-${coin.atrLocation}
-
-`;
-            }
-        );
     }
 
 
-    //--------------------------------------------------
-    // NO NEW SIGNALS
-    //--------------------------------------------------
+    //==================================================
+    // SEND TELEGRAM
+    //==================================================
 
-    if (
-        earlyBullish.length === 0 &&
-        earlyBearish.length === 0 &&
-        confirmedBullish.length === 0 &&
-        confirmedBearish.length === 0
-    ) {
+    await sendMessage(
+        msg
+    );
 
-        msg +=
-`⚪ No new Delta crossover signals.`;
-    }
-
-
-    //--------------------------------------------------
-    // TELEGRAM
-    //--------------------------------------------------
-
-    await sendMessage(msg);
 }
 
 
@@ -2065,18 +1979,14 @@ generateCoinScoreReport();
 
 
 //======================================================
-// RUN EVERY 15 MINUTES
-//
-// The bot checks every 15 minutes,
-// but crossover-state tracking prevents
-// duplicate messages.
+// RUN EVERY 30 MINUTES
 //======================================================
 
 setInterval(
 
     generateCoinScoreReport,
 
-    15 * 60 * 1000
+    30 * 60 * 1000
 
 );
 
