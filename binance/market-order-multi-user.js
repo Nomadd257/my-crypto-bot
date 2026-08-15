@@ -607,30 +607,330 @@ setInterval(async () => {
 }, SIGNAL_CHECK_INTERVAL_MS);
 
 //======================================================
-// CALCULATE COIN ORDER FLOW
+// COIN ORDER FLOW REPORT
 //
-// SIMPLE DELTA-ONLY MODEL
+// FINAL DELTA-ONLY VERSION
 //
-// 30M Delta = current order flow
-// 3H Delta  = broader order flow
+// COMPONENTS
 //
-// No:
+// • 30M Cumulative Delta
+// • 3H Cumulative Delta
+// • 30M Order Flow State
+// • 3H Broader Order Flow State
+// • Top 7 Order-Flow Coins
+//
+// REMOVED
+//
 // • STC
 // • OBV
 // • ATR
-// • EMA crossover
-// • alignment filter
+// • EMA
+// • Delta crossover
+// • 30M/3H relationship
+// • Delta alignment filter
 //
-// A coin only needs valid 30M Delta data
-// to qualify for the report.
+// REPORT INTERVAL = 30 MINUTES
+//
+// PURPOSE:
+//
+// This is an INFORMATIONAL order-flow report.
+//
+// It tells the trader whether buyers or sellers
+// are currently exerting greater volume pressure.
+//
+// 30M = CURRENT ORDER FLOW
+// 3H  = BROADER ORDER FLOW
+//======================================================
+
+
+//======================================================
+// CUMULATIVE DELTA
+//
+// Green candle = positive volume
+// Red candle   = negative volume
+//
+// IMPORTANT:
+//
+// We intentionally do NOT use session filtering here.
+//
+// The supplied candles are used directly.
+//
+// This makes the calculation independent of
+// SESSION_START_HOUR and avoids the previous
+// "NO DATA AVAILABLE" problem caused by session
+// filtering.
+//======================================================
+
+function calculateCumulativeDelta(candles) {
+
+    if (
+        !candles ||
+        candles.length < 2
+    ) {
+
+        return [];
+
+    }
+
+
+    let delta = 0;
+
+    const cumulativeDelta = [];
+
+
+    for (
+        const candle of candles
+    ) {
+
+        if (
+            candle.close >
+            candle.open
+        ) {
+
+            delta +=
+                candle.volume;
+
+        }
+
+        else if (
+            candle.close <
+            candle.open
+        ) {
+
+            delta -=
+                candle.volume;
+
+        }
+
+
+        // Do nothing for a candle where
+        // close === open.
+
+        cumulativeDelta.push(
+            delta
+        );
+
+    }
+
+
+    return cumulativeDelta;
+
+}
+
+
+//======================================================
+// ANALYZE DELTA
+//
+// Determines:
+//
+// • Current cumulative Delta
+// • Previous cumulative Delta
+// • Delta change
+// • Higher Positive
+// • Lower Positive
+// • Higher Negative
+// • Lower Negative
+//
+// IMPORTANT:
+//
+// The terminology:
+//
+// HIGHER POSITIVE
+// = Delta is positive and increasing.
+//
+// LOWER POSITIVE
+// = Delta is still positive but decreasing.
+//
+// LOWER NEGATIVE
+// = Delta is negative and becoming more negative.
+//
+// HIGHER NEGATIVE
+// = Delta is negative but moving upward toward zero.
+//======================================================
+
+function analyzeDelta(cumulativeDelta) {
+
+    if (
+        !cumulativeDelta ||
+        cumulativeDelta.length < 2
+    ) {
+
+        return null;
+
+    }
+
+
+    const currentIndex =
+        cumulativeDelta.length - 1;
+
+
+    const previousIndex =
+        currentIndex - 1;
+
+
+    const currentDelta =
+        cumulativeDelta[
+            currentIndex
+        ];
+
+
+    const previousDelta =
+        cumulativeDelta[
+            previousIndex
+        ];
+
+
+    const deltaChange =
+        currentDelta -
+        previousDelta;
+
+
+    let trend =
+        "FLAT";
+
+
+    let control =
+        "BALANCED";
+
+
+    //==================================================
+    // POSITIVE DELTA
+    //==================================================
+
+    if (
+        currentDelta > 0
+    ) {
+
+        control =
+            "BUYERS IN CONTROL";
+
+
+        if (
+            currentDelta >
+            previousDelta
+        ) {
+
+            trend =
+                "HIGHER POSITIVE";
+
+        }
+
+        else if (
+            currentDelta <
+            previousDelta
+        ) {
+
+            trend =
+                "LOWER POSITIVE";
+
+        }
+
+        else {
+
+            trend =
+                "POSITIVE / FLAT";
+
+        }
+
+    }
+
+
+    //==================================================
+    // NEGATIVE DELTA
+    //==================================================
+
+    else if (
+        currentDelta < 0
+    ) {
+
+        control =
+            "SELLERS IN CONTROL";
+
+
+        if (
+            currentDelta <
+            previousDelta
+        ) {
+
+            trend =
+                "LOWER NEGATIVE";
+
+        }
+
+        else if (
+            currentDelta >
+            previousDelta
+        ) {
+
+            trend =
+                "HIGHER NEGATIVE";
+
+        }
+
+        else {
+
+            trend =
+                "NEGATIVE / FLAT";
+
+        }
+
+    }
+
+
+    //==================================================
+    // ZERO
+    //==================================================
+
+    else {
+
+        control =
+            "BALANCED";
+
+
+        trend =
+            "AT ZERO";
+
+    }
+
+
+    return {
+
+        currentDelta,
+
+        previousDelta,
+
+        deltaChange,
+
+        trend,
+
+        control
+
+    };
+
+}
+
+
+//======================================================
+// CALCULATE COIN ORDER FLOW
+//
+// 30M = CURRENT ORDER FLOW
+// 3H  = BROADER ORDER FLOW
+//
+// IMPORTANT:
+//
+// • No alignment requirement
+// • No crossover requirement
+// • No STC
+// • No OBV
+// • No ATR
+// • No EMA
+//
+// A coin only needs valid Delta data.
 //======================================================
 
 async function calculateCoinScore(symbol) {
 
     try {
-
-        let delta30M = null;
-        let delta3H = null;
 
         //================================================
         // 30M DATA
@@ -643,26 +943,58 @@ async function calculateCoinScore(symbol) {
                 120
             );
 
+
         if (
-            candles30M &&
-            candles30M.length >= 3
+            !candles30M ||
+            candles30M.length < 3
         ) {
 
-            const closed30M =
-                candles30M.slice(
-                    0,
-                    -1
-                );
+            log(
+                `30M data unavailable for ${symbol}`
+            );
 
-            const delta30MSeries =
-                calculateCumulativeDelta(
-                    closed30M
-                );
+            return null;
 
-            delta30M =
-                analyzeDelta(
-                    delta30MSeries
-                );
+        }
+
+
+        // Remove currently forming candle.
+
+        const closed30M =
+            candles30M.slice(
+                0,
+                -1
+            );
+
+
+        if (
+            closed30M.length < 2
+        ) {
+
+            return null;
+
+        }
+
+
+        const delta30MSeries =
+            calculateCumulativeDelta(
+                closed30M
+            );
+
+
+        const delta30M =
+            analyzeDelta(
+                delta30MSeries
+            );
+
+
+        if (!delta30M) {
+
+            log(
+                `30M Delta unavailable for ${symbol}`
+            );
+
+            return null;
 
         }
 
@@ -678,6 +1010,10 @@ async function calculateCoinScore(symbol) {
                 120
             );
 
+
+        let delta3H = null;
+
+
         if (
             candles3H &&
             candles3H.length >= 3
@@ -689,88 +1025,21 @@ async function calculateCoinScore(symbol) {
                     -1
                 );
 
-            const delta3HSeries =
-                calculateCumulativeDelta(
-                    closed3H
-                );
-
-            delta3H =
-                analyzeDelta(
-                    delta3HSeries
-                );
-
-        }
-
-
-        //================================================
-        // 30M DELTA MUST EXIST
-        //
-        // This is the primary order-flow reading.
-        //================================================
-
-        if (!delta30M) {
-
-            return null;
-
-        }
-
-
-        //================================================
-        // 3H DELTA
-        //
-        // If unavailable, the coin can STILL appear.
-        //================================================
-
-        let deltaRelationship =
-            "3H DATA UNAVAILABLE";
-
-
-        if (delta3H) {
 
             if (
-                delta30M.deltaChange > 0 &&
-                delta3H.deltaChange > 0
+                closed3H.length >= 2
             ) {
 
-                deltaRelationship =
-                    "30M BULLISH / 3H BULLISH";
+                const delta3HSeries =
+                    calculateCumulativeDelta(
+                        closed3H
+                    );
 
-            }
 
-            else if (
-                delta30M.deltaChange < 0 &&
-                delta3H.deltaChange < 0
-            ) {
-
-                deltaRelationship =
-                    "30M BEARISH / 3H BEARISH";
-
-            }
-
-            else if (
-                delta30M.deltaChange > 0 &&
-                delta3H.deltaChange < 0
-            ) {
-
-                deltaRelationship =
-                    "30M BULLISH / 3H BEARISH";
-
-            }
-
-            else if (
-                delta30M.deltaChange < 0 &&
-                delta3H.deltaChange > 0
-            ) {
-
-                deltaRelationship =
-                    "30M BEARISH / 3H BULLISH";
-
-            }
-
-            else {
-
-                deltaRelationship =
-                    "MIXED / FLAT";
+                delta3H =
+                    analyzeDelta(
+                        delta3HSeries
+                    );
 
             }
 
@@ -778,51 +1047,29 @@ async function calculateCoinScore(symbol) {
 
 
         //================================================
-        // CURRENT ORDER FLOW
-        //================================================
-
-        let direction =
-            "BALANCED";
-
-
-        if (
-            delta30M.currentDelta > 0
-        ) {
-
-            direction =
-                "BULLISH";
-
-        }
-
-        else if (
-            delta30M.currentDelta < 0
-        ) {
-
-            direction =
-                "BEARISH";
-
-        }
-
-
-        //================================================
-        // RANKING STRENGTH
+        // 30M ORDER-FLOW STRENGTH
         //
-        // 30M Delta is the primary ranking factor.
-        // Absolute value = strength of current Delta.
+        // Used ONLY to rank the Top 7.
         //
-        // 3H is used only as a secondary tie-breaker.
+        // It is not a trading signal.
         //================================================
 
         const orderFlowStrength =
             Math.abs(
-                delta30M.currentDelta
+                delta30M.deltaChange
             );
 
+
+        //================================================
+        // 3H BROADER STRENGTH
+        //
+        // Informational only.
+        //================================================
 
         const broaderStrength =
             delta3H
                 ? Math.abs(
-                    delta3H.currentDelta
+                    delta3H.deltaChange
                 )
                 : 0;
 
@@ -835,13 +1082,9 @@ async function calculateCoinScore(symbol) {
 
             symbol,
 
-            direction,
-
             delta30M,
 
             delta3H,
-
-            deltaRelationship,
 
             orderFlowStrength,
 
@@ -851,7 +1094,13 @@ async function calculateCoinScore(symbol) {
 
     }
 
+
     catch (err) {
+
+        // IMPORTANT:
+        //
+        // One failed coin must NOT stop
+        // the entire scanner.
 
         log(
             `Order Flow Error ${symbol}: ${
@@ -859,8 +1108,6 @@ async function calculateCoinScore(symbol) {
             }`
         );
 
-        // One coin failing must NOT stop
-        // the entire scanner.
 
         return null;
 
@@ -871,20 +1118,22 @@ async function calculateCoinScore(symbol) {
 //======================================================
 // GENERATE COIN ORDER FLOW REPORT
 //
-// INFORMATIONAL ONLY
+// INFORMATIONAL ONLY.
 //
-// 30M = CURRENT ORDER FLOW
-// 3H  = BROADER ORDER FLOW
+// No alignment requirement.
 //
-// The 30M and 3H Delta do NOT have to align.
+// No crossover requirement.
 //
-// Top 7 are ranked by the strength of the
-// current 30M Delta.
+// No directional filter.
 //
-// No STC
-// No OBV
-// No ATR
-// No EMA
+// Every coin with valid 30M Delta data can
+// qualify for the Top 7.
+//
+// Ranking:
+//
+// Strongest 30M Delta CHANGE first.
+//
+// This is only for presentation.
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -894,24 +1143,38 @@ async function generateCoinScoreReport() {
         const results = [];
 
 
-        //==================================================
+        //================================================
         // SCAN ALL COINS
-        //==================================================
+        //================================================
 
         for (
             const symbol of COIN_LIST
         ) {
 
-            const result =
-                await calculateCoinScore(
-                    symbol
-                );
+            try {
+
+                const result =
+                    await calculateCoinScore(
+                        symbol
+                    );
 
 
-            if (result) {
+                if (result) {
 
-                results.push(
-                    result
+                    results.push(
+                        result
+                    );
+
+                }
+
+            }
+
+            catch (err) {
+
+                log(
+                    `Scanner Error ${symbol}: ${
+                        err.message
+                    }`
                 );
 
             }
@@ -919,40 +1182,18 @@ async function generateCoinScoreReport() {
         }
 
 
-        //==================================================
+        //================================================
         // TOP 7
         //
-        // Rank by absolute 30M Delta.
-        //
-        // This tells us which coins currently have
-        // the strongest order-flow pressure.
-        //==================================================
+        // Ranked by 30M Delta movement.
+        //================================================
 
         const top7 =
-
             results
                 .sort(
-                    (a, b) => {
-
-                        if (
-                            b.orderFlowStrength !==
-                            a.orderFlowStrength
-                        ) {
-
-                            return (
-                                b.orderFlowStrength -
-                                a.orderFlowStrength
-                            );
-
-                        }
-
-
-                        return (
-                            b.broaderStrength -
-                            a.broaderStrength
-                        );
-
-                    }
+                    (a, b) =>
+                        b.orderFlowStrength -
+                        a.orderFlowStrength
                 )
                 .slice(
                     0,
@@ -960,9 +1201,9 @@ async function generateCoinScoreReport() {
                 );
 
 
-        //==================================================
+        //================================================
         // MESSAGE HEADER
-        //==================================================
+        //================================================
 
         let msg =
 `⚡ *COIN ORDER FLOW REPORT*
@@ -974,9 +1215,9 @@ async function generateCoinScoreReport() {
 `;
 
 
-        //==================================================
+        //================================================
         // NO DATA
-        //==================================================
+        //================================================
 
         if (
             top7.length === 0
@@ -985,14 +1226,16 @@ async function generateCoinScoreReport() {
             msg +=
 `⚪ *NO DATA AVAILABLE*
 
-The scanner is still monitoring all coins.`;
+The scanner is still monitoring all coins.
+
+`;
 
         }
 
 
-        //==================================================
-        // TOP 7
-        //==================================================
+        //================================================
+        // TOP 7 COINS
+        //================================================
 
         else {
 
@@ -1013,15 +1256,15 @@ The scanner is still monitoring all coins.`;
                         coin.delta3H;
 
 
-                    //======================================
-                    // 30M DISPLAY
-                    //======================================
+                    //================================================
+                    // 30M CONTROL
+                    //================================================
 
-                    let currentIcon =
+                    let flowIcon =
                         "⚪";
 
 
-                    let currentControl =
+                    let flowControl =
                         "BALANCED";
 
 
@@ -1029,10 +1272,11 @@ The scanner is still monitoring all coins.`;
                         d30.currentDelta > 0
                     ) {
 
-                        currentIcon =
+                        flowIcon =
                             "🟢";
 
-                        currentControl =
+
+                        flowControl =
                             "BUYERS IN CONTROL";
 
                     }
@@ -1041,70 +1285,42 @@ The scanner is still monitoring all coins.`;
                         d30.currentDelta < 0
                     ) {
 
-                        currentIcon =
+                        flowIcon =
                             "🔴";
 
-                        currentControl =
+
+                        flowControl =
                             "SELLERS IN CONTROL";
 
                     }
 
 
-                    //======================================
-                    // 3H DISPLAY
-                    //======================================
-
-                    let broaderIcon =
-                        "⚪";
-
-
-                    if (
-                        d3 &&
-                        d3.currentDelta > 0
-                    ) {
-
-                        broaderIcon =
-                            "🟢";
-
-                    }
-
-                    else if (
-                        d3 &&
-                        d3.currentDelta < 0
-                    ) {
-
-                        broaderIcon =
-                            "🔴";
-
-                    }
-
+                    //================================================
+                    // BUILD MESSAGE
+                    //================================================
 
                     msg +=
 
 `${index + 1}. *${coin.symbol}*
 
 ⚡ *30M ORDER FLOW*
-${currentIcon} ${currentControl}
+${flowIcon} ${flowControl}
 Delta: ${d30.currentDelta.toFixed(0)}
 ${d30.trend}
 
 📊 *3H BROADER FLOW*
 ${
     d3
-        ? `${broaderIcon} ${d3.currentDelta.toFixed(0)}
+        ? `${d3.currentDelta >= 0 ? "🟢" : "🔴"} ${d3.currentDelta.toFixed(0)}
+${d3.control}
 ${d3.trend}`
-        : `⚪ DATA UNAVAILABLE`
+        : "⚪ DATA UNAVAILABLE"
 }
-
-🔗 *DELTA RELATIONSHIP*
-${coin.deltaRelationship}
 
 `;
 
 
-                    //======================================
-                    // SEPARATOR
-                    //======================================
+                    // Separator between coins.
 
                     if (
                         index <
@@ -1124,9 +1340,9 @@ ${coin.deltaRelationship}
         }
 
 
-        //==================================================
-        // FOOTER
-        //==================================================
+        //================================================
+        // REPORT GUIDE
+        //================================================
 
         msg +=
 `
@@ -1137,29 +1353,32 @@ ${coin.deltaRelationship}
 ⚡ 30M Delta = current order-flow pressure
 📊 3H Delta = broader order-flow context
 
-🟢 Positive Delta = buyers have greater
-   volume pressure
+🟢 Positive Delta
+Buyers have greater volume pressure.
 
-🔴 Negative Delta = sellers have greater
-   volume pressure
+🔴 Negative Delta
+Sellers have greater volume pressure.
 
-📈 Higher Positive = buying strengthening
-📉 Lower Positive = buying weakening
+📈 Higher Positive
+Buying pressure is strengthening.
 
-📈 Higher Negative = selling weakening
-📉 Lower Negative = selling strengthening
+📉 Lower Positive
+Buying pressure is weakening.
 
-🔗 30M/3H alignment is informational only.
-It is NOT required for a coin to appear.
+📈 Higher Negative
+Selling pressure is weakening.
 
-⚠️ This report is informational,
-not an automatic trading signal.
+📉 Lower Negative
+Selling pressure is strengthening.
+
+⚠️ *INFORMATIONAL ONLY*
+This report is not an automatic trading signal.
 `;
 
 
-        //==================================================
+        //================================================
         // SEND TELEGRAM
-        //==================================================
+        //================================================
 
         await sendMessage(
             msg
@@ -1167,10 +1386,11 @@ not an automatic trading signal.
 
     }
 
+
     catch (err) {
 
         log(
-            `Coin Order Flow Report Error: ${
+            `Order Flow Report Error: ${
                 err.message
             }`
         );
