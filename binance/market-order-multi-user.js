@@ -609,62 +609,40 @@ setInterval(async () => {
 //======================================================
 // COIN ORDER FLOW REPORT
 //
-// FINAL DELTA-ONLY VERSION
+// FINAL VERSION
 //
 // COMPONENTS
 //
 // • 30M Cumulative Delta
-// • 3H Cumulative Delta
 // • 30M Order Flow State
-// • 3H Broader Order Flow State
+// • 3H Trend-Reset ATR Structure
+// • 3H Active Support / Resistance
 // • Top 7 Order-Flow Coins
-//
-// REMOVED
-//
-// • STC
-// • OBV
-// • ATR
-// • EMA
-// • Delta crossover
-// • 30M/3H relationship
-// • Delta alignment filter
-// • Directional filtering
 //
 // REPORT INTERVAL = 30 MINUTES
 //
 // PURPOSE:
 //
-// INFORMATIONAL ORDER-FLOW REPORT
+// INFORMATIONAL ONLY.
 //
 // 30M = CURRENT ORDER FLOW
-// 3H  = BROADER ORDER FLOW
-//
-// The report tells the trader whether the
-// current completed candle data shows buyers
-// or sellers exerting greater volume pressure.
-//
-// IMPORTANT:
-//
-// This cumulative delta is a candle-volume proxy:
-//
-// Green candle = positive volume
-// Red candle   = negative volume
-//
-// It is NOT true aggressive buy/sell trade delta.
+// 3H  = TREND / ATR STRUCTURE
 //======================================================
+
+
+//======================================================
+// 3H TREND SETTINGS
+//======================================================
+
+const TREND_EMA_LENGTH = 20;
+
+const TREND_ATR_LENGTH = 14;
+
+const TREND_ATR_MULTIPLIER = 1;
 
 
 //======================================================
 // CUMULATIVE DELTA
-//
-// IMPORTANT:
-//
-// No session filtering is used.
-//
-// The supplied candles are processed directly.
-//
-// This means the calculation is independent of
-// SESSION_START_HOUR.
 //======================================================
 
 function calculateCumulativeDelta(candles) {
@@ -708,10 +686,6 @@ function calculateCumulativeDelta(candles) {
 
         }
 
-        // Do nothing when:
-        //
-        // candle.close === candle.open
-
 
         cumulativeDelta.push(
             delta
@@ -727,17 +701,6 @@ function calculateCumulativeDelta(candles) {
 
 //======================================================
 // ANALYZE DELTA
-//
-// Determines:
-//
-// • Current cumulative Delta
-// • Previous cumulative Delta
-// • Delta change
-// • Higher Positive
-// • Lower Positive
-// • Higher Negative
-// • Lower Negative
-// • Buyers/Sellers in control
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
@@ -785,10 +748,6 @@ function analyzeDelta(cumulativeDelta) {
         "BALANCED";
 
 
-    //==================================================
-    // POSITIVE DELTA
-    //==================================================
-
     if (
         currentDelta > 0
     ) {
@@ -826,10 +785,6 @@ function analyzeDelta(cumulativeDelta) {
 
     }
 
-
-    //==================================================
-    // NEGATIVE DELTA
-    //==================================================
 
     else if (
         currentDelta < 0
@@ -869,15 +824,10 @@ function analyzeDelta(cumulativeDelta) {
     }
 
 
-    //==================================================
-    // ZERO
-    //==================================================
-
     else {
 
         control =
             "BALANCED";
-
 
         trend =
             "AT ZERO";
@@ -903,49 +853,535 @@ function analyzeDelta(cumulativeDelta) {
 
 
 //======================================================
-// CALCULATE COIN ORDER FLOW
-//
-// 30M = CURRENT ORDER FLOW
-// 3H  = BROADER ORDER FLOW
-//
-// IMPORTANT:
-//
-// • No scoring
-// • No alignment
-// • No crossover
-// • No STC
-// • No OBV
-// • No ATR
-// • No EMA
-//
-// A coin qualifies as long as valid 30M Delta
-// data is available.
-//
-// 3H is informational only.
-//
-// The 3H calculation uses completed historical
-// 3H candles immediately.
-//
-// It does NOT wait for three hours after startup.
-//
-// Once running:
-//
-// 30M → updates every 30 minutes
-// 3H  → changes only when a new 3H candle closes
+// EMA
 //======================================================
 
-async function calculateCoinScore(symbol) {
+function calculateEMA(
+    candles,
+    period
+) {
+
+    if (
+        !candles ||
+        candles.length < period
+    ) {
+
+        return [];
+
+    }
+
+
+    const emaSeries = [];
+
+
+    let sum = 0;
+
+
+    for (
+        let i = 0;
+        i < period;
+        i++
+    ) {
+
+        sum +=
+            candles[i].close;
+
+    }
+
+
+    let ema =
+        sum / period;
+
+
+    emaSeries.push(
+        ema
+    );
+
+
+    const multiplier =
+        2 /
+        (period + 1);
+
+
+    for (
+        let i = period;
+        i < candles.length;
+        i++
+    ) {
+
+        ema =
+            (
+                candles[i].close -
+                ema
+            ) *
+            multiplier +
+            ema;
+
+
+        emaSeries.push(
+            ema
+        );
+
+    }
+
+
+    return emaSeries;
+
+}
+
+
+//======================================================
+// TRUE RANGE
+//======================================================
+
+function calculateTrueRange(
+    current,
+    previous
+) {
+
+    if (!previous) {
+
+        return (
+            current.high -
+            current.low
+        );
+
+    }
+
+
+    const range1 =
+        current.high -
+        current.low;
+
+
+    const range2 =
+        Math.abs(
+            current.high -
+            previous.close
+        );
+
+
+    const range3 =
+        Math.abs(
+            current.low -
+            previous.close
+        );
+
+
+    return Math.max(
+        range1,
+        range2,
+        range3
+    );
+
+}
+
+
+//======================================================
+// ATR
+//======================================================
+
+function calculateATRSeries(
+    candles,
+    period
+) {
+
+    if (
+        !candles ||
+        candles.length <= period
+    ) {
+
+        return [];
+
+    }
+
+
+    const trueRanges = [];
+
+
+    for (
+        let i = 0;
+        i < candles.length;
+        i++
+    ) {
+
+        trueRanges.push(
+            calculateTrueRange(
+                candles[i],
+                i > 0
+                    ? candles[i - 1]
+                    : null
+            )
+        );
+
+    }
+
+
+    const atrSeries = [];
+
+
+    let sum = 0;
+
+
+    for (
+        let i = 0;
+        i < period;
+        i++
+    ) {
+
+        sum +=
+            trueRanges[i];
+
+    }
+
+
+    let atr =
+        sum / period;
+
+
+    atrSeries.push(
+        atr
+    );
+
+
+    for (
+        let i = period;
+        i < trueRanges.length;
+        i++
+    ) {
+
+        atr =
+            (
+                (
+                    atr *
+                    (period - 1)
+                ) +
+                trueRanges[i]
+            ) /
+            period;
+
+
+        atrSeries.push(
+            atr
+        );
+
+    }
+
+
+    return atrSeries;
+
+}
+
+
+//======================================================
+// CALCULATE 3H TREND / ATR STRUCTURE
+//======================================================
+
+function calculate3HTrendATR(
+    candles
+) {
+
+    if (
+        !candles ||
+        candles.length < 30
+    ) {
+
+        return null;
+
+    }
+
+
+    const emaSeries =
+        calculateEMA(
+            candles,
+            TREND_EMA_LENGTH
+        );
+
+
+    const atrSeries =
+        calculateATRSeries(
+            candles,
+            TREND_ATR_LENGTH
+        );
+
+
+    if (
+        !emaSeries.length ||
+        !atrSeries.length
+    ) {
+
+        return null;
+
+    }
+
+
+    const emaStart =
+        TREND_EMA_LENGTH - 1;
+
+
+    const atrStart =
+        TREND_ATR_LENGTH;
+
+
+    const startIndex =
+        Math.max(
+            emaStart,
+            atrStart
+        );
+
+
+    let trendState =
+        0;
+
+
+    let currentUpperBand =
+        null;
+
+
+    let currentLowerBand =
+        null;
+
+
+    let lastBreakType =
+        "NONE";
+
+
+    let lastBreakIndex =
+        -1;
+
+
+    for (
+        let i = startIndex;
+        i < candles.length;
+        i++
+    ) {
+
+        const emaIndex =
+            i - emaStart;
+
+
+        const atrIndex =
+            i - atrStart;
+
+
+        const baseEma =
+            emaSeries[
+                emaIndex
+            ];
+
+
+        const atrValue =
+            atrSeries[
+                atrIndex
+            ];
+
+
+        if (
+            baseEma === undefined ||
+            atrValue === undefined
+        ) {
+
+            continue;
+
+        }
+
+
+        const upperBand =
+            baseEma +
+            atrValue *
+            TREND_ATR_MULTIPLIER;
+
+
+        const lowerBand =
+            baseEma -
+            atrValue *
+            TREND_ATR_MULTIPLIER;
+
+
+        currentUpperBand =
+            upperBand;
+
+
+        currentLowerBand =
+            lowerBand;
+
+
+        const previousTrendState =
+            trendState;
+
+
+        if (
+            candles[i].close >
+            upperBand
+        ) {
+
+            trendState =
+                1;
+
+        }
+
+        else if (
+            candles[i].close <
+            lowerBand
+        ) {
+
+            trendState =
+                -1;
+
+        }
+
+
+        const trendChanged =
+            trendState !==
+            previousTrendState;
+
+
+        if (
+            trendChanged &&
+            trendState === 1
+        ) {
+
+            lastBreakType =
+                "UPPER BAND BREAK";
+
+
+            lastBreakIndex =
+                i;
+
+        }
+
+        else if (
+            trendChanged &&
+            trendState === -1
+        ) {
+
+            lastBreakType =
+                "LOWER BAND BREAK";
+
+
+            lastBreakIndex =
+                i;
+
+        }
+
+    }
+
+
+    if (
+        trendState === 0
+    ) {
+
+        return {
+
+            trend:
+                "NEUTRAL",
+
+            trendState:
+                0,
+
+            upperBand:
+                currentUpperBand,
+
+            lowerBand:
+                currentLowerBand,
+
+            activeLevel:
+                null,
+
+            activeType:
+                "NONE",
+
+            lastBreak:
+                "NONE",
+
+            lastBreakIndex
+
+        };
+
+    }
+
+
+    if (
+        trendState === 1
+    ) {
+
+        return {
+
+            trend:
+                "BULLISH TREND",
+
+            trendState:
+                1,
+
+            upperBand:
+                currentUpperBand,
+
+            lowerBand:
+                currentLowerBand,
+
+            activeLevel:
+                currentLowerBand,
+
+            activeType:
+                "SUPPORT",
+
+            lastBreak:
+                lastBreakType,
+
+            lastBreakIndex
+
+        };
+
+    }
+
+
+    return {
+
+        trend:
+            "BEARISH TREND",
+
+        trendState:
+            -1,
+
+        upperBand:
+            currentUpperBand,
+
+        lowerBand:
+            currentLowerBand,
+
+        activeLevel:
+            currentUpperBand,
+
+        activeType:
+            "RESISTANCE",
+
+        lastBreak:
+            lastBreakType,
+
+        lastBreakIndex
+
+    };
+
+}
+
+
+//======================================================
+// CALCULATE COIN ORDER FLOW
+//======================================================
+
+async function calculateCoinScore(
+    symbol
+) {
 
     try {
 
-        let delta30M = null;
+        let delta30M =
+            null;
 
-        let delta3H = null;
 
+        let trend3H =
+            null;
 
-        //================================================
-        // 30M DATA
-        //================================================
 
         const candles30M =
             await fetchFuturesKlines(
@@ -969,10 +1405,6 @@ async function calculateCoinScore(symbol) {
         }
 
 
-        //================================================
-        // REMOVE CURRENTLY FORMING 30M CANDLE
-        //================================================
-
         const closed30M =
             candles30M.slice(
                 0,
@@ -984,18 +1416,10 @@ async function calculateCoinScore(symbol) {
             closed30M.length < 2
         ) {
 
-            log(
-                `Not enough completed 30M candles for ${symbol}`
-            );
-
             return null;
 
         }
 
-
-        //================================================
-        // CALCULATE 30M DELTA
-        //================================================
 
         const delta30MSeries =
             calculateCumulativeDelta(
@@ -1020,25 +1444,6 @@ async function calculateCoinScore(symbol) {
         }
 
 
-        //================================================
-        // 3H DATA
-        //
-        // 3H = BROADER ORDER-FLOW CONTEXT
-        //
-        // IMPORTANT:
-        //
-        // We use historical 3H candles supplied by
-        // the exchange.
-        //
-        // We remove ONLY the currently forming
-        // 3H candle.
-        //
-        // Therefore historical completed candles
-        // are available immediately.
-        //
-        // We do NOT wait three hours after startup.
-        //================================================
-
         const candles3H =
             await fetchFuturesKlines(
                 symbol,
@@ -1049,10 +1454,8 @@ async function calculateCoinScore(symbol) {
 
         if (
             candles3H &&
-            candles3H.length >= 3
+            candles3H.length >= 30
         ) {
-
-            // Remove currently forming 3H candle.
 
             const closed3H =
                 candles3H.slice(
@@ -1061,56 +1464,13 @@ async function calculateCoinScore(symbol) {
                 );
 
 
-            // Need at least two completed candles
-            // because analyzeDelta() compares the
-            // current Delta with the previous Delta.
-
-            if (
-                closed3H.length >= 2
-            ) {
-
-                const delta3HSeries =
-                    calculateCumulativeDelta(
-                        closed3H
-                    );
-
-
-                delta3H =
-                    analyzeDelta(
-                        delta3HSeries
-                    );
-
-            }
-
-            else {
-
-                log(
-                    `Not enough completed 3H candles for ${symbol}`
+            trend3H =
+                calculate3HTrendATR(
+                    closed3H
                 );
 
-            }
-
         }
 
-        else {
-
-            log(
-                `3H data unavailable for ${symbol}`
-            );
-
-        }
-
-
-        //================================================
-        // 30M ORDER-FLOW STRENGTH
-        //
-        // Used ONLY for Top 7 ranking.
-        //
-        // Stronger absolute change in the latest
-        // completed 30M Delta = higher ranking.
-        //
-        // This is NOT a trading signal.
-        //================================================
 
         const orderFlowStrength =
             Math.abs(
@@ -1118,37 +1478,15 @@ async function calculateCoinScore(symbol) {
             );
 
 
-        //================================================
-        // 3H BROADER STRENGTH
-        //
-        // Informational only.
-        //
-        // Not used for ranking.
-        //================================================
-
-        const broaderStrength =
-            delta3H
-                ? Math.abs(
-                    delta3H.deltaChange
-                )
-                : 0;
-
-
-        //================================================
-        // RETURN
-        //================================================
-
         return {
 
             symbol,
 
             delta30M,
 
-            delta3H,
+            trend3H,
 
-            orderFlowStrength,
-
-            broaderStrength
+            orderFlowStrength
 
         };
 
@@ -1156,13 +1494,6 @@ async function calculateCoinScore(symbol) {
 
 
     catch (err) {
-
-        //================================================
-        // IMPORTANT:
-        //
-        // One failed coin must NOT stop the
-        // entire scanner.
-        //================================================
 
         log(
             `Order Flow Error ${symbol}: ${
@@ -1177,29 +1508,14 @@ async function calculateCoinScore(symbol) {
 
 }
 
-
 //======================================================
 // GENERATE COIN ORDER FLOW REPORT
 //
 // INFORMATIONAL ONLY.
 //
-// No alignment requirement.
+// Top 7 ranking is based on 30M Delta movement.
 //
-// No crossover requirement.
-//
-// No directional filter.
-//
-// Every coin with valid 30M Delta data can
-// qualify for the Top 7.
-//
-// RANKING:
-//
-// Strongest 30M Delta CHANGE first.
-//
-// 3H is NOT used to rank the coins.
-//
-// This keeps the Top 7 focused on CURRENT
-// order-flow activity.
+// 3H Trend / ATR does NOT affect ranking.
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1251,7 +1567,7 @@ async function generateCoinScoreReport() {
         //================================================
         // TOP 7
         //
-        // Ranked by absolute 30M Delta movement.
+        // Strongest 30M Delta movement first.
         //================================================
 
         const top7 =
@@ -1275,8 +1591,8 @@ async function generateCoinScoreReport() {
 `⚡ *COIN ORDER FLOW REPORT*
 🕐 30-MINUTE UPDATE
 
-📊 3H = BROADER ORDER FLOW
 ⚡ 30M = CURRENT ORDER FLOW
+📊 3H = TREND / ATR STRUCTURE
 
 `;
 
@@ -1312,18 +1628,21 @@ The scanner is still monitoring all coins.
 
 
             top7.forEach(
-                (coin, index) => {
+                (
+                    coin,
+                    index
+                ) => {
 
                     const d30 =
                         coin.delta30M;
 
 
-                    const d3 =
-                        coin.delta3H;
+                    const t3 =
+                        coin.trend3H;
 
 
                     //================================================
-                    // 30M CONTROL
+                    // 30M ORDER FLOW
                     //================================================
 
                     let flowIcon =
@@ -1362,7 +1681,7 @@ The scanner is still monitoring all coins.
 
 
                     //================================================
-                    // BUILD MESSAGE
+                    // COIN HEADER + 30M FLOW
                     //================================================
 
                     msg +=
@@ -1374,20 +1693,82 @@ ${flowIcon} ${flowControl}
 Delta: ${d30.currentDelta.toFixed(0)}
 ${d30.trend}
 
-📊 *3H BROADER FLOW*
-${
-    d3
-        ? `${
-            d3.currentDelta >= 0
-                ? "🟢"
-                : "🔴"
-        } ${d3.currentDelta.toFixed(0)}
-${d3.control}
-${d3.trend}`
-        : "⚪ DATA UNAVAILABLE"
+`;
+
+
+                    //================================================
+                    // 3H TREND / ATR
+                    //================================================
+
+                    msg +=
+`📊 *3H TREND / ATR*
+`;
+
+
+                    if (
+                        !t3
+                    ) {
+
+                        msg +=
+`⚪ DATA UNAVAILABLE
+
+`;
+
+                    }
+
+
+                    else if (
+                        t3.trendState === 1
+                    ) {
+
+                        msg +=
+
+`🟢 *BULLISH TREND*
+Price closed ABOVE the upper ATR band.
+
+📍 *ACTIVE SUPPORT*
+Lower ATR Band: ${
+    t3.lowerBand !== null
+        ? t3.lowerBand.toFixed(6)
+        : "N/A"
 }
 
 `;
+
+                    }
+
+
+                    else if (
+                        t3.trendState === -1
+                    ) {
+
+                        msg +=
+
+`🔴 *BEARISH TREND*
+Price closed BELOW the lower ATR band.
+
+📍 *ACTIVE RESISTANCE*
+Upper ATR Band: ${
+    t3.upperBand !== null
+        ? t3.upperBand.toFixed(6)
+        : "N/A"
+}
+
+`;
+
+                    }
+
+
+                    else {
+
+                        msg +=
+
+`⚪ *NEUTRAL*
+No upper/lower ATR breakout has been established.
+
+`;
+
+                    }
 
 
                     //================================================
@@ -1417,31 +1798,52 @@ ${d3.trend}`
         //================================================
 
         msg +=
+
 `
 ━━━━━━━━━━━━━━━━━━━━
 
 📌 *ORDER FLOW GUIDE*
 
-⚡ 30M Delta = current order-flow pressure
-📊 3H Delta = broader order-flow context
+⚡ *30M ORDER FLOW*
 
 🟢 Positive Delta
-Buyers have greater volume pressure.
+BUYERS IN CONTROL
 
 🔴 Negative Delta
-Sellers have greater volume pressure.
+SELLERS IN CONTROL
 
 📈 Higher Positive
-Buying pressure is strengthening.
+Buying pressure strengthening
 
 📉 Lower Positive
-Buying pressure is weakening.
+Buying pressure weakening
 
 📈 Higher Negative
-Selling pressure is weakening.
+Selling pressure weakening
 
 📉 Lower Negative
-Selling pressure is strengthening.
+Selling pressure strengthening
+
+
+📊 *3H TREND / ATR*
+
+🟢 *BULLISH TREND*
+Price closed above the upper ATR band.
+
+📍 Lower ATR Band
+ACTIVE SUPPORT.
+
+
+🔴 *BEARISH TREND*
+Price closed below the lower ATR band.
+
+📍 Upper ATR Band
+ACTIVE RESISTANCE.
+
+
+⚪ *NEUTRAL*
+No confirmed ATR-band breakout.
+
 
 ⚠️ *INFORMATIONAL ONLY*
 This report is not an automatic trading signal.
