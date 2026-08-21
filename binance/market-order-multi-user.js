@@ -615,8 +615,8 @@ setInterval(async () => {
 //
 // • 30M Cumulative Delta
 // • 30M Order Flow State
-// • 3H Trend-Reset ATR Structure
-// • 3H Active Support / Resistance
+// • 4H Trend-Reset ATR Structure
+// • 4H Active Support / Resistance
 // • Top 7 Order-Flow Coins
 //
 // REPORT INTERVAL = 30 MINUTES
@@ -626,12 +626,12 @@ setInterval(async () => {
 // INFORMATIONAL ONLY.
 //
 // 30M = CURRENT ORDER FLOW
-// 3H  = TREND / ATR STRUCTURE
+// 4H  = TREND / ATR STRUCTURE
 //======================================================
 
 
 //======================================================
-// 3H TREND SETTINGS
+// 4H TREND SETTINGS
 //
 // MATCHES YOUR CHART:
 //
@@ -1168,336 +1168,289 @@ function calculateATRValue(
 }
 
 
-//======================================================
-// 3H TREND / ATR STRUCTURE
+//================================================
+// 4H TREND / ATR
 //
-// EXACT LOGIC:
+// 4H = BROADER TREND CONTEXT
 //
-// If a COMPLETED 3H candle closes above
-// EMA20 + ATR14 × 1:
+// Uses Binance's native 4H candles.
 //
-//     BULLISH TREND
-//     LOWER BAND = SUPPORT
+// ChartPrime settings:
 //
-// If a COMPLETED 3H candle closes below
-// EMA20 - ATR14 × 1:
+// EMA Length  = 20
+// ATR Length  = 14
+// ATR Mult    = 1
 //
-//     BEARISH TREND
-//     UPPER BAND = RESISTANCE
+// Latest COMPLETED 4H candle is used.
 //
-// Otherwise the previous trend state remains.
+// Logic:
 //
-// IMPORTANT:
+// Close > Upper ATR Band
+//     → BULLISH TREND
+//     → Lower ATR Band = SUPPORT
 //
-// This function works from historical 3H data.
-// It does NOT require the bot to wait three hours
-// after starting.
-//======================================================
+// Close < Lower ATR Band
+//     → BEARISH TREND
+//     → Upper ATR Band = RESISTANCE
+//
+// Otherwise:
+//     → PRICE INSIDE ATR BANDS
+//================================================
 
-function calculate3HTrendATR(
-    candles
+let trend4H = null;
+
+if (
+    candles4H &&
+    candles4H.length >= 25
 ) {
 
-    if (
-        !candles ||
-        candles.length <
-        TREND_EMA_LENGTH + 2
-    ) {
+    // Remove currently forming 4H candle.
 
-        return null;
+    const closed4H =
+        candles4H.slice(
+            0,
+            -1
+        );
 
-    }
-
-
-    //==================================================
-    // TREND STATE
-    //==================================================
-
-    let trendState =
-        0;
-
-
-    let lastBreakType =
-        "NONE";
-
-
-    let lastBreakIndex =
-        -1;
-
-
-    let activeUpperBand =
-        null;
-
-
-    let activeLowerBand =
-        null;
-
-
-    //==================================================
-    // WALK THROUGH COMPLETED 3H CANDLES
-    //==================================================
-
-    for (
-        let i =
-            TREND_EMA_LENGTH;
-        i < candles.length;
-        i++
-    ) {
-
-        const availableCandles =
-            candles.slice(
-                0,
-                i + 1
-            );
-
-
-        const ema =
-            calculateEMAValue(
-                availableCandles,
-                TREND_EMA_LENGTH
-            );
-
-
-        const atr =
-            calculateATRValue(
-                availableCandles,
-                TREND_ATR_LENGTH
-            );
-
-
-        if (
-            ema === null ||
-            atr === null
-        ) {
-
-            continue;
-
-        }
-
-
-        const upperBand =
-            ema +
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-
-        const lowerBand =
-            ema -
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-
-        const close =
-            Number(
-                candles[i].close
-            );
-
-
-        if (
-            !Number.isFinite(close)
-        ) {
-
-            continue;
-
-        }
-
-
-        const previousTrend =
-            trendState;
-
-
-        //================================================
-        // UPPER BAND BREAK
-        //================================================
-
-        if (
-            close >
-            upperBand
-        ) {
-
-            trendState =
-                1;
-
-        }
-
-
-        //================================================
-        // LOWER BAND BREAK
-        //================================================
-
-        else if (
-            close <
-            lowerBand
-        ) {
-
-            trendState =
-                -1;
-
-        }
-
-
-        //================================================
-        // NEW BULLISH TREND
-        //================================================
-
-        if (
-            trendState === 1 &&
-            previousTrend !== 1
-        ) {
-
-            lastBreakType =
-                "UPPER BAND BREAK";
-
-
-            lastBreakIndex =
-                i;
-
-        }
-
-
-        //================================================
-        // NEW BEARISH TREND
-        //================================================
-
-        if (
-            trendState === -1 &&
-            previousTrend !== -1
-        ) {
-
-            lastBreakType =
-                "LOWER BAND BREAK";
-
-
-            lastBreakIndex =
-                i;
-
-        }
-
-
-        activeUpperBand =
-            upperBand;
-
-
-        activeLowerBand =
-            lowerBand;
-
-    }
-
-
-    //==================================================
-    // NO TREND YET
-    //==================================================
 
     if (
-        trendState === 0
+        closed4H.length >= 20
     ) {
 
-        return {
+        const closes4H =
+            closed4H.map(
+                candle =>
+                    candle.close
+            );
 
-            trend:
-                "NEUTRAL",
 
-            trendState:
-                0,
+        //============================================
+        // EMA 20
+        //============================================
 
-            upperBand:
-                activeUpperBand,
+        const emaLength = 20;
 
-            lowerBand:
-                activeLowerBand,
+        const atrLength = 14;
 
-            activeLevel:
-                null,
+        const atrMultiplier = 1;
 
-            activeType:
-                "NONE",
 
-            lastBreak:
-                "NONE",
+        // Calculate EMA
 
-            lastBreakIndex
+        let ema =
+            closes4H[0];
 
-        };
+        const emaMultiplier =
+            2 /
+            (emaLength + 1);
+
+
+        for (
+            let i = 1;
+            i < closes4H.length;
+            i++
+        ) {
+
+            ema =
+                (
+                    closes4H[i] -
+                    ema
+                ) *
+                emaMultiplier +
+                ema;
+
+        }
+
+
+        //============================================
+        // ATR 14
+        //============================================
+
+        const trueRanges = [];
+
+
+        for (
+            let i = 1;
+            i < closed4H.length;
+            i++
+        ) {
+
+            const current =
+                closed4H[i];
+
+            const previous =
+                closed4H[i - 1];
+
+
+            const high =
+                current.high;
+
+            const low =
+                current.low;
+
+            const previousClose =
+                previous.close;
+
+
+            const tr =
+                Math.max(
+
+                    high - low,
+
+                    Math.abs(
+                        high -
+                        previousClose
+                    ),
+
+                    Math.abs(
+                        low -
+                        previousClose
+                    )
+
+                );
+
+
+            trueRanges.push(
+                tr
+            );
+
+        }
+
+
+        if (
+            trueRanges.length >=
+            atrLength
+        ) {
+
+            const recentTR =
+                trueRanges.slice(
+                    -atrLength
+                );
+
+
+            const atr =
+                recentTR.reduce(
+                    (
+                        sum,
+                        value
+                    ) =>
+                        sum + value,
+                    0
+                ) /
+                recentTR.length;
+
+
+            const upperBand =
+                ema +
+                (
+                    atr *
+                    atrMultiplier
+                );
+
+
+            const lowerBand =
+                ema -
+                (
+                    atr *
+                    atrMultiplier
+                );
+
+
+            const latest4H =
+                closed4H[
+                    closed4H.length - 1
+                ];
+
+
+            const close4H =
+                latest4H.close;
+
+
+            //========================================
+            // TREND / ACTIVE ATR BOUNDARY
+            //========================================
+
+            if (
+                close4H >
+                upperBand
+            ) {
+
+                trend4H = {
+
+                    state:
+                        "BULLISH TREND",
+
+                    close:
+                        close4H,
+
+                    upperBand,
+
+                    lowerBand,
+
+                    boundary:
+                        "SUPPORT",
+
+                    boundaryPrice:
+                        lowerBand
+
+                };
+
+            }
+
+            else if (
+                close4H <
+                lowerBand
+            ) {
+
+                trend4H = {
+
+                    state:
+                        "BEARISH TREND",
+
+                    close:
+                        close4H,
+
+                    upperBand,
+
+                    lowerBand,
+
+                    boundary:
+                        "RESISTANCE",
+
+                    boundaryPrice:
+                        upperBand
+
+                };
+
+            }
+
+            else {
+
+                trend4H = {
+
+                    state:
+                        "PRICE INSIDE ATR BANDS",
+
+                    close:
+                        close4H,
+
+                    upperBand,
+
+                    lowerBand,
+
+                    boundary:
+                        "NONE",
+
+                    boundaryPrice:
+                        null
+
+                };
+
+            }
+
+        }
 
     }
-
-
-    //==================================================
-    // BULLISH
-    //
-    // LOWER BAND BECOMES SUPPORT
-    //==================================================
-
-    if (
-        trendState === 1
-    ) {
-
-        return {
-
-            trend:
-                "BULLISH TREND",
-
-            trendState:
-                1,
-
-            upperBand:
-                activeUpperBand,
-
-            lowerBand:
-                activeLowerBand,
-
-            activeLevel:
-                activeLowerBand,
-
-            activeType:
-                "SUPPORT",
-
-            lastBreak:
-                lastBreakType,
-
-            lastBreakIndex
-
-        };
-
-    }
-
-
-    //==================================================
-    // BEARISH
-    //
-    // UPPER BAND BECOMES RESISTANCE
-    //==================================================
-
-    return {
-
-        trend:
-            "BEARISH TREND",
-
-        trendState:
-            -1,
-
-        upperBand:
-            activeUpperBand,
-
-        lowerBand:
-            activeLowerBand,
-
-        activeLevel:
-            activeUpperBand,
-
-        activeType:
-            "RESISTANCE",
-
-        lastBreak:
-            lastBreakType,
-
-        lastBreakIndex
-
-    };
 
 }
 
@@ -1516,7 +1469,7 @@ async function calculateCoinScore(
             null;
 
 
-        let trend3H =
+        let trend4H =
             null;
 
 
@@ -1588,47 +1541,47 @@ async function calculateCoinScore(
 
 
         //================================================
-        // 3H DATA
+        // 4H DATA
         //
         // IMPORTANT:
         //
         // Remove ONLY the currently forming candle.
         //
         // The calculation then uses historical
-        // completed 3H candles immediately.
+        // completed 4H candles immediately.
         //================================================
 
-        const candles3H =
+        const candles4H =
             await fetchFuturesKlines(
                 symbol,
-                "3h",
+                "4h",
                 120
             );
 
 
         if (
-            candles3H &&
-            candles3H.length >=
+            candles4H &&
+            candles4H.length >=
             TREND_EMA_LENGTH + 2
         ) {
 
-            const closed3H =
-                candles3H.slice(
+            const closed4H =
+                candles4H.slice(
                     0,
                     -1
                 );
 
 
-            trend3H =
-                calculate3HTrendATR(
-                    closed3H
+            trend4H =
+                calculate4HTrendATR(
+                    closed4H
                 );
 
 
-            if (!trend3H) {
+            if (!trend4H) {
 
                 log(
-                    `3H Trend/ATR calculation unavailable for ${symbol}. Candles: ${closed3H.length}`
+                    `4H Trend/ATR calculation unavailable for ${symbol}. Candles: ${closed4H.length}`
                 );
 
             }
@@ -1638,9 +1591,9 @@ async function calculateCoinScore(
         else {
 
             log(
-                `3H data unavailable for ${symbol}. Candles received: ${
-                    candles3H
-                        ? candles3H.length
+                `4H data unavailable for ${symbol}. Candles received: ${
+                    candles4H
+                        ? candles4H.length
                         : 0
                 }`
             );
@@ -1670,7 +1623,7 @@ async function calculateCoinScore(
 
             delta30M,
 
-            trend3H,
+            trend4H,
 
             orderFlowStrength
 
@@ -1701,7 +1654,7 @@ async function calculateCoinScore(
 //
 // Top 7 ranking is based ONLY on 30M Delta movement.
 //
-// 3H Trend / ATR does NOT affect ranking.
+// 4H Trend / ATR does NOT affect ranking.
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1778,7 +1731,7 @@ async function generateCoinScoreReport() {
 🕐 30-MINUTE UPDATE
 
 ⚡ 30M = CURRENT ORDER FLOW
-📊 3H = TREND / ATR STRUCTURE
+📊 4H = TREND / ATR STRUCTURE
 
 `;
 
@@ -1823,8 +1776,8 @@ The scanner is still monitoring all coins.
                         coin.delta30M;
 
 
-                    const t3 =
-                        coin.trend3H;
+                    const t4 =
+                        coin.trend4H;
 
 
                     //================================================
@@ -1883,16 +1836,16 @@ ${d30.trend}
 
 
                     //================================================
-                    // 3H TREND / ATR
+                    // 4H TREND / ATR
                     //================================================
 
                     msg +=
-`📊 *3H TREND / ATR*
+`📊 *4H TREND / ATR*
 `;
 
 
                     if (
-                        !t3
+                        !t4
                     ) {
 
                         msg +=
@@ -1904,7 +1857,7 @@ ${d30.trend}
 
 
                     else if (
-                        t3.trendState === 1
+                        t4.trendState === 1
                     ) {
 
                         msg +=
@@ -1914,8 +1867,8 @@ Price closed ABOVE the upper ATR band.
 
 📍 *ACTIVE SUPPORT*
 Lower ATR Band: ${
-    t3.lowerBand !== null
-        ? t3.lowerBand.toFixed(6)
+    t4.lowerBand !== null
+        ? t4.lowerBand.toFixed(4)
         : "N/A"
 }
 
@@ -1925,7 +1878,7 @@ Lower ATR Band: ${
 
 
                     else if (
-                        t3.trendState === -1
+                        t4.trendState === -1
                     ) {
 
                         msg +=
@@ -1935,8 +1888,8 @@ Price closed BELOW the lower ATR band.
 
 📍 *ACTIVE RESISTANCE*
 Upper ATR Band: ${
-    t3.upperBand !== null
-        ? t3.upperBand.toFixed(6)
+    t4.upperBand !== null
+        ? t4.upperBand.toFixed(4)
         : "N/A"
 }
 
@@ -2011,7 +1964,7 @@ Selling pressure weakening
 Selling pressure strengthening
 
 
-📊 *3H TREND / ATR*
+📊 *4H TREND / ATR*
 
 🟢 *BULLISH TREND*
 Price closed above the upper ATR band.
