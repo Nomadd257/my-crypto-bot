@@ -632,6 +632,13 @@ setInterval(async () => {
 
 //======================================================
 // 3H TREND SETTINGS
+//
+// MATCHES YOUR CHART:
+//
+// Base EMA Length = 20
+// ATR Length      = 14
+// ATR Multiplier  = 1
+// Source          = Close
 //======================================================
 
 const TREND_EMA_LENGTH = 20;
@@ -666,23 +673,40 @@ function calculateCumulativeDelta(candles) {
         const candle of candles
     ) {
 
+        const open =
+            Number(candle.open);
+
+        const close =
+            Number(candle.close);
+
+        const volume =
+            Number(candle.volume);
+
+
         if (
-            candle.close >
-            candle.open
+            !Number.isFinite(open) ||
+            !Number.isFinite(close) ||
+            !Number.isFinite(volume)
         ) {
 
-            delta +=
-                candle.volume;
+            continue;
+
+        }
+
+
+        if (
+            close > open
+        ) {
+
+            delta += volume;
 
         }
 
         else if (
-            candle.close <
-            candle.open
+            close < open
         ) {
 
-            delta -=
-                candle.volume;
+            delta -= volume;
 
         }
 
@@ -724,15 +748,29 @@ function analyzeDelta(cumulativeDelta) {
 
 
     const currentDelta =
-        cumulativeDelta[
-            currentIndex
-        ];
+        Number(
+            cumulativeDelta[
+                currentIndex
+            ]
+        );
 
 
     const previousDelta =
-        cumulativeDelta[
-            previousIndex
-        ];
+        Number(
+            cumulativeDelta[
+                previousIndex
+            ]
+        );
+
+
+    if (
+        !Number.isFinite(currentDelta) ||
+        !Number.isFinite(previousDelta)
+    ) {
+
+        return null;
+
+    }
 
 
     const deltaChange =
@@ -747,6 +785,10 @@ function analyzeDelta(cumulativeDelta) {
     let control =
         "BALANCED";
 
+
+    //==================================================
+    // POSITIVE DELTA
+    //==================================================
 
     if (
         currentDelta > 0
@@ -786,6 +828,10 @@ function analyzeDelta(cumulativeDelta) {
     }
 
 
+    //==================================================
+    // NEGATIVE DELTA
+    //==================================================
+
     else if (
         currentDelta < 0
     ) {
@@ -824,10 +870,15 @@ function analyzeDelta(cumulativeDelta) {
     }
 
 
+    //==================================================
+    // ZERO
+    //==================================================
+
     else {
 
         control =
             "BALANCED";
+
 
         trend =
             "AT ZERO";
@@ -853,10 +904,12 @@ function analyzeDelta(cumulativeDelta) {
 
 
 //======================================================
-// EMA
+// EMA VALUE
+//
+// Standard EMA calculation.
 //======================================================
 
-function calculateEMA(
+function calculateEMAValue(
     candles,
     period
 ) {
@@ -866,12 +919,9 @@ function calculateEMA(
         candles.length < period
     ) {
 
-        return [];
+        return null;
 
     }
-
-
-    const emaSeries = [];
 
 
     let sum = 0;
@@ -883,19 +933,28 @@ function calculateEMA(
         i++
     ) {
 
-        sum +=
-            candles[i].close;
+        const close =
+            Number(
+                candles[i].close
+            );
+
+
+        if (
+            !Number.isFinite(close)
+        ) {
+
+            return null;
+
+        }
+
+
+        sum += close;
 
     }
 
 
     let ema =
         sum / period;
-
-
-    emaSeries.push(
-        ema
-    );
 
 
     const multiplier =
@@ -909,79 +968,44 @@ function calculateEMA(
         i++
     ) {
 
+        const close =
+            Number(
+                candles[i].close
+            );
+
+
+        if (
+            !Number.isFinite(close)
+        ) {
+
+            continue;
+
+        }
+
+
         ema =
             (
-                candles[i].close -
+                close -
                 ema
             ) *
             multiplier +
             ema;
 
-
-        emaSeries.push(
-            ema
-        );
-
     }
 
 
-    return emaSeries;
+    return ema;
 
 }
 
 
 //======================================================
-// TRUE RANGE
+// ATR VALUE
+//
+// Wilder-style ATR calculation.
 //======================================================
 
-function calculateTrueRange(
-    current,
-    previous
-) {
-
-    if (!previous) {
-
-        return (
-            current.high -
-            current.low
-        );
-
-    }
-
-
-    const range1 =
-        current.high -
-        current.low;
-
-
-    const range2 =
-        Math.abs(
-            current.high -
-            previous.close
-        );
-
-
-    const range3 =
-        Math.abs(
-            current.low -
-            previous.close
-        );
-
-
-    return Math.max(
-        range1,
-        range2,
-        range3
-    );
-
-}
-
-
-//======================================================
-// ATR
-//======================================================
-
-function calculateATRSeries(
+function calculateATRValue(
     candles,
     period
 ) {
@@ -991,7 +1015,7 @@ function calculateATRSeries(
         candles.length <= period
     ) {
 
-        return [];
+        return null;
 
     }
 
@@ -1005,47 +1029,123 @@ function calculateATRSeries(
         i++
     ) {
 
+        const high =
+            Number(
+                candles[i].high
+            );
+
+
+        const low =
+            Number(
+                candles[i].low
+            );
+
+
+        if (
+            !Number.isFinite(high) ||
+            !Number.isFinite(low)
+        ) {
+
+            return null;
+
+        }
+
+
+        if (
+            i === 0
+        ) {
+
+            trueRanges.push(
+                high - low
+            );
+
+            continue;
+
+        }
+
+
+        const previousClose =
+            Number(
+                candles[
+                    i - 1
+                ].close
+            );
+
+
+        if (
+            !Number.isFinite(
+                previousClose
+            )
+        ) {
+
+            return null;
+
+        }
+
+
+        const range1 =
+            high - low;
+
+
+        const range2 =
+            Math.abs(
+                high -
+                previousClose
+            );
+
+
+        const range3 =
+            Math.abs(
+                low -
+                previousClose
+            );
+
+
         trueRanges.push(
-            calculateTrueRange(
-                candles[i],
-                i > 0
-                    ? candles[i - 1]
-                    : null
+            Math.max(
+                range1,
+                range2,
+                range3
             )
         );
 
     }
 
 
-    const atrSeries = [];
+    if (
+        trueRanges.length <= period
+    ) {
+
+        return null;
+
+    }
 
 
-    let sum = 0;
+    let atr = 0;
 
+
+    // Initial ATR
 
     for (
-        let i = 0;
-        i < period;
+        let i = 1;
+        i <= period;
         i++
     ) {
 
-        sum +=
+        atr +=
             trueRanges[i];
 
     }
 
 
-    let atr =
-        sum / period;
+    atr /=
+        period;
 
 
-    atrSeries.push(
-        atr
-    );
-
+    // Wilder smoothing
 
     for (
-        let i = period;
+        let i = period + 1;
         i < trueRanges.length;
         i++
     ) {
@@ -1060,21 +1160,38 @@ function calculateATRSeries(
             ) /
             period;
 
-
-        atrSeries.push(
-            atr
-        );
-
     }
 
 
-    return atrSeries;
+    return atr;
 
 }
 
 
 //======================================================
-// CALCULATE 3H TREND / ATR STRUCTURE
+// 3H TREND / ATR STRUCTURE
+//
+// EXACT LOGIC:
+//
+// If a COMPLETED 3H candle closes above
+// EMA20 + ATR14 × 1:
+//
+//     BULLISH TREND
+//     LOWER BAND = SUPPORT
+//
+// If a COMPLETED 3H candle closes below
+// EMA20 - ATR14 × 1:
+//
+//     BEARISH TREND
+//     UPPER BAND = RESISTANCE
+//
+// Otherwise the previous trend state remains.
+//
+// IMPORTANT:
+//
+// This function works from historical 3H data.
+// It does NOT require the bot to wait three hours
+// after starting.
 //======================================================
 
 function calculate3HTrendATR(
@@ -1083,7 +1200,8 @@ function calculate3HTrendATR(
 
     if (
         !candles ||
-        candles.length < 30
+        candles.length <
+        TREND_EMA_LENGTH + 2
     ) {
 
         return null;
@@ -1091,55 +1209,12 @@ function calculate3HTrendATR(
     }
 
 
-    const emaSeries =
-        calculateEMA(
-            candles,
-            TREND_EMA_LENGTH
-        );
-
-
-    const atrSeries =
-        calculateATRSeries(
-            candles,
-            TREND_ATR_LENGTH
-        );
-
-
-    if (
-        !emaSeries.length ||
-        !atrSeries.length
-    ) {
-
-        return null;
-
-    }
-
-
-    const emaStart =
-        TREND_EMA_LENGTH - 1;
-
-
-    const atrStart =
-        TREND_ATR_LENGTH;
-
-
-    const startIndex =
-        Math.max(
-            emaStart,
-            atrStart
-        );
-
+    //==================================================
+    // TREND STATE
+    //==================================================
 
     let trendState =
         0;
-
-
-    let currentUpperBand =
-        null;
-
-
-    let currentLowerBand =
-        null;
 
 
     let lastBreakType =
@@ -1150,35 +1225,49 @@ function calculate3HTrendATR(
         -1;
 
 
+    let activeUpperBand =
+        null;
+
+
+    let activeLowerBand =
+        null;
+
+
+    //==================================================
+    // WALK THROUGH COMPLETED 3H CANDLES
+    //==================================================
+
     for (
-        let i = startIndex;
+        let i =
+            TREND_EMA_LENGTH;
         i < candles.length;
         i++
     ) {
 
-        const emaIndex =
-            i - emaStart;
+        const availableCandles =
+            candles.slice(
+                0,
+                i + 1
+            );
 
 
-        const atrIndex =
-            i - atrStart;
+        const ema =
+            calculateEMAValue(
+                availableCandles,
+                TREND_EMA_LENGTH
+            );
 
 
-        const baseEma =
-            emaSeries[
-                emaIndex
-            ];
-
-
-        const atrValue =
-            atrSeries[
-                atrIndex
-            ];
+        const atr =
+            calculateATRValue(
+                availableCandles,
+                TREND_ATR_LENGTH
+            );
 
 
         if (
-            baseEma === undefined ||
-            atrValue === undefined
+            ema === null ||
+            atr === null
         ) {
 
             continue;
@@ -1187,31 +1276,46 @@ function calculate3HTrendATR(
 
 
         const upperBand =
-            baseEma +
-            atrValue *
-            TREND_ATR_MULTIPLIER;
+            ema +
+            (
+                atr *
+                TREND_ATR_MULTIPLIER
+            );
 
 
         const lowerBand =
-            baseEma -
-            atrValue *
-            TREND_ATR_MULTIPLIER;
+            ema -
+            (
+                atr *
+                TREND_ATR_MULTIPLIER
+            );
 
 
-        currentUpperBand =
-            upperBand;
-
-
-        currentLowerBand =
-            lowerBand;
-
-
-        const previousTrendState =
-            trendState;
+        const close =
+            Number(
+                candles[i].close
+            );
 
 
         if (
-            candles[i].close >
+            !Number.isFinite(close)
+        ) {
+
+            continue;
+
+        }
+
+
+        const previousTrend =
+            trendState;
+
+
+        //================================================
+        // UPPER BAND BREAK
+        //================================================
+
+        if (
+            close >
             upperBand
         ) {
 
@@ -1220,8 +1324,13 @@ function calculate3HTrendATR(
 
         }
 
+
+        //================================================
+        // LOWER BAND BREAK
+        //================================================
+
         else if (
-            candles[i].close <
+            close <
             lowerBand
         ) {
 
@@ -1231,14 +1340,13 @@ function calculate3HTrendATR(
         }
 
 
-        const trendChanged =
-            trendState !==
-            previousTrendState;
-
+        //================================================
+        // NEW BULLISH TREND
+        //================================================
 
         if (
-            trendChanged &&
-            trendState === 1
+            trendState === 1 &&
+            previousTrend !== 1
         ) {
 
             lastBreakType =
@@ -1250,9 +1358,14 @@ function calculate3HTrendATR(
 
         }
 
-        else if (
-            trendChanged &&
-            trendState === -1
+
+        //================================================
+        // NEW BEARISH TREND
+        //================================================
+
+        if (
+            trendState === -1 &&
+            previousTrend !== -1
         ) {
 
             lastBreakType =
@@ -1264,8 +1377,20 @@ function calculate3HTrendATR(
 
         }
 
+
+        activeUpperBand =
+            upperBand;
+
+
+        activeLowerBand =
+            lowerBand;
+
     }
 
+
+    //==================================================
+    // NO TREND YET
+    //==================================================
 
     if (
         trendState === 0
@@ -1280,10 +1405,10 @@ function calculate3HTrendATR(
                 0,
 
             upperBand:
-                currentUpperBand,
+                activeUpperBand,
 
             lowerBand:
-                currentLowerBand,
+                activeLowerBand,
 
             activeLevel:
                 null,
@@ -1301,6 +1426,12 @@ function calculate3HTrendATR(
     }
 
 
+    //==================================================
+    // BULLISH
+    //
+    // LOWER BAND BECOMES SUPPORT
+    //==================================================
+
     if (
         trendState === 1
     ) {
@@ -1314,13 +1445,13 @@ function calculate3HTrendATR(
                 1,
 
             upperBand:
-                currentUpperBand,
+                activeUpperBand,
 
             lowerBand:
-                currentLowerBand,
+                activeLowerBand,
 
             activeLevel:
-                currentLowerBand,
+                activeLowerBand,
 
             activeType:
                 "SUPPORT",
@@ -1335,6 +1466,12 @@ function calculate3HTrendATR(
     }
 
 
+    //==================================================
+    // BEARISH
+    //
+    // UPPER BAND BECOMES RESISTANCE
+    //==================================================
+
     return {
 
         trend:
@@ -1344,13 +1481,13 @@ function calculate3HTrendATR(
             -1,
 
         upperBand:
-            currentUpperBand,
+            activeUpperBand,
 
         lowerBand:
-            currentLowerBand,
+            activeLowerBand,
 
         activeLevel:
-            currentUpperBand,
+            activeUpperBand,
 
         activeType:
             "RESISTANCE",
@@ -1383,6 +1520,10 @@ async function calculateCoinScore(
             null;
 
 
+        //================================================
+        // 30M DATA
+        //================================================
+
         const candles30M =
             await fetchFuturesKlines(
                 symbol,
@@ -1404,6 +1545,8 @@ async function calculateCoinScore(
 
         }
 
+
+        // Remove currently forming 30M candle.
 
         const closed30M =
             candles30M.slice(
@@ -1444,6 +1587,17 @@ async function calculateCoinScore(
         }
 
 
+        //================================================
+        // 3H DATA
+        //
+        // IMPORTANT:
+        //
+        // Remove ONLY the currently forming candle.
+        //
+        // The calculation then uses historical
+        // completed 3H candles immediately.
+        //================================================
+
         const candles3H =
             await fetchFuturesKlines(
                 symbol,
@@ -1454,7 +1608,8 @@ async function calculateCoinScore(
 
         if (
             candles3H &&
-            candles3H.length >= 30
+            candles3H.length >=
+            TREND_EMA_LENGTH + 2
         ) {
 
             const closed3H =
@@ -1469,14 +1624,45 @@ async function calculateCoinScore(
                     closed3H
                 );
 
+
+            if (!trend3H) {
+
+                log(
+                    `3H Trend/ATR calculation unavailable for ${symbol}. Candles: ${closed3H.length}`
+                );
+
+            }
+
         }
 
+        else {
+
+            log(
+                `3H data unavailable for ${symbol}. Candles received: ${
+                    candles3H
+                        ? candles3H.length
+                        : 0
+                }`
+            );
+
+        }
+
+
+        //================================================
+        // TOP 7 RANKING STRENGTH
+        //
+        // ONLY 30M DELTA CHANGE.
+        //================================================
 
         const orderFlowStrength =
             Math.abs(
                 delta30M.deltaChange
             );
 
+
+        //================================================
+        // RETURN
+        //================================================
 
         return {
 
@@ -1513,7 +1699,7 @@ async function calculateCoinScore(
 //
 // INFORMATIONAL ONLY.
 //
-// Top 7 ranking is based on 30M Delta movement.
+// Top 7 ranking is based ONLY on 30M Delta movement.
 //
 // 3H Trend / ATR does NOT affect ranking.
 //======================================================
@@ -1642,7 +1828,7 @@ The scanner is still monitoring all coins.
 
 
                     //================================================
-                    // 30M ORDER FLOW
+                    // 30M CONTROL
                     //================================================
 
                     let flowIcon =
@@ -1681,7 +1867,7 @@ The scanner is still monitoring all coins.
 
 
                     //================================================
-                    // COIN HEADER + 30M FLOW
+                    // COIN + 30M ORDER FLOW
                     //================================================
 
                     msg +=
@@ -1764,7 +1950,7 @@ Upper ATR Band: ${
                         msg +=
 
 `⚪ *NEUTRAL*
-No upper/lower ATR breakout has been established.
+No confirmed ATR-band breakout.
 
 `;
 
@@ -1794,7 +1980,7 @@ No upper/lower ATR breakout has been established.
 
 
         //================================================
-        // REPORT GUIDE
+        // GUIDE
         //================================================
 
         msg +=
