@@ -663,11 +663,9 @@ function calculateCumulativeDelta(candles) {
 
     }
 
-
     let delta = 0;
 
     const cumulativeDelta = [];
-
 
     for (
         const candle of candles
@@ -682,7 +680,6 @@ function calculateCumulativeDelta(candles) {
         const volume =
             Number(candle.volume);
 
-
         if (
             !Number.isFinite(open) ||
             !Number.isFinite(close) ||
@@ -692,7 +689,6 @@ function calculateCumulativeDelta(candles) {
             continue;
 
         }
-
 
         if (
             close > open
@@ -710,13 +706,11 @@ function calculateCumulativeDelta(candles) {
 
         }
 
-
         cumulativeDelta.push(
             delta
         );
 
     }
-
 
     return cumulativeDelta;
 
@@ -738,14 +732,11 @@ function analyzeDelta(cumulativeDelta) {
 
     }
 
-
     const currentIndex =
         cumulativeDelta.length - 1;
 
-
     const previousIndex =
         currentIndex - 1;
-
 
     const currentDelta =
         Number(
@@ -754,14 +745,12 @@ function analyzeDelta(cumulativeDelta) {
             ]
         );
 
-
     const previousDelta =
         Number(
             cumulativeDelta[
                 previousIndex
             ]
         );
-
 
     if (
         !Number.isFinite(currentDelta) ||
@@ -772,15 +761,12 @@ function analyzeDelta(cumulativeDelta) {
 
     }
 
-
     const deltaChange =
         currentDelta -
         previousDelta;
 
-
     let trend =
         "FLAT";
-
 
     let control =
         "BALANCED";
@@ -796,7 +782,6 @@ function analyzeDelta(cumulativeDelta) {
 
         control =
             "BUYERS IN CONTROL";
-
 
         if (
             currentDelta >
@@ -839,7 +824,6 @@ function analyzeDelta(cumulativeDelta) {
         control =
             "SELLERS IN CONTROL";
 
-
         if (
             currentDelta <
             previousDelta
@@ -879,12 +863,10 @@ function analyzeDelta(cumulativeDelta) {
         control =
             "BALANCED";
 
-
         trend =
             "AT ZERO";
 
     }
-
 
     return {
 
@@ -923,9 +905,7 @@ function calculateEMAValue(
 
     }
 
-
     let sum = 0;
-
 
     for (
         let i = 0;
@@ -938,7 +918,6 @@ function calculateEMAValue(
                 candles[i].close
             );
 
-
         if (
             !Number.isFinite(close)
         ) {
@@ -947,20 +926,16 @@ function calculateEMAValue(
 
         }
 
-
         sum += close;
 
     }
 
-
     let ema =
         sum / period;
-
 
     const multiplier =
         2 /
         (period + 1);
-
 
     for (
         let i = period;
@@ -973,7 +948,6 @@ function calculateEMAValue(
                 candles[i].close
             );
 
-
         if (
             !Number.isFinite(close)
         ) {
@@ -981,7 +955,6 @@ function calculateEMAValue(
             continue;
 
         }
-
 
         ema =
             (
@@ -992,7 +965,6 @@ function calculateEMAValue(
             ema;
 
     }
-
 
     return ema;
 
@@ -1019,9 +991,7 @@ function calculateATRValue(
 
     }
 
-
     const trueRanges = [];
-
 
     for (
         let i = 0;
@@ -1034,12 +1004,10 @@ function calculateATRValue(
                 candles[i].high
             );
 
-
         const low =
             Number(
                 candles[i].low
             );
-
 
         if (
             !Number.isFinite(high) ||
@@ -1049,7 +1017,6 @@ function calculateATRValue(
             return null;
 
         }
-
 
         if (
             i === 0
@@ -1063,14 +1030,12 @@ function calculateATRValue(
 
         }
 
-
         const previousClose =
             Number(
                 candles[
                     i - 1
                 ].close
             );
-
 
         if (
             !Number.isFinite(
@@ -1082,10 +1047,8 @@ function calculateATRValue(
 
         }
 
-
         const range1 =
             high - low;
-
 
         const range2 =
             Math.abs(
@@ -1093,13 +1056,11 @@ function calculateATRValue(
                 previousClose
             );
 
-
         const range3 =
             Math.abs(
                 low -
                 previousClose
             );
-
 
         trueRanges.push(
             Math.max(
@@ -1111,7 +1072,6 @@ function calculateATRValue(
 
     }
 
-
     if (
         trueRanges.length <= period
     ) {
@@ -1120,9 +1080,7 @@ function calculateATRValue(
 
     }
 
-
     let atr = 0;
-
 
     // Initial ATR
 
@@ -1137,10 +1095,8 @@ function calculateATRValue(
 
     }
 
-
     atr /=
         period;
-
 
     // Wilder smoothing
 
@@ -1162,295 +1118,325 @@ function calculateATRValue(
 
     }
 
-
     return atr;
 
 }
 
 
-//================================================
-// 4H TREND / ATR
+//======================================================
+// 4H TREND / ATR STRUCTURE
 //
-// 4H = BROADER TREND CONTEXT
+// EXACT LOGIC:
 //
-// Uses Binance's native 4H candles.
+// If a COMPLETED 4H candle closes above
+// EMA20 + ATR14 × 1:
 //
-// ChartPrime settings:
+//     BULLISH TREND
+//     LOWER BAND = SUPPORT
 //
-// EMA Length  = 20
-// ATR Length  = 14
-// ATR Mult    = 1
+// If a COMPLETED 4H candle closes below
+// EMA20 - ATR14 × 1:
 //
-// Latest COMPLETED 4H candle is used.
+//     BEARISH TREND
+//     UPPER BAND = RESISTANCE
 //
-// Logic:
+// Otherwise the previous trend state remains.
 //
-// Close > Upper ATR Band
-//     → BULLISH TREND
-//     → Lower ATR Band = SUPPORT
+// IMPORTANT:
 //
-// Close < Lower ATR Band
-//     → BEARISH TREND
-//     → Upper ATR Band = RESISTANCE
-//
-// Otherwise:
-//     → PRICE INSIDE ATR BANDS
-//================================================
+// This function works from historical 4H data.
+// It does NOT require the bot to wait four hours
+// after starting.
+//======================================================
 
-let trend4H = null;
-
-if (
-    candles4H &&
-    candles4H.length >= 25
+function calculate4HTrendATR(
+    candles
 ) {
 
-    // Remove currently forming 4H candle.
-
-    const closed4H =
-        candles4H.slice(
-            0,
-            -1
-        );
-
-
     if (
-        closed4H.length >= 20
+        !candles ||
+        candles.length <
+        TREND_EMA_LENGTH + 2
     ) {
 
-        const closes4H =
-            closed4H.map(
-                candle =>
-                    candle.close
-            );
-
-
-        //============================================
-        // EMA 20
-        //============================================
-
-        const emaLength = 20;
-
-        const atrLength = 14;
-
-        const atrMultiplier = 1;
-
-
-        // Calculate EMA
-
-        let ema =
-            closes4H[0];
-
-        const emaMultiplier =
-            2 /
-            (emaLength + 1);
-
-
-        for (
-            let i = 1;
-            i < closes4H.length;
-            i++
-        ) {
-
-            ema =
-                (
-                    closes4H[i] -
-                    ema
-                ) *
-                emaMultiplier +
-                ema;
-
-        }
-
-
-        //============================================
-        // ATR 14
-        //============================================
-
-        const trueRanges = [];
-
-
-        for (
-            let i = 1;
-            i < closed4H.length;
-            i++
-        ) {
-
-            const current =
-                closed4H[i];
-
-            const previous =
-                closed4H[i - 1];
-
-
-            const high =
-                current.high;
-
-            const low =
-                current.low;
-
-            const previousClose =
-                previous.close;
-
-
-            const tr =
-                Math.max(
-
-                    high - low,
-
-                    Math.abs(
-                        high -
-                        previousClose
-                    ),
-
-                    Math.abs(
-                        low -
-                        previousClose
-                    )
-
-                );
-
-
-            trueRanges.push(
-                tr
-            );
-
-        }
-
-
-        if (
-            trueRanges.length >=
-            atrLength
-        ) {
-
-            const recentTR =
-                trueRanges.slice(
-                    -atrLength
-                );
-
-
-            const atr =
-                recentTR.reduce(
-                    (
-                        sum,
-                        value
-                    ) =>
-                        sum + value,
-                    0
-                ) /
-                recentTR.length;
-
-
-            const upperBand =
-                ema +
-                (
-                    atr *
-                    atrMultiplier
-                );
-
-
-            const lowerBand =
-                ema -
-                (
-                    atr *
-                    atrMultiplier
-                );
-
-
-            const latest4H =
-                closed4H[
-                    closed4H.length - 1
-                ];
-
-
-            const close4H =
-                latest4H.close;
-
-
-            //========================================
-            // TREND / ACTIVE ATR BOUNDARY
-            //========================================
-
-            if (
-                close4H >
-                upperBand
-            ) {
-
-                trend4H = {
-
-                    state:
-                        "BULLISH TREND",
-
-                    close:
-                        close4H,
-
-                    upperBand,
-
-                    lowerBand,
-
-                    boundary:
-                        "SUPPORT",
-
-                    boundaryPrice:
-                        lowerBand
-
-                };
-
-            }
-
-            else if (
-                close4H <
-                lowerBand
-            ) {
-
-                trend4H = {
-
-                    state:
-                        "BEARISH TREND",
-
-                    close:
-                        close4H,
-
-                    upperBand,
-
-                    lowerBand,
-
-                    boundary:
-                        "RESISTANCE",
-
-                    boundaryPrice:
-                        upperBand
-
-                };
-
-            }
-
-            else {
-
-                trend4H = {
-
-                    state:
-                        "PRICE INSIDE ATR BANDS",
-
-                    close:
-                        close4H,
-
-                    upperBand,
-
-                    lowerBand,
-
-                    boundary:
-                        "NONE",
-
-                    boundaryPrice:
-                        null
-
-                };
-
-            }
-
-        }
+        return null;
 
     }
+
+
+    //==================================================
+    // TREND STATE
+    //==================================================
+
+    let trendState =
+        0;
+
+    let lastBreakType =
+        "NONE";
+
+    let lastBreakIndex =
+        -1;
+
+    let activeUpperBand =
+        null;
+
+    let activeLowerBand =
+        null;
+
+
+    //==================================================
+    // WALK THROUGH COMPLETED 4H CANDLES
+    //==================================================
+
+    for (
+        let i =
+            TREND_EMA_LENGTH;
+        i < candles.length;
+        i++
+    ) {
+
+        const availableCandles =
+            candles.slice(
+                0,
+                i + 1
+            );
+
+        const ema =
+            calculateEMAValue(
+                availableCandles,
+                TREND_EMA_LENGTH
+            );
+
+        const atr =
+            calculateATRValue(
+                availableCandles,
+                TREND_ATR_LENGTH
+            );
+
+        if (
+            ema === null ||
+            atr === null
+        ) {
+
+            continue;
+
+        }
+
+        const upperBand =
+            ema +
+            (
+                atr *
+                TREND_ATR_MULTIPLIER
+            );
+
+        const lowerBand =
+            ema -
+            (
+                atr *
+                TREND_ATR_MULTIPLIER
+            );
+
+        const close =
+            Number(
+                candles[i].close
+            );
+
+        if (
+            !Number.isFinite(close)
+        ) {
+
+            continue;
+
+        }
+
+        const previousTrend =
+            trendState;
+
+
+        //================================================
+        // UPPER BAND BREAK
+        //================================================
+
+        if (
+            close >
+            upperBand
+        ) {
+
+            trendState =
+                1;
+
+        }
+
+
+        //================================================
+        // LOWER BAND BREAK
+        //================================================
+
+        else if (
+            close <
+            lowerBand
+        ) {
+
+            trendState =
+                -1;
+
+        }
+
+
+        //================================================
+        // NEW BULLISH TREND
+        //================================================
+
+        if (
+            trendState === 1 &&
+            previousTrend !== 1
+        ) {
+
+            lastBreakType =
+                "UPPER BAND BREAK";
+
+            lastBreakIndex =
+                i;
+
+        }
+
+
+        //================================================
+        // NEW BEARISH TREND
+        //================================================
+
+        if (
+            trendState === -1 &&
+            previousTrend !== -1
+        ) {
+
+            lastBreakType =
+                "LOWER BAND BREAK";
+
+            lastBreakIndex =
+                i;
+
+        }
+
+        activeUpperBand =
+            upperBand;
+
+        activeLowerBand =
+            lowerBand;
+
+    }
+
+
+    //==================================================
+    // NO TREND YET
+    //==================================================
+
+    if (
+        trendState === 0
+    ) {
+
+        return {
+
+            trend:
+                "NEUTRAL",
+
+            trendState:
+                0,
+
+            upperBand:
+                activeUpperBand,
+
+            lowerBand:
+                activeLowerBand,
+
+            activeLevel:
+                null,
+
+            activeType:
+                "NONE",
+
+            lastBreak:
+                "NONE",
+
+            lastBreakIndex
+
+        };
+
+    }
+
+
+    //==================================================
+    // BULLISH
+    //
+    // LOWER BAND BECOMES SUPPORT
+    //==================================================
+
+    if (
+        trendState === 1
+    ) {
+
+        return {
+
+            trend:
+                "BULLISH TREND",
+
+            trendState:
+                1,
+
+            upperBand:
+                activeUpperBand,
+
+            lowerBand:
+                activeLowerBand,
+
+            activeLevel:
+                activeLowerBand,
+
+            activeType:
+                "SUPPORT",
+
+            lastBreak:
+                lastBreakType,
+
+            lastBreakIndex
+
+        };
+
+    }
+
+
+    //==================================================
+    // BEARISH
+    //
+    // UPPER BAND BECOMES RESISTANCE
+    //==================================================
+
+    return {
+
+        trend:
+            "BEARISH TREND",
+
+        trendState:
+            -1,
+
+        upperBand:
+            activeUpperBand,
+
+        lowerBand:
+            activeLowerBand,
+
+        activeLevel:
+            activeUpperBand,
+
+        activeType:
+            "RESISTANCE",
+
+        lastBreak:
+            lastBreakType,
+
+        lastBreakIndex
+
+    };
 
 }
 
@@ -1468,7 +1454,6 @@ async function calculateCoinScore(
         let delta30M =
             null;
 
-
         let trend4H =
             null;
 
@@ -1483,7 +1468,6 @@ async function calculateCoinScore(
                 "30m",
                 120
             );
-
 
         if (
             !candles30M ||
@@ -1507,7 +1491,6 @@ async function calculateCoinScore(
                 -1
             );
 
-
         if (
             closed30M.length < 2
         ) {
@@ -1516,18 +1499,15 @@ async function calculateCoinScore(
 
         }
 
-
         const delta30MSeries =
             calculateCumulativeDelta(
                 closed30M
             );
 
-
         delta30M =
             analyzeDelta(
                 delta30MSeries
             );
-
 
         if (!delta30M) {
 
@@ -1558,7 +1538,6 @@ async function calculateCoinScore(
                 120
             );
 
-
         if (
             candles4H &&
             candles4H.length >=
@@ -1571,12 +1550,10 @@ async function calculateCoinScore(
                     -1
                 );
 
-
             trend4H =
                 calculate4HTrendATR(
                     closed4H
                 );
-
 
             if (!trend4H) {
 
@@ -1631,7 +1608,6 @@ async function calculateCoinScore(
 
     }
 
-
     catch (err) {
 
         log(
@@ -1639,7 +1615,6 @@ async function calculateCoinScore(
                 err.message
             }`
         );
-
 
         return null;
 
@@ -1678,7 +1653,6 @@ async function generateCoinScoreReport() {
                     await calculateCoinScore(
                         symbol
                     );
-
 
                 if (result) {
 
@@ -1765,7 +1739,6 @@ The scanner is still monitoring all coins.
 
 `;
 
-
             top7.forEach(
                 (
                     coin,
@@ -1774,7 +1747,6 @@ The scanner is still monitoring all coins.
 
                     const d30 =
                         coin.delta30M;
-
 
                     const t4 =
                         coin.trend4H;
@@ -1787,10 +1759,8 @@ The scanner is still monitoring all coins.
                     let flowIcon =
                         "⚪";
 
-
                     let flowControl =
                         "BALANCED";
-
 
                     if (
                         d30.currentDelta > 0
@@ -1798,7 +1768,6 @@ The scanner is still monitoring all coins.
 
                         flowIcon =
                             "🟢";
-
 
                         flowControl =
                             "BUYERS IN CONTROL";
@@ -1811,7 +1780,6 @@ The scanner is still monitoring all coins.
 
                         flowIcon =
                             "🔴";
-
 
                         flowControl =
                             "SELLERS IN CONTROL";
@@ -1843,7 +1811,6 @@ ${d30.trend}
 `📊 *4H TREND / ATR*
 `;
 
-
                     if (
                         !t4
                     ) {
@@ -1854,7 +1821,6 @@ ${d30.trend}
 `;
 
                     }
-
 
                     else if (
                         t4.trendState === 1
@@ -1868,14 +1834,13 @@ Price closed ABOVE the upper ATR band.
 📍 *ACTIVE SUPPORT*
 Lower ATR Band: ${
     t4.lowerBand !== null
-        ? t4.lowerBand.toFixed(4)
+        ? t4.lowerBand.toFixed(6)
         : "N/A"
 }
 
 `;
 
                     }
-
 
                     else if (
                         t4.trendState === -1
@@ -1889,14 +1854,13 @@ Price closed BELOW the lower ATR band.
 📍 *ACTIVE RESISTANCE*
 Upper ATR Band: ${
     t4.upperBand !== null
-        ? t4.upperBand.toFixed(4)
+        ? t4.upperBand.toFixed(6)
         : "N/A"
 }
 
 `;
 
                     }
-
 
                     else {
 
@@ -1998,7 +1962,6 @@ This report is not an automatic trading signal.
         );
 
     }
-
 
     catch (err) {
 
