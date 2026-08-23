@@ -618,6 +618,7 @@ setInterval(async () => {
 // • 4H Trend-Reset ATR Structure
 // • 4H Active Support / Resistance
 // • Top 7 Order-Flow Coins
+// • 0-100 Trend / Order Flow Score
 //
 // REPORT INTERVAL = 30 MINUTES
 //
@@ -1163,11 +1164,6 @@ function calculate4HTrendATR(
 
     }
 
-
-    //==================================================
-    // TREND STATE
-    //==================================================
-
     let trendState =
         0;
 
@@ -1367,8 +1363,6 @@ function calculate4HTrendATR(
 
     //==================================================
     // BULLISH
-    //
-    // LOWER BAND BECOMES SUPPORT
     //==================================================
 
     if (
@@ -1407,8 +1401,6 @@ function calculate4HTrendATR(
 
     //==================================================
     // BEARISH
-    //
-    // UPPER BAND BECOMES RESISTANCE
     //==================================================
 
     return {
@@ -1435,6 +1427,135 @@ function calculate4HTrendATR(
             lastBreakType,
 
         lastBreakIndex
+
+    };
+
+}
+
+
+//======================================================
+// CALCULATE COIN SCORE
+//
+// SCORING:
+//
+// BULLISH 4H = 50 POINTS
+//
+// BULLISH 4H + HIGHER POSITIVE = 100
+// BULLISH 4H + LOWER POSITIVE  = 75
+// BULLISH 4H + CONFLICTING/NEUTRAL = 50
+//
+// BEARISH 4H = 50 POINTS
+//
+// BEARISH 4H + LOWER NEGATIVE = 100
+// BEARISH 4H + HIGHER NEGATIVE = 75
+// BEARISH 4H + CONFLICTING/NEUTRAL = 50
+//
+// CONFLICTING 30M CONDITIONS RECEIVE 0 POINTS.
+//======================================================
+
+function calculateAlignmentScore(
+    trend4H,
+    delta30M
+) {
+
+    let score =
+        0;
+
+    let trendPoints =
+        0;
+
+    let orderFlowPoints =
+        0;
+
+
+    //==================================================
+    // BULLISH 4H
+    //==================================================
+
+    if (
+        trend4H &&
+        trend4H.trendState === 1
+    ) {
+
+        trendPoints =
+            50;
+
+
+        if (
+            delta30M &&
+            delta30M.trend ===
+            "HIGHER POSITIVE"
+        ) {
+
+            orderFlowPoints =
+                50;
+
+        }
+
+        else if (
+            delta30M &&
+            delta30M.trend ===
+            "LOWER POSITIVE"
+        ) {
+
+            orderFlowPoints =
+                25;
+
+        }
+
+    }
+
+
+    //==================================================
+    // BEARISH 4H
+    //==================================================
+
+    else if (
+        trend4H &&
+        trend4H.trendState === -1
+    ) {
+
+        trendPoints =
+            50;
+
+
+        if (
+            delta30M &&
+            delta30M.trend ===
+            "LOWER NEGATIVE"
+        ) {
+
+            orderFlowPoints =
+                50;
+
+        }
+
+        else if (
+            delta30M &&
+            delta30M.trend ===
+            "HIGHER NEGATIVE"
+        ) {
+
+            orderFlowPoints =
+                25;
+
+        }
+
+    }
+
+
+    score =
+        trendPoints +
+        orderFlowPoints;
+
+
+    return {
+
+        score,
+
+        trendPoints,
+
+        orderFlowPoints
 
     };
 
@@ -1522,13 +1643,6 @@ async function calculateCoinScore(
 
         //================================================
         // 4H DATA
-        //
-        // IMPORTANT:
-        //
-        // Remove ONLY the currently forming candle.
-        //
-        // The calculation then uses historical
-        // completed 4H candles immediately.
         //================================================
 
         const candles4H =
@@ -1579,9 +1693,21 @@ async function calculateCoinScore(
 
 
         //================================================
-        // TOP 7 RANKING STRENGTH
+        // ALIGNMENT SCORE
+        //================================================
+
+        const alignmentScore =
+            calculateAlignmentScore(
+                trend4H,
+                delta30M
+            );
+
+
+        //================================================
+        // TOP 7 TIE-BREAKER
         //
-        // ONLY 30M DELTA CHANGE.
+        // Existing 30M Delta movement remains available
+        // for ranking coins with identical scores.
         //================================================
 
         const orderFlowStrength =
@@ -1601,6 +1727,8 @@ async function calculateCoinScore(
             delta30M,
 
             trend4H,
+
+            alignmentScore,
 
             orderFlowStrength
 
@@ -1627,9 +1755,14 @@ async function calculateCoinScore(
 //
 // INFORMATIONAL ONLY.
 //
-// Top 7 ranking is based ONLY on 30M Delta movement.
+// Top 7 ranking:
 //
-// 4H Trend / ATR does NOT affect ranking.
+// 1. Alignment Score
+// 2. 30M Delta Movement as tie-breaker
+//
+// 4H Trend = 50 points
+// 30M aligned pressure = 25 or 50 points
+// Conflicting pressure = 0 points
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -1680,15 +1813,33 @@ async function generateCoinScoreReport() {
         //================================================
         // TOP 7
         //
-        // Strongest 30M Delta movement first.
+        // Highest score first.
+        // 30M delta movement breaks ties.
         //================================================
 
         const top7 =
             results
                 .sort(
-                    (a, b) =>
-                        b.orderFlowStrength -
-                        a.orderFlowStrength
+                    (a, b) => {
+
+                        if (
+                            b.alignmentScore.score !==
+                            a.alignmentScore.score
+                        ) {
+
+                            return (
+                                b.alignmentScore.score -
+                                a.alignmentScore.score
+                            );
+
+                        }
+
+                        return (
+                            b.orderFlowStrength -
+                            a.orderFlowStrength
+                        );
+
+                    }
                 )
                 .slice(
                     0,
@@ -1706,6 +1857,7 @@ async function generateCoinScoreReport() {
 
 ⚡ 30M = CURRENT ORDER FLOW
 📊 4H = TREND / ATR STRUCTURE
+🎯 SCORE = 4H TREND + ALIGNED 30M PRESSURE
 
 `;
 
@@ -1751,6 +1903,9 @@ The scanner is still monitoring all coins.
                     const t4 =
                         coin.trend4H;
 
+                    const score =
+                        coin.alignmentScore;
+
 
                     //================================================
                     // 30M CONTROL
@@ -1788,14 +1943,62 @@ The scanner is still monitoring all coins.
 
 
                     //================================================
-                    // COIN + 30M ORDER FLOW
+                    // SCORE DISPLAY
+                    //================================================
+
+                    let scoreIcon =
+                        "⚪";
+
+                    if (
+                        score.score === 100
+                    ) {
+
+                        scoreIcon =
+                            "🟢";
+
+                    }
+
+                    else if (
+                        score.score === 75
+                    ) {
+
+                        scoreIcon =
+                            "🟡";
+
+                    }
+
+                    else if (
+                        score.score === 50
+                    ) {
+
+                        scoreIcon =
+                            "🟠";
+
+                    }
+
+
+                    //================================================
+                    // COIN
                     //================================================
 
                     msg +=
 
 `${index + 1}. *${coin.symbol}*
 
-⚡ *30M ORDER FLOW*
+🎯 *SCORE: ${score.score}/100*
+${scoreIcon} 4H Trend: +${score.trendPoints}
+⚡ 30M Aligned Pressure: +${score.orderFlowPoints}
+
+`;
+
+
+                    //================================================
+                    // 30M ORDER FLOW
+                    //================================================
+
+                    msg +=
+
+`⚡ *30M ORDER FLOW*
 ${flowIcon} ${flowControl}
 Delta: ${d30.currentDelta.toFixed(0)}
 ${d30.trend}
@@ -1905,7 +2108,23 @@ No confirmed ATR-band breakout.
 `
 ━━━━━━━━━━━━━━━━━━━━
 
-📌 *ORDER FLOW GUIDE*
+📌 *ORDER FLOW SCORE GUIDE*
+
+🎯 *100/100*
+Strong 4H trend +
+strong aligned 30M pressure.
+
+🎯 *75/100*
+4H trend +
+weaker aligned 30M pressure.
+
+🎯 *50/100*
+4H trend exists +
+30M pressure is conflicting or neutral.
+
+⚠️ Conflicting 30M pressure receives
+0 additional points.
+
 
 ⚡ *30M ORDER FLOW*
 
