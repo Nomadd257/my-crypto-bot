@@ -16,9 +16,9 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8247817335:AAHHuyixUFnQdCQ01axADkNv_03NZ0A1DDM";
+const TELEGRAM_BOT_TOKEN = "7852661207:AAH6WycYvBK9TFSNanesbtavDOgS9VMh-Vc";
 const GROUP_CHAT_ID = "-1003419090746";
-const ADMIN_ID = "7476742687";
+const ADMIN_ID = "1718404728";
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // --- USERS FILE ---
@@ -2214,7 +2214,7 @@ setInterval(
 
 );
 
-const ADMIN_CHAT_ID = 7476742687; // <-- Replace with your Telegram chat ID
+const ADMIN_CHAT_ID = 1718404728; // <-- Replace with your Telegram chat ID
 
 // Helper function to check admin
 function isAdmin(msg) {

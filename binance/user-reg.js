@@ -15,7 +15,7 @@ const bot = new TelegramBot("8517187439:AAH6ysDoUixQlTZ421Snt2p7g1HFohjIVu8", {
   polling: true,
 });
 
-const ADMIN_ID = "7476742687";
+const ADMIN_ID = "1718404728";
 const USERS_FILE = "users.json";
 
 // ===============================
