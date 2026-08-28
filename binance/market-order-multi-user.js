@@ -16,7 +16,7 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "7852661207:AAH6WycYvBK9TFSNanesbtavDOgS9VMh-Vc";
+const TELEGRAM_BOT_TOKEN = "7751375561:AAHbI58eOMywLiZkQvnj4C3zkYosVZ3pGoY";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "1718404728";
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
