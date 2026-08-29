@@ -1,7 +1,7 @@
 const TelegramBot = require("node-telegram-bot-api");
 
 // ===== CONFIG =====
-const BOT_TOKEN = "8303886909:AAEEBYQsHccznm0UrgtfKLRFCUEQn9NFG2M";
+const BOT_TOKEN = "8656741808:AAEJuPvouct_yPaEQqZdFhLa7BmTPuG8LS4";
 const GROUP_CHAT_ID = "-1002708995403"; // Correct supergroup ID
 
 // ===== INIT BOT =====
