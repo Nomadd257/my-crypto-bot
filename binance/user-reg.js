@@ -2,8 +2,8 @@
 // DanuvieCrypto Registration Bot (Updated, Hardcoded Token + AutoTrading Group Button)
 // =====================================================
 
-import TelegramBot from "node-telegram-bot-api";
-import fs from "fs";
+const TelegramBot = require("node-telegram-bot-api");
+const fs = require("fs");
 
 // ===============================
 // CONFIG
@@ -21,9 +21,7 @@ const bot = new TelegramBot("8782543055:AAFevGNqJW_L1xymbXO0ECsS6P9tGEjV7EM", {
 // ADMIN IDS
 // ===============================
 
-const ADMIN_IDS = [
-  "7476742687", "1718404728",
-];
+const ADMIN_IDS = ["7476742687", "1718404728"];
 
 const USERS_FILE = "users.json";
 
@@ -41,16 +39,11 @@ function isAdmin(msg) {
 
 function loadUsers() {
   if (!fs.existsSync(USERS_FILE)) {
-    fs.writeFileSync(
-      USERS_FILE,
-      JSON.stringify([], null, 2)
-    );
+    fs.writeFileSync(USERS_FILE, JSON.stringify([], null, 2));
   }
 
   try {
-    return JSON.parse(
-      fs.readFileSync(USERS_FILE, "utf8")
-    );
+    return JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
   } catch (err) {
     console.error("Error loading users.json:", err);
     return [];
@@ -58,16 +51,11 @@ function loadUsers() {
 }
 
 function saveUsers(data) {
-  fs.writeFileSync(
-    USERS_FILE,
-    JSON.stringify(data, null, 2)
-  );
+  fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
 }
 
 function findUser(users, id) {
-  return users.find(
-    (u) => u.id === String(id)
-  );
+  return users.find((u) => u.id === String(id));
 }
 
 // ===============================
@@ -78,14 +66,11 @@ function createUserFromTelegram(msg) {
   return {
     id: String(msg.chat.id),
 
-    firstName:
-      msg.from?.first_name || "",
+    firstName: msg.from?.first_name || "",
 
-    lastName:
-      msg.from?.last_name || "",
+    lastName: msg.from?.last_name || "",
 
-    username:
-      msg.from?.username || "",
+    username: msg.from?.username || "",
 
     photoFileId: "",
 
@@ -97,21 +82,11 @@ function createUserFromTelegram(msg) {
 }
 
 function updateTelegramDetails(user, msg) {
+  user.firstName = msg.from?.first_name || user.firstName || "";
 
-  user.firstName =
-    msg.from?.first_name ||
-    user.firstName ||
-    "";
+  user.lastName = msg.from?.last_name || user.lastName || "";
 
-  user.lastName =
-    msg.from?.last_name ||
-    user.lastName ||
-    "";
-
-  user.username =
-    msg.from?.username ||
-    user.username ||
-    "";
+  user.username = msg.from?.username || user.username || "";
 }
 
 // ===============================
@@ -119,30 +94,18 @@ function updateTelegramDetails(user, msg) {
 // ===============================
 
 bot.onText(/\/start/, (msg) => {
-
   const chatId = msg.chat.id;
 
   let users = loadUsers();
 
-  let user = findUser(
-    users,
-    chatId
-  );
+  let user = findUser(users, chatId);
 
   if (!user) {
-
-    user =
-      createUserFromTelegram(msg);
+    user = createUserFromTelegram(msg);
 
     users.push(user);
-
   } else {
-
-    updateTelegramDetails(
-      user,
-      msg
-    );
-
+    updateTelegramDetails(user, msg);
   }
 
   saveUsers(users);
@@ -150,7 +113,7 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     chatId,
 
-`👋 *Welcome to DanuvieCrypto Registration*
+    `👋 *Welcome to DanuvieCrypto Registration*
 
 Navigate using the buttons below.`,
 
@@ -158,53 +121,45 @@ Navigate using the buttons below.`,
       parse_mode: "Markdown",
 
       reply_markup: {
-
         inline_keyboard: [
-
           [
             {
               text: "🔑 Binance API Keys",
-              callback_data: "api_menu"
-            }
+              callback_data: "api_menu",
+            },
           ],
 
           [
             {
               text: "📷 Passport Photo",
-              callback_data: "passport_photo"
-            }
+              callback_data: "passport_photo",
+            },
           ],
 
           [
             {
               text: "💳 Subscription",
-              url:
-                "https://t.me/DanuvieCryptopayments_bot"
-            }
+              url: "https://t.me/DanuvieCryptopayments_bot",
+            },
           ],
 
           [
             {
               text: "🖥 Server IP",
-              callback_data: "server_ip"
-            }
+              callback_data: "server_ip",
+            },
           ],
 
           [
             {
               text: "⚙ Trade Settings",
-              callback_data: "trade_settings"
-            }
+              callback_data: "trade_settings",
+            },
           ],
-
         ],
-
       },
-
-    }
-
+    },
   );
-
 });
 
 // ===============================
@@ -212,54 +167,30 @@ Navigate using the buttons below.`,
 // ===============================
 
 bot.on("callback_query", (query) => {
+  const chatId = query.message.chat.id;
 
-  const chatId =
-    query.message.chat.id;
+  const data = query.data;
 
-  const data =
-    query.data;
+  let users = loadUsers();
 
-  let users =
-    loadUsers();
-
-  let user =
-    findUser(
-      users,
-      chatId
-    );
+  let user = findUser(users, chatId);
 
   // Ensure user exists
 
   if (!user) {
-
-    user =
-      createUserFromTelegram(
-        query.message
-      );
+    user = createUserFromTelegram(query.message);
 
     users.push(user);
-
   }
 
   // Update Telegram information
 
   if (query.from) {
+    user.firstName = query.from.first_name || user.firstName || "";
 
-    user.firstName =
-      query.from.first_name ||
-      user.firstName ||
-      "";
+    user.lastName = query.from.last_name || user.lastName || "";
 
-    user.lastName =
-      query.from.last_name ||
-      user.lastName ||
-      "";
-
-    user.username =
-      query.from.username ||
-      user.username ||
-      "";
-
+    user.username = query.from.username || user.username || "";
   }
 
   saveUsers(users);
@@ -269,11 +200,10 @@ bot.on("callback_query", (query) => {
   // =============================
 
   if (data === "api_menu") {
-
     bot.sendMessage(
       chatId,
 
-`🔐 *Binance API Setup*
+      `🔐 *Binance API Setup*
 
 Use the buttons below to enter your API credentials.
 
@@ -283,35 +213,24 @@ Use the buttons below to enter your API credentials.
         parse_mode: "Markdown",
 
         reply_markup: {
-
           inline_keyboard: [
-
             [
               {
-                text:
-                  "🔐 Enter API Key",
-                callback_data:
-                  "enter_api_key"
-              }
+                text: "🔐 Enter API Key",
+                callback_data: "enter_api_key",
+              },
             ],
 
             [
               {
-                text:
-                  "🔏 Enter API Secret",
-                callback_data:
-                  "enter_api_secret"
-              }
+                text: "🔏 Enter API Secret",
+                callback_data: "enter_api_secret",
+              },
             ],
-
           ],
-
         },
-
-      }
-
+      },
     );
-
   }
 
   // =============================
@@ -319,11 +238,10 @@ Use the buttons below to enter your API credentials.
   // =============================
 
   if (data === "passport_photo") {
-
     bot.sendMessage(
       chatId,
 
-`📷 *Passport Photograph*
+      `📷 *Passport Photograph*
 
 Please upload your passport photograph as a photo.
 
@@ -333,9 +251,8 @@ Please send the photograph now.`,
 
       {
         parse_mode: "Markdown",
-      }
+      },
     );
-
   }
 
   // =============================
@@ -343,69 +260,35 @@ Please send the photograph now.`,
   // =============================
 
   if (data === "enter_api_key") {
+    bot.sendMessage(chatId, "Please send your *Binance API Key* now.", {
+      parse_mode: "Markdown",
+    });
 
-    bot.sendMessage(
-      chatId,
-      "Please send your *Binance API Key* now.",
-      {
-        parse_mode: "Markdown",
+    bot.once("message", (msg) => {
+      const uid = msg.chat.id;
+
+      if (!msg.text) {
+        return bot.sendMessage(uid, "❌ Please send the API Key as text.");
       }
-    );
 
-    bot.once(
-      "message",
-      (msg) => {
+      let users = loadUsers();
 
-        const uid =
-          msg.chat.id;
+      let usr = findUser(users, uid);
 
-        if (!msg.text) {
+      if (!usr) {
+        usr = createUserFromTelegram(msg);
 
-          return bot.sendMessage(
-            uid,
-            "❌ Please send the API Key as text."
-          );
-
-        }
-
-        let users =
-          loadUsers();
-
-        let usr =
-          findUser(
-            users,
-            uid
-          );
-
-        if (!usr) {
-
-          usr =
-            createUserFromTelegram(
-              msg
-            );
-
-          users.push(usr);
-
-        }
-
-        usr.apiKey =
-          msg.text.trim();
-
-        updateTelegramDetails(
-          usr,
-          msg
-        );
-
-        saveUsers(users);
-
-        bot.sendMessage(
-          uid,
-          "✅ API Key saved successfully."
-        );
-
+        users.push(usr);
       }
-    );
 
+      usr.apiKey = msg.text.trim();
+
+      updateTelegramDetails(usr, msg);
+
+      saveUsers(users);
+
+      bot.sendMessage(uid, "✅ API Key saved successfully.");
+    });
   }
 
   // =============================
@@ -413,69 +296,35 @@ Please send the photograph now.`,
   // =============================
 
   if (data === "enter_api_secret") {
+    bot.sendMessage(chatId, "Please send your *Binance API Secret* now.", {
+      parse_mode: "Markdown",
+    });
 
-    bot.sendMessage(
-      chatId,
-      "Please send your *Binance API Secret* now.",
-      {
-        parse_mode: "Markdown",
+    bot.once("message", (msg) => {
+      const uid = msg.chat.id;
+
+      if (!msg.text) {
+        return bot.sendMessage(uid, "❌ Please send the API Secret as text.");
       }
-    );
 
-    bot.once(
-      "message",
-      (msg) => {
+      let users = loadUsers();
 
-        const uid =
-          msg.chat.id;
+      let usr = findUser(users, uid);
 
-        if (!msg.text) {
+      if (!usr) {
+        usr = createUserFromTelegram(msg);
 
-          return bot.sendMessage(
-            uid,
-            "❌ Please send the API Secret as text."
-          );
-
-        }
-
-        let users =
-          loadUsers();
-
-        let usr =
-          findUser(
-            users,
-            uid
-          );
-
-        if (!usr) {
-
-          usr =
-            createUserFromTelegram(
-              msg
-            );
-
-          users.push(usr);
-
-        }
-
-        usr.apiSecret =
-          msg.text.trim();
-
-        updateTelegramDetails(
-          usr,
-          msg
-        );
-
-        saveUsers(users);
-
-        bot.sendMessage(
-          uid,
-          "✅ API Secret saved successfully."
-        );
-
+        users.push(usr);
       }
-    );
 
+      usr.apiSecret = msg.text.trim();
+
+      updateTelegramDetails(usr, msg);
+
+      saveUsers(users);
+
+      bot.sendMessage(uid, "✅ API Secret saved successfully.");
+    });
   }
 
   // =============================
@@ -483,7 +332,6 @@ Please send the photograph now.`,
   // =============================
 
   if (data === "server_ip") {
-
     const instructions = `
 
 🖥 **Server IP Whitelisting Instructions**
@@ -510,14 +358,9 @@ To allow the bot to trade securely on your Binance account, follow these steps:
 Once saved, your account will synchronize with our trading system.
 `;
 
-    bot.sendMessage(
-      chatId,
-      instructions,
-      {
-        parse_mode: "Markdown",
-      }
-    );
-
+    bot.sendMessage(chatId, instructions, {
+      parse_mode: "Markdown",
+    });
   }
 
   // =============================
@@ -525,7 +368,6 @@ Once saved, your account will synchronize with our trading system.
   // =============================
 
   if (data === "trade_settings") {
-
     const settings = `
 
 ⚙ **TRADE SETTINGS INSTRUCTIONS**
@@ -544,22 +386,14 @@ Make changes to the following:
 These settings ensure your account is properly configured for automated trading.
 `;
 
-    bot.sendMessage(
-      chatId,
-      settings,
-      {
-        parse_mode: "Markdown",
-      }
-    );
-
+    bot.sendMessage(chatId, settings, {
+      parse_mode: "Markdown",
+    });
   }
 
   // Answer callback
 
-  bot.answerCallbackQuery(
-    query.id
-  );
-
+  bot.answerCallbackQuery(query.id);
 });
 
 // ===============================
@@ -567,77 +401,48 @@ These settings ensure your account is properly configured for automated trading.
 // ===============================
 
 bot.on("photo", (msg) => {
+  const chatId = msg.chat.id;
 
-  const chatId =
-    msg.chat.id;
+  let users = loadUsers();
 
-  let users =
-    loadUsers();
-
-  let user =
-    findUser(
-      users,
-      chatId
-    );
+  let user = findUser(users, chatId);
 
   if (!user) {
-
-    user =
-      createUserFromTelegram(
-        msg
-      );
+    user = createUserFromTelegram(msg);
 
     users.push(user);
-
   }
 
-  updateTelegramDetails(
-    user,
-    msg
-  );
+  updateTelegramDetails(user, msg);
 
   // Telegram provides several
   // resolutions of the uploaded photo.
   // The final element is normally
   // the largest available version.
 
-  const photos =
-    msg.photo;
+  const photos = msg.photo;
 
-  if (
-    !photos ||
-    photos.length === 0
-  ) {
-
-    return bot.sendMessage(
-      chatId,
-      "❌ Photo could not be processed. Please try again."
-    );
-
+  if (!photos || photos.length === 0) {
+    return bot.sendMessage(chatId, "❌ Photo could not be processed. Please try again.");
   }
 
-  const largestPhoto =
-    photos[
-      photos.length - 1
-    ];
+  const largestPhoto = photos[photos.length - 1];
 
-  user.photoFileId =
-    largestPhoto.file_id;
+  user.photoFileId = largestPhoto.file_id;
 
   saveUsers(users);
 
   bot.sendMessage(
     chatId,
 
-`✅ *Passport photograph saved successfully.*
+    `✅ *Passport photograph saved successfully.*
 
 Your photo has been linked to your registration.`,
 
     {
       parse_mode: "Markdown",
-    }
+    },
   );
-
 });
 
 // ===============================
@@ -661,73 +466,40 @@ Your photo has been linked to your registration.`,
 // ===============================
 
 bot.onText(/\/users$/, async (msg) => {
-
   if (!isAdmin(msg)) {
     return;
   }
 
-  const adminChatId =
-    msg.chat.id;
+  const adminChatId = msg.chat.id;
 
-  const users =
-    loadUsers();
+  const users = loadUsers();
 
   if (!users.length) {
-
-    return bot.sendMessage(
-      adminChatId,
-      "👥 No registered users found."
-    );
-
+    return bot.sendMessage(adminChatId, "👥 No registered users found.");
   }
 
-  await bot.sendMessage(
-    adminChatId,
-    `👥 *REGISTERED USERS*\n\nTotal Users: ${users.length}`,
-    {
-      parse_mode: "Markdown"
-    }
-  );
+  await bot.sendMessage(adminChatId, `👥 *REGISTERED USERS*\n\nTotal Users: ${users.length}`, {
+    parse_mode: "Markdown",
+  });
 
   // =================================
   // SEND EACH USER
   // =================================
 
-  for (
-    let i = 0;
-    i < users.length;
-    i++
-  ) {
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
 
-    const user =
-      users[i];
+    const fullName = [user.firstName, user.lastName].filter(Boolean).join(" ") || "Name not provided";
 
-    const fullName =
-      [
-        user.firstName,
-        user.lastName
-      ]
-        .filter(Boolean)
-        .join(" ") ||
-      "Name not provided";
+    const username = user.username ? `@${user.username}` : "No username";
 
-    const username =
-      user.username
-        ? `@${user.username}`
-        : "No username";
-
-    const status =
-      user.active
-        ? "🟢 ACTIVE"
-        : "🔴 INACTIVE";
+    const status = user.active ? "🟢 ACTIVE" : "🔴 INACTIVE";
 
     // =================================
     // USER INFORMATION
     // =================================
 
-    const caption =
-
-`👤 *USER ${i + 1}*
+    const caption = `👤 *USER ${i + 1}*
 
 Name: ${fullName}
 Username: ${username}
@@ -735,40 +507,20 @@ Username: ${username}
 
 Account: ${status}
 
-🔐 API Credentials: ${
-      user.apiKey &&
-      user.apiSecret
-        ? "CONNECTED"
-        : "NOT COMPLETE"
-    }`;
+🔐 API Credentials: ${user.apiKey && user.apiSecret ? "CONNECTED" : "NOT COMPLETE"}`;
 
     // =================================
     // SEND PHOTO IF AVAILABLE
     // =================================
 
-    if (
-      user.photoFileId
-    ) {
-
+    if (user.photoFileId) {
       try {
-
-        await bot.sendPhoto(
-          adminChatId,
-          user.photoFileId,
-          {
-            caption,
-            parse_mode: "Markdown"
-          }
-        );
-
-      }
-
-      catch (err) {
-
-        console.error(
-          `Could not send photo for ${user.id}:`,
-          err.message
-        );
+        await bot.sendPhoto(adminChatId, user.photoFileId, {
+          caption,
+          parse_mode: "Markdown",
+        });
+      } catch (err) {
+        console.error(`Could not send photo for ${user.id}:`, err.message);
 
         await bot.sendMessage(
           adminChatId,
@@ -776,51 +528,37 @@ Account: ${status}
 
 📷 Passport Photo: Unable to display`,
           {
-            parse_mode: "Markdown"
-          }
+            parse_mode: "Markdown",
+          },
         );
-
       }
-
     }
 
     // =================================
     // NO PHOTO
     // =================================
-
     else {
-
       await bot.sendMessage(
         adminChatId,
 
-`${caption}
+        `${caption}
 
 📷 Passport Photo: Not uploaded`,
 
         {
-          parse_mode: "Markdown"
-        }
+          parse_mode: "Markdown",
+        },
       );
-
     }
 
     // =================================
     // SEPARATOR
     // =================================
 
-    if (
-      i < users.length - 1
-    ) {
-
-      await bot.sendMessage(
-        adminChatId,
-        "━━━━━━━━━━━━━━━━━━━━"
-      );
-
+    if (i < users.length - 1) {
+      await bot.sendMessage(adminChatId, "━━━━━━━━━━━━━━━━━━━━");
     }
-
   }
-
 });
 
 // ===============================
@@ -831,118 +569,82 @@ Account: ${status}
 // /deactivate 123456789
 // ===============================
 
-bot.onText(
-  /\/(activate|deactivate) (.+)/,
-  (msg, match) => {
+bot.onText(/\/(activate|deactivate) (.+)/, (msg, match) => {
+  if (!isAdmin(msg)) {
+    return;
+  }
 
-    if (!isAdmin(msg)) {
-      return;
-    }
+  const action = match[1];
 
-    const action =
-      match[1];
+  const targetId = match[2].trim();
 
-    const targetId =
-      match[2].trim();
+  let users = loadUsers();
 
-    let users =
-      loadUsers();
+  let user = findUser(users, targetId);
 
-    let user =
-      findUser(
-        users,
-        targetId
-      );
+  if (!user) {
+    return bot.sendMessage(msg.chat.id, "❌ User not found.");
+  }
 
-    if (!user) {
+  // =================================
+  // ACTIVATE
+  // =================================
 
-      return bot.sendMessage(
-        msg.chat.id,
-        "❌ User not found."
-      );
+  if (action === "activate") {
+    user.active = true;
 
-    }
+    saveUsers(users);
 
-    // =================================
-    // ACTIVATE
-    // =================================
+    bot.sendMessage(msg.chat.id, "✅ User Activated");
 
-    if (
-      action === "activate"
-    ) {
+    bot.sendMessage(
+      targetId,
 
-      user.active =
-        true;
-
-      saveUsers(users);
-
-      bot.sendMessage(
-        msg.chat.id,
-        "✅ User Activated"
-      );
-
-      bot.sendMessage(
-        targetId,
-
-`🟢 *Your account has been activated.*
+      `🟢 *Your account has been activated.*
 
 Automated trading has commenced.`,
 
-        {
-          parse_mode: "Markdown"
-        }
-      );
+      {
+        parse_mode: "Markdown",
+      },
+    );
+  }
 
-    }
+  // =================================
+  // DEACTIVATE
+  // =================================
 
-    // =================================
-    // DEACTIVATE
-    // =================================
+  if (action === "deactivate") {
+    user.active = false;
 
-    if (
-      action === "deactivate"
-    ) {
+    saveUsers(users);
 
-      user.active =
-        false;
+    bot.sendMessage(msg.chat.id, "🛑 User Deactivated");
 
-      saveUsers(users);
+    bot.sendMessage(
+      targetId,
 
-      bot.sendMessage(
-        msg.chat.id,
-        "🛑 User Deactivated"
-      );
-
-      bot.sendMessage(
-        targetId,
-
-`🔴 *Your account has been deactivated.*
+      `🔴 *Your account has been deactivated.*
 
 Automated trading is now paused.`,
 
-        {
-          parse_mode: "Markdown"
-        }
-      );
-
-    }
-
+      {
+        parse_mode: "Markdown",
+      },
+    );
   }
-);
+});
 
 // ===============================
 // ADMIN HELP
 // ===============================
 
-bot.onText(
-  /\/adminhelp$/,
-  (msg) => {
+bot.onText(/\/adminhelp$/, (msg) => {
+  if (!isAdmin(msg)) {
+    return;
+  }
 
-    if (!isAdmin(msg)) {
-      return;
-    }
-
-    const help = `
+  const help = `
 
 🛠 *ADMIN COMMANDS*
 
@@ -961,21 +663,13 @@ Display this menu.
 ⚠️ API credentials are never displayed by /users.
 `;
 
-    bot.sendMessage(
-      msg.chat.id,
-      help,
-      {
-        parse_mode: "Markdown"
-      }
-    );
-
-  }
-);
+  bot.sendMessage(msg.chat.id, help, {
+    parse_mode: "Markdown",
+  });
+});
 
 // ===============================
 // BOT STARTUP
 // ===============================
 
-console.log(
-  "Binance Registration Bot Running..."
-);
+console.log("Binance Registration Bot Running...");
