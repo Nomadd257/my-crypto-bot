@@ -228,6 +228,438 @@ function calculateATR(candles, period = ATR_PERIOD) {
   return atr;
 }
 
+// ======================================================
+// TREND-RESET CUMULATIVE DELTA
+// ChartPrime methodology
+//
+// Settings:
+// Base EMA Length = 20
+// ATR Length      = 14
+// ATR Multiplier  = 1
+// Delta MA        = SMA 10
+//
+// Used for 15M ENTRY confirmation.
+// ======================================================
+
+const TR_DELTA_EMA_LENGTH = 20;
+const TR_DELTA_ATR_LENGTH = 14;
+const TR_DELTA_ATR_MULTIPLIER = 1;
+const TR_DELTA_MA_LENGTH = 10;
+
+
+// ------------------------------------------------------
+// EMA SERIES
+// ------------------------------------------------------
+
+function calculateEMASeries(candles, period) {
+
+  if (!candles || candles.length < period) {
+    return [];
+  }
+
+  const result = [];
+
+  let sum = 0;
+
+  for (let i = 0; i < period; i++) {
+
+    const close = Number(candles[i].close);
+
+    if (!Number.isFinite(close)) {
+      return [];
+    }
+
+    sum += close;
+  }
+
+  let ema = sum / period;
+
+  for (let i = 0; i < candles.length; i++) {
+
+    const close = Number(candles[i].close);
+
+    if (!Number.isFinite(close)) {
+      result.push(null);
+      continue;
+    }
+
+    if (i < period - 1) {
+      result.push(null);
+      continue;
+    }
+
+    if (i === period - 1) {
+      result.push(ema);
+      continue;
+    }
+
+    const multiplier =
+      2 / (period + 1);
+
+    ema =
+      (close - ema) * multiplier +
+      ema;
+
+    result.push(ema);
+  }
+
+  return result;
+}
+
+
+// ------------------------------------------------------
+// WILDER ATR SERIES
+// ------------------------------------------------------
+
+function calculateATRSeries(candles, period) {
+
+  if (!candles || candles.length <= period) {
+    return [];
+  }
+
+  const result = new Array(candles.length).fill(null);
+
+  const trueRanges = new Array(candles.length).fill(null);
+
+  for (let i = 0; i < candles.length; i++) {
+
+    const high = Number(candles[i].high);
+    const low = Number(candles[i].low);
+
+    if (
+      !Number.isFinite(high) ||
+      !Number.isFinite(low)
+    ) {
+      return [];
+    }
+
+    if (i === 0) {
+
+      trueRanges[i] =
+        high - low;
+
+      continue;
+    }
+
+    const previousClose =
+      Number(candles[i - 1].close);
+
+    if (!Number.isFinite(previousClose)) {
+      return [];
+    }
+
+    const range1 =
+      high - low;
+
+    const range2 =
+      Math.abs(
+        high - previousClose
+      );
+
+    const range3 =
+      Math.abs(
+        low - previousClose
+      );
+
+    trueRanges[i] =
+      Math.max(
+        range1,
+        range2,
+        range3
+      );
+  }
+
+
+  // -----------------------------------------------
+  // Initial Wilder ATR
+  // Pine ta.atr() uses Wilder/RMA smoothing.
+  // -----------------------------------------------
+
+  let atr = 0;
+
+  for (
+    let i = 1;
+    i <= period;
+    i++
+  ) {
+
+    atr += trueRanges[i];
+  }
+
+  atr /= period;
+
+  result[period] = atr;
+
+
+  // -----------------------------------------------
+  // Wilder smoothing
+  // -----------------------------------------------
+
+  for (
+    let i = period + 1;
+    i < candles.length;
+    i++
+  ) {
+
+    atr =
+      (
+        atr * (period - 1) +
+        trueRanges[i]
+      ) / period;
+
+    result[i] = atr;
+  }
+
+  return result;
+}
+
+// ======================================================
+// CALCULATE CHARTPRIME TREND-RESET CUMULATIVE DELTA
+// ======================================================
+//
+// Returns the latest CLOSED candle:
+//
+// {
+//   cumDelta,
+//   deltaMA,
+//   trendState,
+//   trendChanged,
+//   bullish,
+//   bearish
+// }
+//
+// ======================================================
+
+function calculateTrendResetCumulativeDelta(
+  candles
+) {
+
+  if (
+    !candles ||
+    candles.length <
+    Math.max(
+      TR_DELTA_EMA_LENGTH,
+      TR_DELTA_ATR_LENGTH
+    ) + TR_DELTA_MA_LENGTH
+  ) {
+
+    return null;
+  }
+
+
+  const emaSeries =
+    calculateEMASeries(
+      candles,
+      TR_DELTA_EMA_LENGTH
+    );
+
+  const atrSeries =
+    calculateATRSeries(
+      candles,
+      TR_DELTA_ATR_LENGTH
+    );
+
+
+  if (
+    !emaSeries.length ||
+    !atrSeries.length
+  ) {
+
+    return null;
+  }
+
+
+  let trendState = 0;
+
+  let cumDelta = 0;
+
+  const deltaSeries = [];
+
+
+  for (
+    let i = 0;
+    i < candles.length;
+    i++
+  ) {
+
+    const close =
+      Number(candles[i].close);
+
+    const open =
+      Number(candles[i].open);
+
+    const volume =
+      Number(candles[i].volume);
+
+    if (
+      !Number.isFinite(close) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(volume)
+    ) {
+
+      continue;
+    }
+
+
+    // ---------------------------------------------
+    // ChartPrime barDelta
+    // ---------------------------------------------
+
+    const barDelta =
+      close > open
+        ? volume
+        : -volume;
+
+
+    let newTrendState =
+      trendState;
+
+
+    const ema =
+      emaSeries[i];
+
+    const atr =
+      atrSeries[i];
+
+
+    // ---------------------------------------------
+    // ChartPrime trend calculation
+    // ---------------------------------------------
+
+    if (
+      ema !== null &&
+      atr !== null
+    ) {
+
+      const upperBand =
+        ema +
+        atr *
+        TR_DELTA_ATR_MULTIPLIER;
+
+      const lowerBand =
+        ema -
+        atr *
+        TR_DELTA_ATR_MULTIPLIER;
+
+
+      if (
+        close > upperBand
+      ) {
+
+        newTrendState = 1;
+
+      }
+
+      else if (
+        close < lowerBand
+      ) {
+
+        newTrendState = -1;
+
+      }
+    }
+
+
+    const trendChanged =
+      newTrendState !== trendState;
+
+
+    trendState =
+      newTrendState;
+
+
+    // ---------------------------------------------
+    // ChartPrime cumulative delta reset
+    // ---------------------------------------------
+
+    if (trendChanged) {
+
+      cumDelta =
+        barDelta;
+
+    }
+
+    else {
+
+      cumDelta +=
+        barDelta;
+
+    }
+
+
+    deltaSeries.push({
+      index: i,
+      cumDelta,
+      trendState,
+      trendChanged
+    });
+  }
+
+
+  if (
+    deltaSeries.length <
+    TR_DELTA_MA_LENGTH
+  ) {
+
+    return null;
+  }
+
+
+  // -----------------------------------------------
+  // SMA(10) of cumulative delta
+  // Same as:
+  //
+  // ta.sma(cumDelta, 10)
+  // -----------------------------------------------
+
+  const recentDeltaValues =
+    deltaSeries
+      .slice(
+        -TR_DELTA_MA_LENGTH
+      )
+      .map(
+        item => item.cumDelta
+      );
+
+
+  const deltaMA =
+    recentDeltaValues.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    ) /
+    TR_DELTA_MA_LENGTH;
+
+
+  const latest =
+    deltaSeries[
+      deltaSeries.length - 1
+    ];
+
+
+  return {
+
+    cumDelta:
+      latest.cumDelta,
+
+    deltaMA,
+
+    trendState:
+      latest.trendState,
+
+    trendChanged:
+      latest.trendChanged,
+
+    bullish:
+      latest.cumDelta > 0 &&
+      latest.cumDelta > deltaMA,
+
+    bearish:
+      latest.cumDelta < 0 &&
+      latest.cumDelta < deltaMA
+  };
+}
+
 // --- Floor qty ---
 function floorToStep(qty, step) {
   const s = Number(step);
@@ -531,28 +963,91 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-      // 5M STC ENTRY
-      // =====================================================
-      const candles5 = await fetchFuturesKlines(symbol, "5m", 100);
-      if (!candles5 || candles5.length < 30) continue;
+// 15M TREND-RESET CUMULATIVE DELTA ENTRY
+// ChartPrime methodology
+// =====================================================
+//
+// 1H STC = TREND
+//
+// 15M Delta:
+//
+// BUY:
+//   Delta > 0
+//   AND Delta > SMA(10)
+//
+// SELL:
+//   Delta < 0
+//   AND Delta < SMA(10)
+//
+// Only CLOSED 15M candles are used.
+// =====================================================
 
-      const closedCandles5 = candles5.slice(0, -1);
-      const closes5 = closedCandles5.map((c) => c.close);
+const candles15 =
+  await fetchFuturesKlines(
+    symbol,
+    "15m",
+    150
+  );
 
-      const stcSeries5 = [];
-      for (let i = 0; i < closes5.length; i++) {
-        const slice = closes5.slice(0, i + 1);
-        const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-        if (val !== null) stcSeries5.push(val);
-      }
-      if (stcSeries5.length < 2) continue;
+if (
+  !candles15 ||
+  candles15.length < 40
+) continue;
 
-      const prev5 = stcSeries5[stcSeries5.length - 2];
-      const curr5 = stcSeries5[stcSeries5.length - 1];
 
-      let direction = null;
-      if (trendCycle === "BULL" && prev5 < 25 && curr5 >= 25) direction = "BUY";
-      if (trendCycle === "BEAR" && prev5 > 75 && curr5 <= 75) direction = "SELL";
+// Remove currently forming 15M candle.
+
+const closedCandles15 =
+  candles15.slice(0, -1);
+
+
+// Calculate ChartPrime-style
+// Trend-Reset Cumulative Delta.
+
+const trDelta15 =
+  calculateTrendResetCumulativeDelta(
+    closedCandles15
+  );
+
+
+if (!trDelta15) continue;
+
+
+// =====================================================
+// ENTRY DIRECTION
+// =====================================================
+
+let direction = null;
+
+
+// -----------------------------------------------------
+// BULLISH 1H + BULLISH 15M DELTA
+// -----------------------------------------------------
+
+if (
+  trendCycle === "BULL" &&
+  trDelta15.cumDelta > 0 &&
+  trDelta15.cumDelta > trDelta15.deltaMA
+) {
+
+  direction = "BUY";
+
+}
+
+
+// -----------------------------------------------------
+// BEARISH 1H + BEARISH 15M DELTA
+// -----------------------------------------------------
+
+if (
+  trendCycle === "BEAR" &&
+  trDelta15.cumDelta < 0 &&
+  trDelta15.cumDelta < trDelta15.deltaMA
+) {
+
+  direction = "SELL";
+
+}
 
       // =====================================================
       // EXECUTION
@@ -560,8 +1055,8 @@ setInterval(async () => {
       if (direction) {
         await executeMarketOrderForAllUsers(symbol, direction);
 
-        const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-        const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+        const buyVol = closedCandles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+        const sellVol = closedCandles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
         const totalVol = buyVol + sellVol;
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
@@ -617,6 +1112,8 @@ setInterval(async () => {
 // • 30M Order Flow State
 // • 4H Trend-Reset ATR Structure
 // • 4H Active Support / Resistance
+// • 1H Momentum
+// • Trend Health / Exhaustion
 // • Top 7 Order-Flow Coins
 // • 0-100 Trend / Order Flow Score
 //
@@ -627,14 +1124,13 @@ setInterval(async () => {
 // INFORMATIONAL ONLY.
 //
 // 30M = CURRENT ORDER FLOW
-// 4H  = TREND / ATR STRUCTURE
+// 4H  = BROADER TREND / ATR STRUCTURE
+// 1H  = MOMENTUM / TREND HEALTH
 //======================================================
 
 
 //======================================================
 // 4H TREND SETTINGS
-//
-// MATCHES YOUR CHART:
 //
 // Base EMA Length = 20
 // ATR Length      = 14
@@ -888,8 +1384,6 @@ function analyzeDelta(cumulativeDelta) {
 
 //======================================================
 // EMA VALUE
-//
-// Standard EMA calculation.
 //======================================================
 
 function calculateEMAValue(
@@ -974,8 +1468,6 @@ function calculateEMAValue(
 
 //======================================================
 // ATR VALUE
-//
-// Wilder-style ATR calculation.
 //======================================================
 
 function calculateATRValue(
@@ -1083,8 +1575,6 @@ function calculateATRValue(
 
     let atr = 0;
 
-    // Initial ATR
-
     for (
         let i = 1;
         i <= period;
@@ -1098,8 +1588,6 @@ function calculateATRValue(
 
     atr /=
         period;
-
-    // Wilder smoothing
 
     for (
         let i = period + 1;
@@ -1127,27 +1615,15 @@ function calculateATRValue(
 //======================================================
 // 4H TREND / ATR STRUCTURE
 //
-// EXACT LOGIC:
+// COMPLETED 4H CANDLE:
 //
-// If a COMPLETED 4H candle closes above
-// EMA20 + ATR14 × 1:
+// Close > EMA20 + ATR14 × 1
+//     = BULLISH
 //
-//     BULLISH TREND
-//     LOWER BAND = SUPPORT
+// Close < EMA20 - ATR14 × 1
+//     = BEARISH
 //
-// If a COMPLETED 4H candle closes below
-// EMA20 - ATR14 × 1:
-//
-//     BEARISH TREND
-//     UPPER BAND = RESISTANCE
-//
-// Otherwise the previous trend state remains.
-//
-// IMPORTANT:
-//
-// This function works from historical 4H data.
-// It does NOT require the bot to wait four hours
-// after starting.
+// Otherwise previous trend remains.
 //======================================================
 
 function calculate4HTrendATR(
@@ -1179,10 +1655,6 @@ function calculate4HTrendATR(
     let activeLowerBand =
         null;
 
-
-    //==================================================
-    // WALK THROUGH COMPLETED 4H CANDLES
-    //==================================================
 
     for (
         let i =
@@ -1249,10 +1721,6 @@ function calculate4HTrendATR(
             trendState;
 
 
-        //================================================
-        // UPPER BAND BREAK
-        //================================================
-
         if (
             close >
             upperBand
@@ -1262,11 +1730,6 @@ function calculate4HTrendATR(
                 1;
 
         }
-
-
-        //================================================
-        // LOWER BAND BREAK
-        //================================================
 
         else if (
             close <
@@ -1278,10 +1741,6 @@ function calculate4HTrendATR(
 
         }
 
-
-        //================================================
-        // NEW BULLISH TREND
-        //================================================
 
         if (
             trendState === 1 &&
@@ -1296,10 +1755,6 @@ function calculate4HTrendATR(
 
         }
 
-
-        //================================================
-        // NEW BEARISH TREND
-        //================================================
 
         if (
             trendState === -1 &&
@@ -1322,10 +1777,6 @@ function calculate4HTrendATR(
 
     }
 
-
-    //==================================================
-    // NO TREND YET
-    //==================================================
 
     if (
         trendState === 0
@@ -1361,10 +1812,6 @@ function calculate4HTrendATR(
     }
 
 
-    //==================================================
-    // BULLISH
-    //==================================================
-
     if (
         trendState === 1
     ) {
@@ -1399,10 +1846,6 @@ function calculate4HTrendATR(
     }
 
 
-    //==================================================
-    // BEARISH
-    //==================================================
-
     return {
 
         trend:
@@ -1432,25 +1875,439 @@ function calculate4HTrendATR(
 
 }
 
+//======================================================
+// 1H MOMENTUM
+//
+// 10-CANDLE LOOKBACK
+//
+// Momentum is calculated as:
+//
+// (Current Price - Price 10 Hours Ago) / 10
+//
+// The previous 10H momentum is also calculated so we
+// can determine whether momentum is accelerating or
+// decelerating.
+//======================================================
+
+const MOMENTUM_LOOKBACK_1H = 10;
+
+
+function calculate1HMomentum(candles) {
+
+    if (
+        !candles ||
+        candles.length <
+        (MOMENTUM_LOOKBACK_1H * 2) + 1
+    ) {
+
+        return null;
+
+    }
+
+    const end =
+        candles.length - 1;
+
+
+    const currentClose =
+        Number(
+            candles[end].close
+        );
+
+
+    const close10HoursAgo =
+        Number(
+            candles[
+                end -
+                MOMENTUM_LOOKBACK_1H
+            ].close
+        );
+
+
+    const close20HoursAgo =
+        Number(
+            candles[
+                end -
+                (
+                    MOMENTUM_LOOKBACK_1H * 2
+                )
+            ].close
+        );
+
+
+    if (
+        !Number.isFinite(currentClose) ||
+        !Number.isFinite(close10HoursAgo) ||
+        !Number.isFinite(close20HoursAgo)
+    ) {
+
+        return null;
+
+    }
+
+
+    //==================================================
+    // CURRENT 10H MOMENTUM
+    //==================================================
+
+    const currentMomentum =
+        (
+            currentClose -
+            close10HoursAgo
+        ) /
+        MOMENTUM_LOOKBACK_1H;
+
+
+    //==================================================
+    // PREVIOUS 10H MOMENTUM
+    //==================================================
+
+    const previousMomentum =
+        (
+            close10HoursAgo -
+            close20HoursAgo
+        ) /
+        MOMENTUM_LOOKBACK_1H;
+
+
+    //==================================================
+    // MOMENTUM CHANGE
+    //==================================================
+
+    const momentumChange =
+        currentMomentum -
+        previousMomentum;
+
+
+    //==================================================
+    // DIRECTION
+    //==================================================
+
+    let direction =
+        "FLAT";
+
+
+    if (
+        currentMomentum > 0
+    ) {
+
+        direction =
+            "POSITIVE";
+
+    }
+
+    else if (
+        currentMomentum < 0
+    ) {
+
+        direction =
+            "NEGATIVE";
+
+    }
+
+
+    //==================================================
+    // ACCELERATION / DECELERATION
+    //==================================================
+
+    const accelerating =
+        Math.abs(currentMomentum) >=
+        Math.abs(previousMomentum);
+
+
+    const state =
+        accelerating
+            ? "ACCELERATING"
+            : "DECELERATING";
+
+
+    return {
+
+        current:
+            currentMomentum,
+
+        previous:
+            previousMomentum,
+
+        change:
+            momentumChange,
+
+        direction,
+
+        state
+
+    };
+
+}
+
 
 //======================================================
-// CALCULATE COIN SCORE
+// TREND HEALTH / EXHAUSTION
 //
-// SCORING:
+// This does NOT predict a reversal.
 //
-// BULLISH 4H = 50 POINTS
+// It measures whether the current 4H trend continues
+// to receive confirmation from:
 //
-// BULLISH 4H + HIGHER POSITIVE = 100
-// BULLISH 4H + LOWER POSITIVE  = 75
-// BULLISH 4H + CONFLICTING/NEUTRAL = 50
+// • 1H Momentum
+// • 30M Delta
 //
-// BEARISH 4H = 50 POINTS
+// Healthy:
+// Trend + momentum + order flow aligned.
 //
-// BEARISH 4H + LOWER NEGATIVE = 100
-// BEARISH 4H + HIGHER NEGATIVE = 75
-// BEARISH 4H + CONFLICTING/NEUTRAL = 50
+// Weakening:
+// Momentum or order flow is beginning to fade.
 //
-// CONFLICTING 30M CONDITIONS RECEIVE 0 POINTS.
+// High exhaustion:
+// Momentum is no longer aligned with the broader trend.
+//======================================================
+
+function analyzeTrendHealth(
+    trend4H,
+    delta30M,
+    momentum1H
+) {
+
+    if (
+        !trend4H ||
+        !delta30M ||
+        !momentum1H
+    ) {
+
+        return {
+
+            trend:
+                "UNKNOWN",
+
+            exhaustion:
+                "UNKNOWN",
+
+            action:
+                "MONITOR"
+
+        };
+
+    }
+
+
+    const bullish =
+        trend4H.trendState === 1;
+
+
+    const bearish =
+        trend4H.trendState === -1;
+
+
+    //==================================================
+    // MOMENTUM ALIGNMENT
+    //==================================================
+
+    const momentumAligned =
+        (
+            bullish &&
+            momentum1H.current > 0
+        ) ||
+        (
+            bearish &&
+            momentum1H.current < 0
+        );
+
+
+    //==================================================
+    // DELTA ALIGNMENT
+    //==================================================
+
+    const deltaAligned =
+        (
+            bullish &&
+            (
+                delta30M.trend ===
+                "HIGHER POSITIVE" ||
+
+                delta30M.trend ===
+                "LOWER POSITIVE"
+            )
+        ) ||
+
+        (
+            bearish &&
+            (
+                delta30M.trend ===
+                "LOWER NEGATIVE" ||
+
+                delta30M.trend ===
+                "HIGHER NEGATIVE"
+            )
+        );
+
+
+    //==================================================
+    // MOMENTUM WEAKENING
+    //==================================================
+
+    const momentumWeakening =
+        momentum1H.state ===
+        "DECELERATING";
+
+
+    //==================================================
+    // ORDER FLOW WEAKENING
+    //==================================================
+
+    const deltaWeakening =
+        (
+            bullish &&
+            delta30M.trend ===
+            "LOWER POSITIVE"
+        ) ||
+
+        (
+            bearish &&
+            delta30M.trend ===
+            "HIGHER NEGATIVE"
+        );
+
+
+    //==================================================
+    // HIGH EXHAUSTION
+    //
+    // Momentum has moved against the broader trend.
+    //==================================================
+
+    if (
+        !momentumAligned
+    ) {
+
+        return {
+
+            trend:
+                "WEAKENING",
+
+            exhaustion:
+                "HIGH",
+
+            action:
+                "MONITOR"
+
+        };
+
+    }
+
+
+    //==================================================
+    // MODERATE EXHAUSTION
+    //
+    // Order flow no longer confirms the broader trend.
+    //==================================================
+
+    if (
+        !deltaAligned
+    ) {
+
+        return {
+
+            trend:
+                "WEAKENING",
+
+            exhaustion:
+                "MODERATE",
+
+            action:
+                "MONITOR"
+
+        };
+
+    }
+
+
+    //==================================================
+    // MOMENTUM + DELTA BOTH WEAKENING
+    //==================================================
+
+    if (
+        momentumWeakening &&
+        deltaWeakening
+    ) {
+
+        return {
+
+            trend:
+                "WEAKENING",
+
+            exhaustion:
+                "MODERATE",
+
+            action:
+                "MONITOR"
+
+        };
+
+    }
+
+
+    //==================================================
+    // ONE COMPONENT WEAKENING
+    //==================================================
+
+    if (
+        momentumWeakening ||
+        deltaWeakening
+    ) {
+
+        return {
+
+            trend:
+                "WEAKENING",
+
+            exhaustion:
+                "MODERATE",
+
+            action:
+                "MONITOR"
+
+        };
+
+    }
+
+
+    //==================================================
+    // HEALTHY TREND
+    //==================================================
+
+    return {
+
+        trend:
+            "HEALTHY",
+
+        exhaustion:
+            "LOW",
+
+        action:
+            "HOLD"
+
+    };
+
+}
+
+
+//======================================================
+// ALIGNMENT SCORE
+//
+// 4H BROADER TREND
+//
+// BULLISH  = 50 POINTS
+// BEARISH  = 50 POINTS
+//
+// 30M:
+//
+// Bullish:
+// HIGHER POSITIVE = +50
+// LOWER POSITIVE  = +25
+//
+// Bearish:
+// LOWER NEGATIVE  = +50
+// HIGHER NEGATIVE = +25
+//
+// Conflicting conditions = 0
 //======================================================
 
 function calculateAlignmentScore(
@@ -1563,7 +2420,7 @@ function calculateAlignmentScore(
 
 
 //======================================================
-// CALCULATE COIN ORDER FLOW
+// CALCULATE COIN SCORE
 //======================================================
 
 async function calculateCoinScore(
@@ -1578,6 +2435,9 @@ async function calculateCoinScore(
         let trend4H =
             null;
 
+        let momentum1H =
+            null;
+
 
         //================================================
         // 30M DATA
@@ -1589,6 +2449,7 @@ async function calculateCoinScore(
                 "30m",
                 120
             );
+
 
         if (
             !candles30M ||
@@ -1604,7 +2465,7 @@ async function calculateCoinScore(
         }
 
 
-        // Remove currently forming 30M candle.
+        // Remove currently forming candle.
 
         const closed30M =
             candles30M.slice(
@@ -1612,25 +2473,49 @@ async function calculateCoinScore(
                 -1
             );
 
+
+        const currentPrice =
+            Number(
+                closed30M[
+                    closed30M.length - 1
+                ].close
+            );
+
+
         if (
-            closed30M.length < 2
+            !Number.isFinite(
+                currentPrice
+            )
         ) {
+
+            log(
+                `Current price unavailable for ${symbol}`
+            );
 
             return null;
 
         }
+
+
+        //================================================
+        // 30M CUMULATIVE DELTA
+        //================================================
 
         const delta30MSeries =
             calculateCumulativeDelta(
                 closed30M
             );
 
+
         delta30M =
             analyzeDelta(
                 delta30MSeries
             );
 
-        if (!delta30M) {
+
+        if (
+            !delta30M
+        ) {
 
             log(
                 `30M Delta unavailable for ${symbol}`
@@ -1652,6 +2537,7 @@ async function calculateCoinScore(
                 120
             );
 
+
         if (
             candles4H &&
             candles4H.length >=
@@ -1664,15 +2550,19 @@ async function calculateCoinScore(
                     -1
                 );
 
+
             trend4H =
                 calculate4HTrendATR(
                     closed4H
                 );
 
-            if (!trend4H) {
+
+            if (
+                !trend4H
+            ) {
 
                 log(
-                    `4H Trend/ATR calculation unavailable for ${symbol}. Candles: ${closed4H.length}`
+                    `4H Trend/ATR calculation unavailable for ${symbol}`
                 );
 
             }
@@ -1693,6 +2583,65 @@ async function calculateCoinScore(
 
 
         //================================================
+        // 1H DATA
+        //================================================
+
+        const candles1H =
+            await fetchFuturesKlines(
+                symbol,
+                "1h",
+                60
+            );
+
+
+        if (
+            candles1H &&
+            candles1H.length >=
+            (
+                (MOMENTUM_LOOKBACK_1H * 2) + 2
+            )
+        ) {
+
+            const closed1H =
+                candles1H.slice(
+                    0,
+                    -1
+                );
+
+
+            momentum1H =
+                calculate1HMomentum(
+                    closed1H
+                );
+
+        }
+
+        else {
+
+            log(
+                `1H Momentum data unavailable for ${symbol}. Candles received: ${
+                    candles1H
+                        ? candles1H.length
+                        : 0
+                }`
+            );
+
+        }
+
+
+        //================================================
+        // TREND HEALTH
+        //================================================
+
+        const trendHealth =
+            analyzeTrendHealth(
+                trend4H,
+                delta30M,
+                momentum1H
+            );
+
+
+        //================================================
         // ALIGNMENT SCORE
         //================================================
 
@@ -1704,10 +2653,7 @@ async function calculateCoinScore(
 
 
         //================================================
-        // TOP 7 TIE-BREAKER
-        //
-        // Existing 30M Delta movement remains available
-        // for ranking coins with identical scores.
+        // DELTA STRENGTH
         //================================================
 
         const orderFlowStrength =
@@ -1717,16 +2663,22 @@ async function calculateCoinScore(
 
 
         //================================================
-        // RETURN
+        // RETURN RESULT
         //================================================
 
         return {
 
             symbol,
 
+            currentPrice,
+
             delta30M,
 
             trend4H,
+
+            momentum1H,
+
+            trendHealth,
 
             alignmentScore,
 
@@ -1787,7 +2739,9 @@ async function generateCoinScoreReport() {
                         symbol
                     );
 
-                if (result) {
+                if (
+                    result
+                ) {
 
                     results.push(
                         result
@@ -1820,7 +2774,10 @@ async function generateCoinScoreReport() {
         const top7 =
             results
                 .sort(
-                    (a, b) => {
+                    (
+                        a,
+                        b
+                    ) => {
 
                         if (
                             b.alignmentScore.score !==
@@ -1852,12 +2809,15 @@ async function generateCoinScoreReport() {
         //================================================
 
         let msg =
-`⚡ *COIN ORDER FLOW REPORT*
+`⚡ *COIN TREND REPORT*
 🕐 30-MINUTE UPDATE
 
-⚡ 30M = CURRENT ORDER FLOW
-📊 4H = TREND / ATR STRUCTURE
-🎯 SCORE = 4H TREND + ALIGNED 30M PRESSURE
+📊 4H = BROADER TREND
+📈 1H = MOMENTUM
+⚡ 30M = ORDER FLOW
+🎯 ATR = ACTIVE SUPPORT / RESISTANCE
+
+🏆 *TOP 7*
 
 `;
 
@@ -1886,11 +2846,6 @@ The scanner is still monitoring all coins.
 
         else {
 
-            msg +=
-`🏆 *TOP 7 ORDER-FLOW COINS*
-
-`;
-
             top7.forEach(
                 (
                     coin,
@@ -1903,178 +2858,190 @@ The scanner is still monitoring all coins.
                     const t4 =
                         coin.trend4H;
 
-                    const score =
-                        coin.alignmentScore;
+                    const momentum =
+                        coin.momentum1H;
+
+                    const health =
+                        coin.trendHealth;
 
 
                     //================================================
-                    // 30M CONTROL
+                    // 4H TREND
                     //================================================
 
-                    let flowIcon =
-                        "⚪";
+                    const trendLabel =
+                        t4
+                            ? (
+                                t4.trendState === 1
+                                    ? "🟢 BULLISH"
+                                    : t4.trendState === -1
+                                        ? "🔴 BEARISH"
+                                        : "⚪ NEUTRAL"
+                            )
+                            : "⚪ UNKNOWN";
 
-                    let flowControl =
-                        "BALANCED";
+
+                    //================================================
+                    // ATR ACTIVE SUPPORT / RESISTANCE
+                    //================================================
+
+                    let atrText =
+                        "⚪ N/A";
+
+                    let distanceText =
+                        "N/A";
+
 
                     if (
-                        d30.currentDelta > 0
+                        t4 &&
+                        t4.activeLevel !== null
                     ) {
 
-                        flowIcon =
-                            "🟢";
+                        const distance =
+                            Math.abs(
+                                coin.currentPrice -
+                                Number(
+                                    t4.activeLevel
+                                )
+                            );
 
-                        flowControl =
-                            "BUYERS IN CONTROL";
+
+                        if (
+                            Number.isFinite(
+                                distance
+                            )
+                        ) {
+
+                            distanceText =
+                                distance.toFixed(
+                                    6
+                                );
+
+                        }
 
                     }
 
-                    else if (
-                        d30.currentDelta < 0
-                    ) {
-
-                        flowIcon =
-                            "🔴";
-
-                        flowControl =
-                            "SELLERS IN CONTROL";
-
-                    }
-
-
-                    //================================================
-                    // SCORE DISPLAY
-                    //================================================
-
-                    let scoreIcon =
-                        "⚪";
 
                     if (
-                        score.score === 100
+                        t4
                     ) {
 
-                        scoreIcon =
-                            "🟢";
+                        if (
+                            t4.trendState === 1
+                        ) {
 
-                    }
+                            atrText =
+                                `🟢 SUPPORT @ ${
+                                    t4.activeLevel !== null
+                                        ? t4.activeLevel.toFixed(6)
+                                        : "N/A"
+                                }`;
 
-                    else if (
-                        score.score === 75
-                    ) {
+                        }
 
-                        scoreIcon =
-                            "🟡";
+                        else if (
+                            t4.trendState === -1
+                        ) {
 
-                    }
+                            atrText =
+                                `🔴 RESISTANCE @ ${
+                                    t4.activeLevel !== null
+                                        ? t4.activeLevel.toFixed(6)
+                                        : "N/A"
+                                }`;
 
-                    else if (
-                        score.score === 50
-                    ) {
-
-                        scoreIcon =
-                            "🟠";
+                        }
 
                     }
 
 
                     //================================================
-                    // COIN
+                    // 1H MOMENTUM
+                    //================================================
+
+                    let momentumText =
+                        "N/A";
+
+
+                    if (
+                        momentum
+                    ) {
+
+                        const momentumIcon =
+                            momentum.state ===
+                            "DECELERATING"
+                                ? "🟡"
+                                : "🟢";
+
+
+                        const momentumValue =
+                            momentum.current >= 0
+                                ? `+${momentum.current.toFixed(3)}`
+                                : momentum.current.toFixed(3);
+
+
+                        momentumText =
+                            `${momentumValue} ${momentumIcon}`;
+
+                    }
+
+
+                    //================================================
+                    // 30M DELTA
+                    //================================================
+
+                    const flowText =
+                        d30
+                            ? d30.trend
+                            : "N/A";
+
+
+                    //================================================
+                    // TREND HEALTH
+                    //================================================
+
+                    const trendIcon =
+                        health.trend ===
+                        "HEALTHY"
+                            ? "🟢"
+                            : health.trend ===
+                              "WEAKENING"
+                                ? "🟡"
+                                : "🔴";
+
+
+                    //================================================
+                    // EXHAUSTION
+                    //================================================
+
+                    const exhaustionIcon =
+                        health.exhaustion ===
+                        "LOW"
+                            ? "🟢"
+                            : health.exhaustion ===
+                              "MODERATE"
+                                ? "🟡"
+                                : "🔴";
+
+
+                    //================================================
+                    // REPORT ENTRY
                     //================================================
 
                     msg +=
-
 `${index + 1}. *${coin.symbol}*
 
-🎯 *SCORE: ${score.score}/100*
-${scoreIcon} 4H Trend: +${score.trendPoints}
-⚡ 30M Aligned Pressure: +${score.orderFlowPoints}
+📊 4H: ${trendLabel}
+🎯 ATR: ${atrText}
+📏 Distance: ${distanceText}
+📈 1H MOM: ${momentumText}
+⚡ 30M DELTA: ${flowText}
+
+💪 TREND: ${trendIcon} ${health.trend}
+⚠️ EXHAUSTION: ${exhaustionIcon} ${health.exhaustion}
+➡️ ${health.action}
 
 `;
-
-
-                    //================================================
-                    // 30M ORDER FLOW
-                    //================================================
-
-                    msg +=
-
-`⚡ *30M ORDER FLOW*
-${flowIcon} ${flowControl}
-Delta: ${d30.currentDelta.toFixed(0)}
-${d30.trend}
-
-`;
-
-
-                    //================================================
-                    // 4H TREND / ATR
-                    //================================================
-
-                    msg +=
-`📊 *4H TREND / ATR*
-`;
-
-                    if (
-                        !t4
-                    ) {
-
-                        msg +=
-`⚪ DATA UNAVAILABLE
-
-`;
-
-                    }
-
-                    else if (
-                        t4.trendState === 1
-                    ) {
-
-                        msg +=
-
-`🟢 *BULLISH TREND*
-Price closed ABOVE the upper ATR band.
-
-📍 *ACTIVE SUPPORT*
-Lower ATR Band: ${
-    t4.lowerBand !== null
-        ? t4.lowerBand.toFixed(6)
-        : "N/A"
-}
-
-`;
-
-                    }
-
-                    else if (
-                        t4.trendState === -1
-                    ) {
-
-                        msg +=
-
-`🔴 *BEARISH TREND*
-Price closed BELOW the lower ATR band.
-
-📍 *ACTIVE RESISTANCE*
-Upper ATR Band: ${
-    t4.upperBand !== null
-        ? t4.upperBand.toFixed(6)
-        : "N/A"
-}
-
-`;
-
-                    }
-
-                    else {
-
-                        msg +=
-
-`⚪ *NEUTRAL*
-No confirmed ATR-band breakout.
-
-`;
-
-                    }
 
 
                     //================================================
@@ -2104,71 +3071,14 @@ No confirmed ATR-band breakout.
         //================================================
 
         msg +=
+`━━━━━━━━━━━━━━━━━━━━
 
-`
-━━━━━━━━━━━━━━━━━━━━
-
-📌 *ORDER FLOW SCORE GUIDE*
-
-🎯 *100/100*
-Strong 4H trend +
-strong aligned 30M pressure.
-
-🎯 *75/100*
-4H trend +
-weaker aligned 30M pressure.
-
-🎯 *50/100*
-4H trend exists +
-30M pressure is conflicting or neutral.
-
-⚠️ Conflicting 30M pressure receives
-0 additional points.
-
-
-⚡ *30M ORDER FLOW*
-
-🟢 Positive Delta
-BUYERS IN CONTROL
-
-🔴 Negative Delta
-SELLERS IN CONTROL
-
-📈 Higher Positive
-Buying pressure strengthening
-
-📉 Lower Positive
-Buying pressure weakening
-
-📈 Higher Negative
-Selling pressure weakening
-
-📉 Lower Negative
-Selling pressure strengthening
-
-
-📊 *4H TREND / ATR*
-
-🟢 *BULLISH TREND*
-Price closed above the upper ATR band.
-
-📍 Lower ATR Band
-ACTIVE SUPPORT.
-
-
-🔴 *BEARISH TREND*
-Price closed below the lower ATR band.
-
-📍 Upper ATR Band
-ACTIVE RESISTANCE.
-
-
-⚪ *NEUTRAL*
-No confirmed ATR-band breakout.
-
+📌 *GUIDE*
+🟢 HEALTHY = trend intact
+🟡 WEAKENING = momentum/order flow fading
+🔴 HIGH EXHAUSTION = reversal risk elevated
 
 ⚠️ *INFORMATIONAL ONLY*
-This report is not an automatic trading signal.
 `;
 
 
