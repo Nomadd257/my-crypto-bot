@@ -2707,14 +2707,35 @@ async function calculateCoinScore(
 //
 // INFORMATIONAL ONLY.
 //
-// Top 7 ranking:
+// PROCESS:
+//
+// 1. Scan ALL coins
+//
+// 2. Filter coins that pass ALL requirements:
+//
+//    4H TREND
+//    • BULLISH or BEARISH
+//
+//    1H MOMENTUM
+//    • Must agree with 4H trend
+//
+//    30M DELTA
+//    • Must agree with 4H trend
+//
+//    TREND HEALTH
+//    • Must be HEALTHY
+//
+//    EXHAUSTION
+//    • Must be LOW
+//
+// 3. Rank ONLY eligible coins
+//
+// 4. Show TOP 7
+//
+// Ranking:
 //
 // 1. Alignment Score
 // 2. 30M Delta Movement as tie-breaker
-//
-// 4H Trend = 50 points
-// 30M aligned pressure = 25 or 50 points
-// Conflicting pressure = 0 points
 //======================================================
 
 async function generateCoinScoreReport() {
@@ -2765,14 +2786,162 @@ async function generateCoinScoreReport() {
 
 
         //================================================
+        // FILTER ELIGIBLE TRENDING COINS
+        //
+        // A coin MUST pass ALL conditions:
+        //
+        // 1. 4H TREND = BULLISH or BEARISH
+        // 2. 1H MOMENTUM agrees with 4H trend
+        // 3. 30M DELTA agrees with 4H trend
+        // 4. TREND = HEALTHY
+        // 5. EXHAUSTION = LOW
+        //
+        // Only coins passing every condition can
+        // enter the TOP 7.
+        //================================================
+
+        const eligibleCoins =
+            results.filter(
+                (
+                    coin
+                ) => {
+
+                    if (
+                        !coin ||
+                        !coin.trend4H ||
+                        !coin.momentum1H ||
+                        !coin.delta30M ||
+                        !coin.trendHealth
+                    ) {
+
+                        return false;
+
+                    }
+
+
+                    const trendState =
+                        coin.trend4H.trendState;
+
+
+                    //================================================
+                    // BULLISH TREND
+                    //================================================
+
+                    if (
+                        trendState === 1
+                    ) {
+
+                        // 1H momentum must be positive
+
+                        const bullishMomentum =
+                            coin.momentum1H.direction ===
+                            "POSITIVE";
+
+
+                        // 30M delta must be positive
+
+                        const bullishDelta =
+                            coin.delta30M.trend ===
+                                "HIGHER POSITIVE" ||
+
+                            coin.delta30M.trend ===
+                                "LOWER POSITIVE";
+
+
+                        // Trend must be healthy
+
+                        const healthy =
+                            coin.trendHealth.trend ===
+                            "HEALTHY";
+
+
+                        // Exhaustion must be low
+
+                        const lowExhaustion =
+                            coin.trendHealth.exhaustion ===
+                            "LOW";
+
+
+                        return (
+                            bullishMomentum &&
+                            bullishDelta &&
+                            healthy &&
+                            lowExhaustion
+                        );
+
+                    }
+
+
+                    //================================================
+                    // BEARISH TREND
+                    //================================================
+
+                    if (
+                        trendState === -1
+                    ) {
+
+                        // 1H momentum must be negative
+
+                        const bearishMomentum =
+                            coin.momentum1H.direction ===
+                            "NEGATIVE";
+
+
+                        // 30M delta must be negative
+
+                        const bearishDelta =
+                            coin.delta30M.trend ===
+                                "LOWER NEGATIVE" ||
+
+                            coin.delta30M.trend ===
+                                "HIGHER NEGATIVE";
+
+
+                        // Trend must be healthy
+
+                        const healthy =
+                            coin.trendHealth.trend ===
+                            "HEALTHY";
+
+
+                        // Exhaustion must be low
+
+                        const lowExhaustion =
+                            coin.trendHealth.exhaustion ===
+                            "LOW";
+
+
+                        return (
+                            bearishMomentum &&
+                            bearishDelta &&
+                            healthy &&
+                            lowExhaustion
+                        );
+
+                    }
+
+
+                    //================================================
+                    // NEUTRAL 4H = NOT ELIGIBLE
+                    //================================================
+
+                    return false;
+
+                }
+            );
+
+
+        //================================================
         // TOP 7
         //
-        // Highest score first.
-        // 30M delta movement breaks ties.
+        // Rank ONLY coins that passed ALL filters.
+        //
+        // 1. Highest alignment score
+        // 2. Strongest 30M delta movement breaks ties
         //================================================
 
         const top7 =
-            results
+            eligibleCoins
                 .sort(
                     (
                         a,
@@ -2790,6 +2959,7 @@ async function generateCoinScoreReport() {
                             );
 
                         }
+
 
                         return (
                             b.orderFlowStrength -
@@ -2817,13 +2987,13 @@ async function generateCoinScoreReport() {
 ⚡ 30M = ORDER FLOW
 🎯 ATR = ACTIVE SUPPORT / RESISTANCE
 
-🏆 *TOP 7*
+🏆 *TOP 7 HEALTHY TRENDING COINS*
 
 `;
 
 
         //================================================
-        // NO DATA
+        // NO ELIGIBLE COINS
         //================================================
 
         if (
@@ -2831,7 +3001,15 @@ async function generateCoinScoreReport() {
         ) {
 
             msg +=
-`⚪ *NO DATA AVAILABLE*
+`⚪ *NO QUALIFYING COINS*
+
+No coin currently satisfies all of the following:
+
+• 4H trend
+• 1H momentum aligned
+• 30M delta aligned
+• Healthy trend
+• Low exhaustion
 
 The scanner is still monitoring all coins.
 
@@ -3072,6 +3250,13 @@ The scanner is still monitoring all coins.
 
         msg +=
 `━━━━━━━━━━━━━━━━━━━━
+
+📌 *FILTER*
+4H trend must be established
+1H momentum must agree
+30M delta must agree
+Trend must be HEALTHY
+Exhaustion must be LOW
 
 📌 *GUIDE*
 🟢 HEALTHY = trend intact
