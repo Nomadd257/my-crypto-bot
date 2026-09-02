@@ -4,7 +4,7 @@
 // TP/SL/TRAILING STOP INTACT
 // Volume imbalance report only per trade
 // MAX TRADES = 7 per user
-// 30-min cooldown per symbol
+// 2 HRS cooldown per symbol
 // =====================================================
 
 const config = require("../config");
@@ -27,9 +27,9 @@ const USERS_FILE = "./users.json";
 // --- Settings ---
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
-const TP_PCT = 2.0;
+const RUNNER_ACTIVATION_PCT = 2;
 const SL_PCT = 1.5;
-const TRAILING_STOP_PCT = 3;
+const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_TRADES = 7; // per user
@@ -761,8 +761,11 @@ async function monitorPositions() {
 
       try {
         const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
+        const p = Array.isArray(positions)
+          ? positions.find((x) => x.symbol === symbol)
+          : null;
         const amt = p ? parseFloat(p.positionAmt || 0) : 0;
+
         if (!p || amt === 0) {
           delete activePositions[symbol][userId];
           continue;
@@ -773,53 +776,182 @@ async function monitorPositions() {
           const mp = await client.futuresMarkPrice(symbol);
           mark = mp?.markPrice ? parseFloat(mp.markPrice) : 0;
         } catch {}
+
         if (!mark || mark <= 0) continue;
 
-        // Trailing Stop
-        if (pos.side === "BUY") {
-          pos.highest = Math.max(pos.highest, mark);
-          const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail > pos.trailingStop) pos.trailingStop = trail;
-          if (mark <= pos.trailingStop) {
-            await client.futuresMarketSell(symbol, Math.abs(amt));
-            delete activePositions[symbol][userId];
-            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
-            continue;
-          }
-        } else {
-          pos.lowest = Math.min(pos.lowest, mark);
-          const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
-          if (!pos.trailingStop || trail < pos.trailingStop) pos.trailingStop = trail;
-          if (mark >= pos.trailingStop) {
-            await client.futuresMarketBuy(symbol, Math.abs(amt));
-            delete activePositions[symbol][userId];
-            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
-            continue;
-          }
-        }
-
-        // TP / SL
+        // Profit/Loss calculation
         const move =
           pos.side === "BUY"
             ? ((mark - pos.entryPrice) / pos.entryPrice) * 100
             : ((pos.entryPrice - mark) / pos.entryPrice) * 100;
-        if (move >= TP_PCT) {
-          if (pos.side === "BUY") await client.futuresMarketSell(symbol, Math.abs(amt));
-          else await client.futuresMarketBuy(symbol, Math.abs(amt));
-          delete activePositions[symbol][userId];
-          await sendMessage(`🎯 TAKE PROFIT: *${symbol}* User ${userId}`);
-          continue;
+
+        // =====================================================
+        // RUNNER ACTIVATION
+        // Runner activates once the position reaches +2%.
+        // Only one activation message is sent per symbol.
+        // =====================================================
+        if (move >= RUNNER_ACTIVATION_PCT && !pos.runnerActive) {
+          pos.runnerActive = true;
+
+          if (!runnerActivationNotified[symbol]) {
+            runnerActivationNotified[symbol] = true;
+
+            await sendMessage(
+              `🏃 RUNNER ACTIVATED: *${symbol}* ${pos.side}\n\n` +
+              `💰 Profit: +${move.toFixed(2)}%\n` +
+              `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
+              `📊 Runner Mode: ACTIVE\n` +
+              `🔎 Exit Signal: 15M Delta vs Delta MA\n\n` +
+              `👥 All users' ${symbol} positions are now in runner mode.`
+            );
+          }
         }
+
+        // =====================================================
+        // TRAILING STOP
+        // Active only before runner mode.
+        // Once runner mode activates, Delta controls the runner exit.
+        // =====================================================
+        if (!pos.runnerActive && pos.side === "BUY") {
+          pos.highest = Math.max(pos.highest, mark);
+          const trail = pos.highest * (1 - TRAILING_STOP_PCT / 100);
+
+          if (!pos.trailingStop || trail > pos.trailingStop) {
+            pos.trailingStop = trail;
+          }
+
+          if (mark <= pos.trailingStop) {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+            delete activePositions[symbol][userId];
+
+            await sendMessage(
+              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
+            );
+
+            continue;
+          }
+        } else if (!pos.runnerActive && pos.side === "SELL") {
+          pos.lowest = Math.min(pos.lowest, mark);
+          const trail = pos.lowest * (1 + TRAILING_STOP_PCT / 100);
+
+          if (!pos.trailingStop || trail < pos.trailingStop) {
+            pos.trailingStop = trail;
+          }
+
+          if (mark >= pos.trailingStop) {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+            delete activePositions[symbol][userId];
+
+            await sendMessage(
+              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
+            );
+
+            continue;
+          }
+        }
+
+        // =====================================================
+        // RUNNER EXIT USING 15M TREND-RESET CUMULATIVE DELTA
+        //
+        // LONG:
+        // Positive Delta > Delta MA = HOLD
+        // Positive Delta < Delta MA = EXIT
+        //
+        // SHORT:
+        // Negative Delta < Delta MA = HOLD
+        // Negative Delta > Delta MA = EXIT
+        // =====================================================
+        if (pos.runnerActive) {
+          try {
+            const candles15 = await client.futuresCandles({
+              symbol,
+              interval: "15m",
+              limit: 150,
+            });
+
+            // Use closed 15M candles only.
+            const closedCandles15 = candles15.slice(0, -1);
+
+            const trDelta15 =
+              calculateTrendResetCumulativeDelta(closedCandles15);
+
+            if (
+              pos.side === "BUY" &&
+              trDelta15.cumDelta > 0 &&
+              trDelta15.cumDelta < trDelta15.deltaMA
+            ) {
+              await client.futuresMarketSell(symbol, Math.abs(amt));
+              delete activePositions[symbol][userId];
+
+              await sendMessage(
+                `🏃 RUNNER EXIT: *${symbol}* LONG\n` +
+                `Profit: ${move.toFixed(2)}%\n` +
+                `Delta weakened below Delta MA.`
+              );
+
+              continue;
+            }
+
+            if (
+              pos.side === "SELL" &&
+              trDelta15.cumDelta < 0 &&
+              trDelta15.cumDelta > trDelta15.deltaMA
+            ) {
+              await client.futuresMarketBuy(symbol, Math.abs(amt));
+              delete activePositions[symbol][userId];
+
+              await sendMessage(
+                `🏃 RUNNER EXIT: *${symbol}* SHORT\n` +
+                `Profit: ${move.toFixed(2)}%\n` +
+                `Delta weakened above Delta MA.`
+              );
+
+              continue;
+            }
+          } catch (deltaErr) {
+            log(
+              `⚠️ Runner delta check error ${userId} ${symbol}: ${
+                deltaErr?.message || deltaErr
+              }`
+            );
+          }
+        }
+
+        // =====================================================
+        // STOP LOSS REMAINS ACTIVE
+        // =====================================================
         if (move <= -SL_PCT) {
-          if (pos.side === "BUY") await client.futuresMarketSell(symbol, Math.abs(amt));
-          else await client.futuresMarketBuy(symbol, Math.abs(amt));
+          if (pos.side === "BUY") {
+            await client.futuresMarketSell(symbol, Math.abs(amt));
+          } else {
+            await client.futuresMarketBuy(symbol, Math.abs(amt));
+          }
+
           delete activePositions[symbol][userId];
-          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
+
+          await sendMessage(
+            `🔻 STOP LOSS: *${symbol}* User ${userId}`
+          );
+
           continue;
         }
       } catch (err) {
-        log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
+        log(
+          `❌ monitorPositions error ${userId} ${symbol}: ${
+            err?.message || err
+          }`
+        );
       }
+    }
+
+    // Reset notification state when there are no positions left
+    // for this symbol, allowing a future trade to activate a new runner.
+    if (
+      !activePositions[symbol] ||
+      Object.keys(activePositions[symbol]).length === 0
+    ) {
+      delete runnerActivationNotified[symbol];
+      delete activePositions[symbol];
     }
   }
 }
