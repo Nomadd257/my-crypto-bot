@@ -84,6 +84,7 @@ const COIN_LIST = [
 
 // --- In-memory ---
 let activePositions = {}; // { symbol: { userId: position } }
+let runnerActivationNotified = {}; // { symbol: true }
 let userClients = {};
 let BOT_PAUSED = false;
 let symbolCooldowns = {}; // { symbol: timestamp }
@@ -736,6 +737,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           trailingStop: null,
           highest: markPrice,
           lowest: markPrice,
+          runnerActive: false,
         };
         // Start cooldown for this symbol
         symbolCooldowns[symbol] = Date.now();
