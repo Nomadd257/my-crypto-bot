@@ -89,6 +89,16 @@ let userClients = {};
 let BOT_PAUSED = false;
 let symbolCooldowns = {}; // { symbol: timestamp }
 
+// =====================================================
+// PRICE ACTIVATION GATE
+// =====================================================
+// A coin can be locked until it reaches an admin-defined
+// price. Once triggered, it stays unlocked for this bot
+// session. This is separate from /activate and /deactivate.
+// =====================================================
+let priceActivationLevels = {}; // { BTCUSDT: 105000 }
+let priceActivated = {};         // { BTCUSDT: true }
+
 // --- STC cycle trackers ---
 let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
 
@@ -965,6 +975,55 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
+// =====================================================
+// PRICE ACTIVATION MONITOR
+// =====================================================
+// Uses Binance's public Futures mark-price endpoint.
+// No user account/order is required to monitor activation.
+// =====================================================
+async function monitorPriceActivations() {
+  const symbols = Object.keys(priceActivationLevels);
+  if (!symbols.length) return;
+
+  for (const symbol of symbols) {
+    if (priceActivated[symbol] === true) continue;
+
+    try {
+      const res = await fetch(
+        `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`
+      );
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data = await res.json();
+      const currentPrice = parseFloat(data?.markPrice || 0);
+      const activationPrice = priceActivationLevels[symbol];
+
+      if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+      if (!Number.isFinite(activationPrice) || activationPrice <= 0) continue;
+
+      if (currentPrice >= activationPrice) {
+        priceActivated[symbol] = true;
+
+        await sendMessage(
+          `🔓 *PRICE ACTIVATION TRIGGERED*\n\n` +
+          `🪙 Coin: *${symbol}*\n` +
+          `🎯 Activation Price: *${activationPrice}*\n` +
+          `💰 Current Price: *${currentPrice}*\n\n` +
+          `✅ *${symbol}* is now unlocked for trading.\n` +
+          `Waiting for a valid 1H STC + 15M Trend-Reset Cumulative Delta setup.`
+        );
+
+        log(`🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. Trigger: ${activationPrice}`);
+      }
+    } catch (err) {
+      log(`❌ Price activation monitor error ${symbol}: ${err?.message || err}`);
+    }
+  }
+}
+
+setInterval(monitorPriceActivations, 5000);
+
 // --- Full-auto STC + ATR combined scanning loop ---
 
 let prevBullishFlip = [];
@@ -1078,6 +1137,13 @@ setInterval(async () => {
       // Skip trading if paused/inactive
       // =====================================================
       if (!isActive || BOT_PAUSED) continue;
+
+      // Price activation gate. This does not change /activate or /deactivate.
+      if (
+        priceActivationLevels[symbol] !== undefined &&
+        priceActivated[symbol] !== true
+      ) continue;
+
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
@@ -3574,6 +3640,86 @@ bot.onText(/\/deactivateall/, async (msg) => {
     symbolActive[symbol] = false;
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
+});
+
+// =====================================================
+// PRICE ACTIVATION COMMANDS
+// =====================================================
+
+// Set a price gate: /price BTCUSDT 105000
+bot.onText(/^\/price\s+(\w+)\s+([\d.]+)$/i, async (msg, match) => {
+  if (!isAdmin(msg)) return;
+
+  const symbol = match[1].toUpperCase();
+  const activationPrice = parseFloat(match[2]);
+
+  if (!COIN_LIST.includes(symbol)) {
+    await sendMessage(`⚠️ Symbol *${symbol}* is not in COIN_LIST.`);
+    return;
+  }
+
+  if (!Number.isFinite(activationPrice) || activationPrice <= 0) {
+    await sendMessage(`⚠️ Invalid activation price for *${symbol}*.`);
+    return;
+  }
+
+  priceActivationLevels[symbol] = activationPrice;
+  priceActivated[symbol] = false;
+
+  await sendMessage(
+    `🎯 *PRICE ACTIVATION SET*\n\n` +
+    `🪙 Coin: *${symbol}*\n` +
+    `💰 Activation Price: *${activationPrice}*\n\n` +
+    `🔒 ${symbol} is now locked until price reaches the activation level.\n` +
+    `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`
+  );
+});
+
+// Remove a price gate: /priceoff BTCUSDT
+bot.onText(/^\/priceoff\s+(\w+)$/i, async (msg, match) => {
+  if (!isAdmin(msg)) return;
+
+  const symbol = match[1].toUpperCase();
+
+  if (!COIN_LIST.includes(symbol)) {
+    await sendMessage(`⚠️ Symbol *${symbol}* is not in COIN_LIST.`);
+    return;
+  }
+
+  delete priceActivationLevels[symbol];
+  delete priceActivated[symbol];
+
+  await sendMessage(
+    `🔓 *PRICE ACTIVATION REMOVED*\n\n` +
+    `🪙 *${symbol}* no longer has a price activation gate.\n` +
+    `Its normal /activate and /deactivate status remains unchanged.`
+  );
+});
+
+// Show all price gates: /pricestatus
+bot.onText(/^\/pricestatus$/i, async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  const symbols = Object.keys(priceActivationLevels);
+
+  if (!symbols.length) {
+    await sendMessage(
+      `🎯 *PRICE ACTIVATION STATUS*\n\nNo price activation levels are configured.`
+    );
+    return;
+  }
+
+  let message = `🎯 *PRICE ACTIVATION STATUS*\n\n`;
+
+  for (const symbol of symbols) {
+    const activated = priceActivated[symbol] === true;
+    message +=
+      `${activated ? "🟢" : "🔒"} *${symbol}*\n` +
+      `Activation: *${priceActivationLevels[symbol]}*\n` +
+      `Status: *${activated ? "ACTIVATED" : "WAITING"}*\n\n`;
+  }
+
+  await sendMessage(message);
 });
 
 // --- Show all users Futures USDT balances ---
