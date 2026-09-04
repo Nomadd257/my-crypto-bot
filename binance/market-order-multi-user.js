@@ -88,6 +88,16 @@ let runnerActivationNotified = {}; // { symbol: true }
 let userClients = {};
 let BOT_PAUSED = false;
 let symbolCooldowns = {}; // { symbol: timestamp }
+let tradeHistory = []; // Successful trades placed by the bot
+
+function getTradeHistoryDate() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Lagos",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+}
 
 // =====================================================
 // PRICE ACTIVATION GATE
@@ -98,6 +108,7 @@ let symbolCooldowns = {}; // { symbol: timestamp }
 // =====================================================
 let priceActivationLevels = {}; // { BTCUSDT: 105000 }
 let priceActivated = {};         // { BTCUSDT: true }
+let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 
 // --- STC cycle trackers ---
 let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
@@ -256,6 +267,12 @@ const TR_DELTA_EMA_LENGTH = 20;
 const TR_DELTA_ATR_LENGTH = 14;
 const TR_DELTA_ATR_MULTIPLIER = 1;
 const TR_DELTA_MA_LENGTH = 10;
+
+// Minimum adaptive Delta strength required for a new entry.
+// 0.50 = Delta must be at least half of the recent average
+// absolute bar-delta movement beyond the Delta MA.
+const DELTA_STRENGTH_THRESHOLD = 0.50;
+const DELTA_STRENGTH_LOOKBACK = 20;
 
 
 // ------------------------------------------------------
@@ -641,6 +658,37 @@ function calculateTrendResetCumulativeDelta(
     ) /
     TR_DELTA_MA_LENGTH;
 
+  // -----------------------------------------------------
+  // Adaptive Delta strength
+  // Measures how far cumulative Delta is from its MA
+  // relative to the recent typical bar-delta movement.
+  // This prevents weak readings that are only slightly
+  // above/below the MA from qualifying as entries.
+  // -----------------------------------------------------
+  const strengthWindow =
+    deltaSeries.slice(
+      -Math.min(DELTA_STRENGTH_LOOKBACK, deltaSeries.length)
+    );
+
+  const recentBarDeltaMoves = [];
+
+  for (let i = 1; i < strengthWindow.length; i++) {
+    recentBarDeltaMoves.push(
+      Math.abs(
+        strengthWindow[i].cumDelta -
+        strengthWindow[i - 1].cumDelta
+      )
+    );
+  }
+
+  const avgAbsBarDelta =
+    recentBarDeltaMoves.length
+      ? recentBarDeltaMoves.reduce(
+          (sum, value) => sum + value,
+          0
+        ) / recentBarDeltaMoves.length
+      : 0;
+
 
   const latest =
     deltaSeries[
@@ -661,13 +709,29 @@ function calculateTrendResetCumulativeDelta(
     trendChanged:
       latest.trendChanged,
 
+    deltaDistance:
+      latest.cumDelta - deltaMA,
+
+    deltaStrength:
+      avgAbsBarDelta > 0
+        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
+        : 0,
+
+    avgAbsBarDelta,
+
     bullish:
       latest.cumDelta > 0 &&
-      latest.cumDelta > deltaMA,
+      latest.cumDelta > deltaMA &&
+      (avgAbsBarDelta > 0
+        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
+        : 0) >= DELTA_STRENGTH_THRESHOLD,
 
     bearish:
       latest.cumDelta < 0 &&
-      latest.cumDelta < deltaMA
+      latest.cumDelta < deltaMA &&
+      (avgAbsBarDelta > 0
+        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
+        : 0) <= -DELTA_STRENGTH_THRESHOLD
   };
 }
 
@@ -751,6 +815,19 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         };
         // Start cooldown for this symbol
         symbolCooldowns[symbol] = Date.now();
+
+        // Record every successful order so /tradehistory can show
+        // all trades placed during the current day.
+        tradeHistory.push({
+          date: getTradeHistoryDate(),
+          symbol,
+          direction,
+          entryPrice: markPrice,
+          qty,
+          userId,
+          timestamp: Date.now()
+        });
+
         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
       } catch (err) {
         log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
@@ -1002,20 +1079,45 @@ async function monitorPriceActivations() {
       if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
       if (!Number.isFinite(activationPrice) || activationPrice <= 0) continue;
 
-      if (currentPrice >= activationPrice) {
+      // The price must CROSS the activation level while the gate is active.
+      // Either direction is valid: below -> above OR above -> below.
+      // If the coin is already on one side when /price is set, it stays locked
+      // until price actually crosses the activation level.
+      const previousPrice = priceActivationPreviousPrice[symbol];
+
+      if (previousPrice === undefined) {
+        priceActivationPreviousPrice[symbol] = currentPrice;
+        continue;
+      }
+
+      const crossedUp =
+        previousPrice < activationPrice && currentPrice >= activationPrice;
+      const crossedDown =
+        previousPrice > activationPrice && currentPrice <= activationPrice;
+
+      if (crossedUp || crossedDown) {
         priceActivated[symbol] = true;
+
+        const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
         await sendMessage(
           `🔓 *PRICE ACTIVATION TRIGGERED*\n\n` +
           `🪙 Coin: *${symbol}*\n` +
           `🎯 Activation Price: *${activationPrice}*\n` +
-          `💰 Current Price: *${currentPrice}*\n\n` +
+          `💰 Current Price: *${currentPrice}*\n` +
+          `↕️ Cross: *${crossDirection}*\n\n` +
           `✅ *${symbol}* is now unlocked for trading.\n` +
-          `Waiting for a valid 1H STC + 15M Trend-Reset Cumulative Delta setup.`
+          `The normal 1H STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
         );
 
-        log(`🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. Trigger: ${activationPrice}`);
+        log(
+          `🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. ` +
+          `Trigger: ${activationPrice}. Cross: ${crossDirection}`
+        );
       }
+
+      // Always keep the latest observed price so the next check can detect a crossing.
+      priceActivationPreviousPrice[symbol] = currentPrice;
     } catch (err) {
       log(`❌ Price activation monitor error ${symbol}: ${err?.message || err}`);
     }
@@ -1227,7 +1329,8 @@ let direction = null;
 if (
   trendCycle === "BULL" &&
   trDelta15.cumDelta > 0 &&
-  trDelta15.cumDelta > trDelta15.deltaMA
+  trDelta15.cumDelta > trDelta15.deltaMA &&
+  trDelta15.deltaStrength >= DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "BUY";
@@ -1242,7 +1345,8 @@ if (
 if (
   trendCycle === "BEAR" &&
   trDelta15.cumDelta < 0 &&
-  trDelta15.cumDelta < trDelta15.deltaMA
+  trDelta15.cumDelta < trDelta15.deltaMA &&
+  trDelta15.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "SELL";
@@ -3665,12 +3769,13 @@ bot.onText(/^\/price\s+(\w+)\s+([\d.]+)$/i, async (msg, match) => {
 
   priceActivationLevels[symbol] = activationPrice;
   priceActivated[symbol] = false;
+  delete priceActivationPreviousPrice[symbol];
 
   await sendMessage(
     `🎯 *PRICE ACTIVATION SET*\n\n` +
     `🪙 Coin: *${symbol}*\n` +
     `💰 Activation Price: *${activationPrice}*\n\n` +
-    `🔒 ${symbol} is now locked until price reaches the activation level.\n` +
+    `🔒 ${symbol} is now locked until price crosses the activation level.\n` +
     `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`
   );
 });
@@ -3688,6 +3793,7 @@ bot.onText(/^\/priceoff\s+(\w+)$/i, async (msg, match) => {
 
   delete priceActivationLevels[symbol];
   delete priceActivated[symbol];
+  delete priceActivationPreviousPrice[symbol];
 
   await sendMessage(
     `🔓 *PRICE ACTIVATION REMOVED*\n\n` +
@@ -3852,158 +3958,83 @@ bot.onText(/\/monthlyreport/, async (msg) => {
 
 // =====================================================
 // /activecoins
-// Shows:
-// 1. Coins currently active for trading
-// 2. Coins for which the bot has executed trades
+// Shows ONLY coins that are currently active for trading.
+// Traded coins are intentionally excluded.
 // =====================================================
 
 bot.onText(/^\/activecoins$/, async (msg) => {
+  try {
+    const activeCoins = COIN_LIST.filter(
+      symbol => symbolActive[symbol] !== false
+    );
 
-    try {
-
-        // =================================================
-        // CURRENTLY ACTIVE COINS
-        // =================================================
-
-        const activeCoins = COIN_LIST.filter(
-            symbol => symbolActive[symbol] !== false
-        );
-
-
-        // =================================================
-        // COINS WITH EXECUTED TRADES
-        // =================================================
-
-        const tradedCoins = Object.keys(
-            symbolCooldowns || {}
-        ).filter(symbol =>
-            symbolCooldowns[symbol] &&
-            COIN_LIST.includes(symbol)
-        );
-
-
-        // =================================================
-        // COMBINE BOTH LISTS
-        // Remove duplicates
-        // =================================================
-
-        const allCoins = [
-            ...new Set([
-                ...activeCoins,
-                ...tradedCoins
-            ])
-        ];
-
-
-        // =================================================
-        // NO COINS
-        // =================================================
-
-        if (!allCoins.length) {
-
-            await sendMessage(
-                "⚪ *BOT TRADING STATUS*\n\n" +
-                "No active or traded coins found."
-            );
-
-            return;
-        }
-
-
-        // =================================================
-        // BUILD MESSAGE
-        // =================================================
-
-        let message =
-`⚡ *BOT TRADING STATUS*
-
-`;
-
-
-        allCoins.forEach((symbol, index) => {
-
-            const isActive =
-                symbolActive[symbol] !== false;
-
-            const hasTraded =
-                tradedCoins.includes(symbol);
-
-
-            let status;
-
-
-            // Active AND has executed a trade
-
-            if (
-                isActive &&
-                hasTraded
-            ) {
-
-                status =
-                    "🟢 ACTIVE + TRADED";
-
-            }
-
-
-            // Active but no trade yet
-
-            else if (
-                isActive
-            ) {
-
-                status =
-                    "🟢 ACTIVE — NO TRADE YET";
-
-            }
-
-
-            // Has traded but currently inactive
-
-            else if (
-                hasTraded
-            ) {
-
-                status =
-                    "🔵 TRADED";
-
-            }
-
-
-            message +=
-`${index + 1}. *${symbol}* — ${status}\n`;
-
-        });
-
-
-        // =================================================
-        // SUMMARY
-        // =================================================
-
-        message +=
-`\n📊 Total Coins: *${allCoins.length}*`;
-
-        message +=
-`\n🟢 Active: *${activeCoins.length}*`;
-
-        message +=
-`\n🔵 Traded: *${tradedCoins.length}*`;
-
-
-        // =================================================
-        // SEND TELEGRAM MESSAGE
-        // =================================================
-
-        await sendMessage(message);
-
-
-    } catch (err) {
-
-        log(
-            `❌ /activecoins error: ${
-                err?.message || err
-            }`
-        );
-
+    if (!activeCoins.length) {
+      await sendMessage(
+        "⚪ *ACTIVE COINS*\n\n" +
+        "No coins are currently active for trading."
+      );
+      return;
     }
 
+    let message = `⚡ *ACTIVE COINS*\n\n`;
+
+    activeCoins.forEach((symbol, index) => {
+      message += `${index + 1}. 🟢 *${symbol}*\n`;
+    });
+
+    message += `\n📊 Total Active Coins: *${activeCoins.length}*`;
+
+    await sendMessage(message);
+  } catch (err) {
+    log(`❌ /activecoins error: ${err?.message || err}`);
+  }
+});
+
+// =====================================================
+// /tradehistory
+// Shows all successful trades placed during the current
+// day. The history automatically starts fresh each day.
+// =====================================================
+
+bot.onText(/^\/tradehistory$/, async (msg) => {
+  try {
+    const today = getTradeHistoryDate();
+
+    // Keep only today's trades. Older entries naturally fall
+    // out of the displayed history when the date changes.
+    tradeHistory = tradeHistory.filter(trade => trade.date === today);
+
+    if (!tradeHistory.length) {
+      await sendMessage(
+        `📜 *TRADE HISTORY — ${today}*\n\n` +
+        "No trades have been placed today."
+      );
+      return;
+    }
+
+    let message = `📜 *TRADE HISTORY — ${today}*\n\n`;
+
+    tradeHistory.forEach((trade, index) => {
+      const time = new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Africa/Lagos",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      }).format(new Date(trade.timestamp));
+
+      message +=
+        `${index + 1}. *${trade.symbol}* — ${trade.direction === "BUY" ? "🟢 LONG" : "🔴 SHORT"}\n` +
+        `   💵 Entry: *${trade.entryPrice}*\n` +
+        `   🕐 Time: ${time}\n` +
+        `   📦 Qty: ${trade.qty}\n` +
+        `   👤 User: ${trade.userId}\n\n`;
+    });
+
+    message += `📊 Total Trades Today: *${tradeHistory.length}*`;
+
+    await sendMessage(message);
+  } catch (err) {
+    log(`❌ /tradehistory error: ${err?.message || err}`);
+  }
 });
