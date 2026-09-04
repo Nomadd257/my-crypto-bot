@@ -1096,7 +1096,11 @@ async function monitorPriceActivations() {
         previousPrice > activationPrice && currentPrice <= activationPrice;
 
       if (crossedUp || crossedDown) {
+        // Automatically perform the same state change as /activate <symbol>.
+        // This makes reaching the configured price actually activate the coin
+        // for the normal trading scanner, not just unlock the price gate.
         priceActivated[symbol] = true;
+        symbolActive[symbol] = true;
 
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
@@ -1106,7 +1110,8 @@ async function monitorPriceActivations() {
           `🎯 Activation Price: *${activationPrice}*\n` +
           `💰 Current Price: *${currentPrice}*\n` +
           `↕️ Cross: *${crossDirection}*\n\n` +
-          `✅ *${symbol}* is now unlocked for trading.\n` +
+          `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
+          `This is the same action as /activate ${symbol}.\n` +
           `The normal 1H STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
         );
 
