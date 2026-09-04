@@ -173,6 +173,238 @@ async function sendMessage(msg) {
   } catch {}
 }
 
+// =====================================================
+// MAJOR NEWS WARNING SYSTEM
+// =====================================================
+// Pulls today's high-impact U.S. economic releases and
+// sends Telegram warnings as the release approaches.
+// This is informational only and does NOT pause trading.
+//
+// Alert schedule for each event:
+//   - Every 1 hour before the release (same event minute)
+//   - 30 minutes before
+//   - 15 minutes before
+//   - 5 minutes before
+//   - At release time
+//
+// Source: Xoomar Pulse economic calendar API, which publishes
+// a JSON calendar sourced from official U.S. agencies.
+// =====================================================
+const NEWS_TIMEZONE = "Africa/Lagos";
+const NEWS_CALENDAR_URL = "https://xoomar.com/api/markets/calendar";
+const NEWS_CALENDAR_REFRESH_MS = 15 * 60 * 1000;
+const NEWS_ALERT_CHECK_MS = 30 * 1000;
+const NEWS_HOURLY_MAX_HOURS = 12;
+
+let majorNewsEvents = [];
+let newsAlertState = {}; // { eventKey: { alertKeys: {} } }
+let newsCalendarDate = null;
+
+function getLagosDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: NEWS_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  const out = {};
+  for (const part of parts) {
+    if (part.type !== "literal") out[part.type] = part.value;
+  }
+  return out;
+}
+
+function getLagosDateString(date = new Date()) {
+  const p = getLagosDateParts(date);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function formatNewsTime(date) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: NEWS_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function formatNewsDate(date) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: NEWS_TIMEZONE,
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date);
+}
+
+function normalizeNewsEvent(event, index) {
+  if (!event || !event.scheduledAt) return null;
+
+  const scheduledAt = new Date(event.scheduledAt);
+  if (Number.isNaN(scheduledAt.getTime())) return null;
+
+  const currency = String(event.currency || event.currencyCode || "").toUpperCase();
+  const impact = String(event.importance || event.impact || "").toLowerCase();
+  const eventName = String(event.eventName || event.event || event.name || "").trim();
+
+  if (!eventName) return null;
+
+  // Focus on USD events because they are the primary macro driver
+  // relevant to the dollar and crypto market in this warning system.
+  if (currency !== "USD") return null;
+
+  const isHighImpact = ["high", "red", "3", "very high"].includes(impact);
+  if (!isHighImpact) return null;
+
+  const lagosDate = getLagosDateString(scheduledAt);
+  const today = getLagosDateString();
+  if (lagosDate !== today) return null;
+
+  const id = String(event.id || event.eventId || `${eventName}-${scheduledAt.toISOString()}-${index}`);
+
+  return {
+    id,
+    eventName,
+    currency,
+    impact: "HIGH",
+    scheduledAt,
+    forecast: event.forecast ?? null,
+    previous: event.previous ?? null,
+    actual: event.actual ?? null,
+  };
+}
+
+async function fetchMajorNewsEvents() {
+  try {
+    const today = getLagosDateString();
+    const url = `${NEWS_CALENDAR_URL}?importance=high&from=${today}&to=${today}`;
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const payload = await res.json();
+    const rawEvents = Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.events)
+        ? payload.events
+        : [];
+
+    const normalized = rawEvents
+      .map(normalizeNewsEvent)
+      .filter(Boolean)
+      .sort((a, b) => a.scheduledAt - b.scheduledAt);
+
+    majorNewsEvents = normalized;
+    newsCalendarDate = today;
+
+    // Remove stale alert state for events no longer present.
+    const validIds = new Set(normalized.map(event => event.id));
+    for (const key of Object.keys(newsAlertState)) {
+      if (!validIds.has(key)) delete newsAlertState[key];
+    }
+
+    log(`📰 Major news calendar refreshed: ${majorNewsEvents.length} high-impact USD event(s) today.`);
+  } catch (err) {
+    log(`❌ Major news calendar error: ${err?.message || err}`);
+  }
+}
+
+function getNewsAlertKey(minutesRemaining, event) {
+  if (minutesRemaining <= 0) return "RELEASE";
+
+  if (minutesRemaining <= 5) return "5M";
+  if (minutesRemaining <= 15) return "15M";
+  if (minutesRemaining <= 30) return "30M";
+  if (minutesRemaining <= 60) return "60M";
+
+  // Hourly alerts are tied to the event's release minute.
+  // Example: a 13:30 release produces alerts at 12:30, 11:30,
+  // 10:30, etc., rather than at arbitrary wall-clock hours.
+  const hoursRemaining = Math.round(minutesRemaining / 60);
+  if (
+    hoursRemaining >= 1 &&
+    hoursRemaining <= NEWS_HOURLY_MAX_HOURS &&
+    Math.abs(minutesRemaining - hoursRemaining * 60) <= 0.5
+  ) {
+    return `${hoursRemaining}H`;
+  }
+
+  return null;
+}
+
+async function sendMajorNewsWarning(event, minutesRemaining, alertKey) {
+  const timeText = formatNewsTime(event.scheduledAt);
+  const dateText = formatNewsDate(event.scheduledAt);
+
+  let countdownText;
+  if (alertKey === "RELEASE") {
+    countdownText = "🚨 *RELEASE TIME — HIGH VOLATILITY WINDOW*";
+  } else if (alertKey.endsWith("H")) {
+    const hours = Number(alertKey.slice(0, -1));
+    countdownText = `⏳ *${hours} HOUR${hours === 1 ? "" : "S"} REMAINING*`;
+  } else {
+    countdownText = `⏳ *${alertKey} REMAINING*`;
+  }
+
+  let message =
+    `⚠️ *MAJOR USD NEWS WARNING*\n\n` +
+    `🇺🇸 *${event.eventName}*\n` +
+    `🔥 Impact: *HIGH*\n` +
+    `📅 ${dateText}\n` +
+    `🕐 Release: *${timeText} WAT*\n\n` +
+    `${countdownText}\n\n` +
+    `This release can cause significant volatility in the *U.S. dollar and crypto markets*.\n` +
+    `⚠️ Rapid price spikes, reversals and wider-than-normal market movement are possible.\n` +
+    `📌 This is an *informational warning only*; the bot's trading logic is unchanged.`;
+
+  if (event.forecast !== null || event.previous !== null) {
+    message += `\n\n📊 Forecast: *${event.forecast ?? "N/A"}*\n` +
+      `📊 Previous: *${event.previous ?? "N/A"}*`;
+  }
+
+  await sendMessage(message);
+}
+
+async function monitorMajorNewsAlerts() {
+  try {
+    const now = new Date();
+    const today = getLagosDateString(now);
+
+    if (newsCalendarDate !== today) {
+      await fetchMajorNewsEvents();
+    }
+
+    for (const event of majorNewsEvents) {
+      const minutesRemaining = (event.scheduledAt.getTime() - now.getTime()) / 60000;
+
+      // Ignore events that are already more than 12 hours past release.
+      if (minutesRemaining < -1) continue;
+
+      const alertKey = getNewsAlertKey(minutesRemaining, event);
+      if (!alertKey) continue;
+
+      if (!newsAlertState[event.id]) newsAlertState[event.id] = { alertKeys: {} };
+      if (newsAlertState[event.id].alertKeys[alertKey]) continue;
+
+      newsAlertState[event.id].alertKeys[alertKey] = true;
+      await sendMajorNewsWarning(event, minutesRemaining, alertKey);
+    }
+  } catch (err) {
+    log(`❌ Major news alert monitor error: ${err?.message || err}`);
+  }
+}
+
+// Refresh the calendar regularly so newly added or revised releases
+// can be picked up during the day.
+fetchMajorNewsEvents();
+setInterval(fetchMajorNewsEvents, NEWS_CALENDAR_REFRESH_MS);
+setInterval(monitorMajorNewsAlerts, NEWS_ALERT_CHECK_MS);
+
 // --- Fetch Futures Klines ---
 async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
   try {
