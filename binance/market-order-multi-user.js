@@ -34,6 +34,20 @@ const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_TRADES = 7; // per user
 const COOLDOWN_MS = 120 * 60 * 1000; // 2 hours
+
+// --- Liquidity filter ---
+// These checks run immediately before a trade is allowed to execute.
+const LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT = 5_000_000;
+const LIQUIDITY_MAX_SPREAD_PCT = 0.15;
+const LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE = 10;
+const LIQUIDITY_MIN_BOOK_DEPTH_USDT = 25_000;
+
+// --- Absorption warnings ---
+// Absorption is informational only for now. It NEVER blocks an entry.
+const ABSORPTION_VOLUME_MULTIPLE = 1.5;
+const ABSORPTION_MAX_BODY_TO_RANGE = 0.35;
+const ABSORPTION_MIN_WICK_TO_RANGE = 0.45;
+const ABSORPTION_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 const COIN_LIST = [
   "AVAXUSDT",
   "NEARUSDT",
@@ -89,6 +103,8 @@ let userClients = {};
 let BOT_PAUSED = false;
 let symbolCooldowns = {}; // { symbol: timestamp }
 let tradeHistory = []; // Successful trades placed by the bot
+let absorptionWarningState = {}; // { symbol: { BUY/SELL: candleKey } }
+let liquidityWarningState = {}; // { symbol: lastWarningTimestamp }
 
 function getTradeHistoryDate() {
   return new Intl.DateTimeFormat("en-CA", {
@@ -967,6 +983,223 @@ function calculateTrendResetCumulativeDelta(
   };
 }
 
+// =====================================================
+// LIQUIDITY FILTER
+// =====================================================
+// Checks public Binance Futures market liquidity immediately
+// before an entry. If liquidity is insufficient, the trade is
+// blocked and the scanner continues to the next symbol.
+// =====================================================
+async function checkLiquidity(symbol, direction, estimatedTradeNotional = 0) {
+  try {
+    const [depthRes, tickerRes] = await Promise.all([
+      fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=10`),
+      fetch(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`),
+    ]);
+
+    if (!depthRes.ok) throw new Error(`Depth HTTP ${depthRes.status}`);
+    if (!tickerRes.ok) throw new Error(`Ticker HTTP ${tickerRes.status}`);
+
+    const depth = await depthRes.json();
+    const ticker = await tickerRes.json();
+
+    const bids = Array.isArray(depth?.bids) ? depth.bids : [];
+    const asks = Array.isArray(depth?.asks) ? depth.asks : [];
+
+    if (!bids.length || !asks.length) {
+      return {
+        passed: false,
+        reason: "Order book unavailable or empty",
+        spreadPct: null,
+        quoteVolume24h: null,
+        bidDepth: 0,
+        askDepth: 0,
+      };
+    }
+
+    const bestBid = Number(bids[0][0]);
+    const bestAsk = Number(asks[0][0]);
+    const quoteVolume24h = Number(ticker?.quoteVolume || 0);
+
+    const spreadPct = bestBid > 0
+      ? ((bestAsk - bestBid) / bestBid) * 100
+      : Infinity;
+
+    const bidDepth = bids.reduce(
+      (sum, level) => sum + Number(level[0]) * Number(level[1]),
+      0
+    );
+    const askDepth = asks.reduce(
+      (sum, level) => sum + Number(level[0]) * Number(level[1]),
+      0
+    );
+
+    const requiredDepth = Math.max(
+      LIQUIDITY_MIN_BOOK_DEPTH_USDT,
+      Number(estimatedTradeNotional || 0) * LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE
+    );
+
+    const volumePass = quoteVolume24h >= LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT;
+    const spreadPass = spreadPct <= LIQUIDITY_MAX_SPREAD_PCT;
+    const depthPass = bidDepth >= requiredDepth && askDepth >= requiredDepth;
+
+    return {
+      passed: volumePass && spreadPass && depthPass,
+      reason: !volumePass
+        ? `24H quote volume below ${LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT.toLocaleString()} USDT`
+        : !spreadPass
+          ? `spread ${spreadPct.toFixed(3)}% exceeds ${LIQUIDITY_MAX_SPREAD_PCT.toFixed(2)}%`
+          : !depthPass
+            ? `top-10 order-book depth below required ${requiredDepth.toFixed(0)} USDT`
+            : "Liquidity sufficient",
+      spreadPct,
+      quoteVolume24h,
+      bidDepth,
+      askDepth,
+      requiredDepth,
+      bestBid,
+      bestAsk,
+      direction,
+    };
+  } catch (err) {
+    return {
+      passed: false,
+      reason: `Liquidity check error: ${err?.message || err}`,
+      spreadPct: null,
+      quoteVolume24h: null,
+      bidDepth: 0,
+      askDepth: 0,
+    };
+  }
+}
+
+async function sendLiquidityWarning(symbol, direction, liquidity) {
+  const now = Date.now();
+  const lastWarning = liquidityWarningState[symbol] || 0;
+
+  // Prevent repeated warnings while the same coin remains illiquid.
+  if (now - lastWarning < ABSORPTION_ALERT_COOLDOWN_MS) return;
+  liquidityWarningState[symbol] = now;
+
+  const spreadText = Number.isFinite(liquidity.spreadPct)
+    ? `${liquidity.spreadPct.toFixed(3)}%`
+    : "N/A";
+  const volumeText = Number.isFinite(liquidity.quoteVolume24h)
+    ? `${liquidity.quoteVolume24h.toLocaleString(undefined, { maximumFractionDigits: 0 })} USDT`
+    : "N/A";
+
+  await sendMessage(
+    `🚫 *LIQUIDITY FILTER — TRADE BLOCKED*\n\n` +
+    `🪙 Coin: *${symbol}*\n` +
+    `📈 Direction: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n\n` +
+    `❌ Liquidity: *INSUFFICIENT*\n` +
+    `📊 24H Quote Volume: *${volumeText}*\n` +
+    `↔️ Spread: *${spreadText}*\n` +
+    `📚 Bid Depth (Top 10): *${Number(liquidity.bidDepth || 0).toFixed(0)} USDT*\n` +
+    `📚 Ask Depth (Top 10): *${Number(liquidity.askDepth || 0).toFixed(0)} USDT*\n\n` +
+    `⚠️ Reason: *${liquidity.reason}*\n\n` +
+    `🚫 *No trade was placed.*\n` +
+    `➡️ The scanner will continue to the next active coin.\n` +
+    `💡 You may deactivate *${symbol}* manually if you do not want it considered.`
+  );
+}
+
+// =====================================================
+// ABSORPTION WARNING — INFORMATIONAL ONLY
+// =====================================================
+// Uses the latest CLOSED 15M candle and the same volume-signed
+// delta concept already used by the Trend-Reset Delta system.
+// Absorption is detected when unusually large directional effort
+// produces a relatively small candle body with a strong opposing wick.
+// This warning NEVER blocks a trade.
+// =====================================================
+async function checkAndWarnAbsorption(symbol, direction, closedCandles15) {
+  try {
+    if (!closedCandles15 || closedCandles15.length < 25) return false;
+
+    const latest = closedCandles15[closedCandles15.length - 1];
+    const recent = closedCandles15.slice(-21, -1);
+
+    const open = Number(latest.open);
+    const high = Number(latest.high);
+    const low = Number(latest.low);
+    const close = Number(latest.close);
+    const volume = Number(latest.volume);
+
+    if (![open, high, low, close, volume].every(Number.isFinite)) return false;
+
+    const range = high - low;
+    if (range <= 0 || volume <= 0) return false;
+
+    const avgVolume = recent.reduce((sum, candle) => sum + Number(candle.volume || 0), 0) / recent.length;
+    if (!avgVolume || !Number.isFinite(avgVolume)) return false;
+
+    const body = Math.abs(close - open);
+    const upperWick = high - Math.max(open, close);
+    const lowerWick = Math.min(open, close) - low;
+    const effortRatio = volume / avgVolume;
+    const bodyRatio = body / range;
+    const upperWickRatio = upperWick / range;
+    const lowerWickRatio = lowerWick / range;
+
+    const bullishBarDelta = close > open;
+    const bearishBarDelta = close < open;
+
+    let absorption = null;
+
+    // LONG setup: heavy bullish effort + poor upside result + upper rejection.
+    if (
+      direction === "BUY" &&
+      bullishBarDelta &&
+      effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+      bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+      upperWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+    ) {
+      absorption = "BEARISH ABSORPTION";
+    }
+
+    // SHORT setup: heavy bearish effort + poor downside result + lower rejection.
+    if (
+      direction === "SELL" &&
+      bearishBarDelta &&
+      effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+      bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+      lowerWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+    ) {
+      absorption = "BULLISH ABSORPTION";
+    }
+
+    if (!absorption) return false;
+
+    const candleKey = `${latest.openTime || latest.time || latest.timestamp || closedCandles15.length}`;
+    if (!absorptionWarningState[symbol]) absorptionWarningState[symbol] = {};
+
+    const directionKey = direction;
+    if (absorptionWarningState[symbol][directionKey] === candleKey) return true;
+    absorptionWarningState[symbol][directionKey] = candleKey;
+
+    const bodyPct = (bodyRatio * 100).toFixed(1);
+    const wickPct = ((direction === "BUY" ? upperWickRatio : lowerWickRatio) * 100).toFixed(1);
+
+    await sendMessage(
+      `⚠️ *ABSORPTION WARNING*\n\n` +
+      `🪙 Coin: *${symbol}*\n` +
+      `📈 Setup: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n` +
+      `🛑 Detected: *${absorption}*\n\n` +
+      `📊 Volume vs 20-bar average: *${effortRatio.toFixed(2)}x*\n` +
+      `📏 Candle body/range: *${bodyPct}%*\n` +
+      `↩️ Opposing wick/range: *${wickPct}%*\n\n` +
+      `⚠️ Price is showing possible absorption of the directional pressure.\n` +
+      `ℹ️ *INFORMATIONAL ONLY — trade will NOT be blocked.*`
+    );
+
+    return true;
+  } catch (err) {
+    log(`❌ Absorption warning error ${symbol}: ${err?.message || err}`);
+    return false;
+  }
+}
+
 // --- Floor qty ---
 function floorToStep(qty, step) {
   const s = Number(step);
@@ -1551,6 +1784,11 @@ const trDelta15 =
 
 if (!trDelta15) continue;
 
+// Absorption is a warning only. It never blocks the entry.
+await checkAndWarnAbsorption(symbol,
+  trendCycle === "BULL" ? "BUY" : "SELL",
+  closedCandles15
+);
 
 // =====================================================
 // ENTRY DIRECTION
@@ -1591,9 +1829,29 @@ if (
 }
 
       // =====================================================
-      // EXECUTION
+      // LIQUIDITY GATE + EXECUTION
       // =====================================================
       if (direction) {
+        // Estimate total notional across active users so order-book depth
+        // is evaluated against the actual size the bot is preparing to place.
+        let estimatedTradeNotional = 0;
+        for (const client of Object.values(userClients)) {
+          try {
+            const balances = await client.futuresBalance();
+            const usdtBal = balances.find((b) => b.asset === "USDT");
+            const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
+            if (Number.isFinite(bal) && bal > 0) {
+              estimatedTradeNotional += bal * TRADE_PERCENT;
+            }
+          } catch {}
+        }
+
+        const liquidity = await checkLiquidity(symbol, direction, estimatedTradeNotional);
+        if (!liquidity.passed) {
+          await sendLiquidityWarning(symbol, direction, liquidity);
+          continue;
+        }
+
         await executeMarketOrderForAllUsers(symbol, direction);
 
         const buyVol = closedCandles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
