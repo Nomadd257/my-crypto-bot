@@ -1,8 +1,8 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// STC STRATEGY: 1H STC = direction, 5M STC = entry (confirmed flip on close)
+// STC STRATEGY: 1H STC = direction, 5M Trend-Reset Delta = entry
 // TP/SL/TRAILING STOP INTACT
-// Volume imbalance report only per trade
+// Volume imbalance report uses 5M closed candles
 // MAX TRADES = 7 per user
 // 2 HRS cooldown per symbol
 // =====================================================
@@ -522,6 +522,12 @@ const TR_DELTA_MA_LENGTH = 10;
 const DELTA_STRENGTH_THRESHOLD = 0.50;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
+// 5M price/delta divergence setup.
+// Divergence is a setup condition; the existing 0.50 delta-strength check
+// remains the final entry confirmation.
+const DELTA_DIVERGENCE_WINDOW = 8;
+const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
+
 
 // ------------------------------------------------------
 // EMA SERIES
@@ -967,6 +973,10 @@ function calculateTrendResetCumulativeDelta(
 
     avgAbsBarDelta,
 
+    // Full closed-candle delta series is returned so the scanner can compare
+    // price swing points against delta swing points for divergence.
+    deltaSeries,
+
     bullish:
       latest.cumDelta > 0 &&
       latest.cumDelta > deltaMA &&
@@ -981,6 +991,128 @@ function calculateTrendResetCumulativeDelta(
         ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
         : 0) <= -DELTA_STRENGTH_THRESHOLD
   };
+}
+
+// =====================================================
+// 5M PRICE / DELTA DIVERGENCE
+// =====================================================
+//
+// Bullish divergence:
+//   Recent price swing low  < previous price swing low
+//   AND
+//   Recent cumulative-delta low > previous cumulative-delta low
+//
+// Bearish divergence:
+//   Recent price swing high > previous price swing high
+//   AND
+//   Recent cumulative-delta high < previous cumulative-delta high
+//
+// This is a setup condition only. It does NOT place a trade by itself.
+// The scanner still requires the existing 5M Delta direction + SMA(10)
+// + 0.50 strength confirmation.
+// =====================================================
+function detect5MDeltaDivergence(candles, trDelta) {
+  const window = DELTA_DIVERGENCE_WINDOW;
+
+  if (
+    !candles ||
+    !trDelta ||
+    !Array.isArray(trDelta.deltaSeries) ||
+    candles.length < window * 2 ||
+    trDelta.deltaSeries.length !== candles.length
+  ) {
+    return { bullish: false, bearish: false, bullishCandleTime: null, bearishCandleTime: null };
+  }
+
+  const previousStart = candles.length - window * 2;
+  const previousEnd = candles.length - window;
+  const recentStart = previousEnd;
+  const recentEnd = candles.length;
+
+  let previousLowIndex = previousStart;
+  let recentLowIndex = recentStart;
+  let previousHighIndex = previousStart;
+  let recentHighIndex = recentStart;
+
+  for (let i = previousStart + 1; i < previousEnd; i++) {
+    if (candles[i].low < candles[previousLowIndex].low) previousLowIndex = i;
+    if (candles[i].high > candles[previousHighIndex].high) previousHighIndex = i;
+  }
+
+  for (let i = recentStart + 1; i < recentEnd; i++) {
+    if (candles[i].low < candles[recentLowIndex].low) recentLowIndex = i;
+    if (candles[i].high > candles[recentHighIndex].high) recentHighIndex = i;
+  }
+
+  const previousLowDelta = trDelta.deltaSeries[previousLowIndex]?.cumDelta;
+  const recentLowDelta = trDelta.deltaSeries[recentLowIndex]?.cumDelta;
+  const previousHighDelta = trDelta.deltaSeries[previousHighIndex]?.cumDelta;
+  const recentHighDelta = trDelta.deltaSeries[recentHighIndex]?.cumDelta;
+
+  const bullish =
+    candles[recentLowIndex].low < candles[previousLowIndex].low &&
+    Number.isFinite(previousLowDelta) &&
+    Number.isFinite(recentLowDelta) &&
+    recentLowDelta > previousLowDelta;
+
+  const bearish =
+    candles[recentHighIndex].high > candles[previousHighIndex].high &&
+    Number.isFinite(previousHighDelta) &&
+    Number.isFinite(recentHighDelta) &&
+    recentHighDelta < previousHighDelta;
+
+  return {
+    bullish,
+    bearish,
+    bullishCandleTime: bullish ? candles[recentLowIndex].time : null,
+    bearishCandleTime: bearish ? candles[recentHighIndex].time : null,
+    previousLowDelta,
+    recentLowDelta,
+    previousHighDelta,
+    recentHighDelta
+  };
+}
+
+function rememberFreshDeltaDivergence(symbol, divergence) {
+  if (!deltaDivergenceState[symbol]) {
+    deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  }
+
+  if (divergence.bullish) {
+    deltaDivergenceState[symbol].BUY = {
+      candleTime: divergence.bullishCandleTime,
+      detectedAt: Date.now()
+    };
+  }
+
+  if (divergence.bearish) {
+    deltaDivergenceState[symbol].SELL = {
+      candleTime: divergence.bearishCandleTime,
+      detectedAt: Date.now()
+    };
+  }
+}
+
+function hasFreshDeltaDivergence(symbol, direction, latestCandleTime) {
+  const state = deltaDivergenceState[symbol]?.[direction];
+  if (!state) return false;
+
+  const maxAgeMs =
+    DELTA_DIVERGENCE_MAX_AGE_CANDLES * 5 * 60 * 1000;
+
+  if (Date.now() - state.detectedAt > maxAgeMs) {
+    deltaDivergenceState[symbol][direction] = null;
+    return false;
+  }
+
+  // The divergence candle must be at or before the current closed candle.
+  if (
+    latestCandleTime !== undefined &&
+    state.candleTime !== null &&
+    state.candleTime > latestCandleTime
+  ) return false;
+
+  return true;
 }
 
 // =====================================================
@@ -1515,6 +1647,10 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
+
+// Tracks a fresh 5M delta-divergence setup for each symbol/direction.
+// A divergence must be detected after activation before an entry can occur.
+let deltaDivergenceState = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // =====================================================
@@ -1566,6 +1702,7 @@ async function monitorPriceActivations() {
         // for the normal trading scanner, not just unlock the price gate.
         priceActivated[symbol] = true;
         symbolActive[symbol] = true;
+        deltaDivergenceState[symbol] = { BUY: null, SELL: null };
 
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
@@ -1735,60 +1872,58 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// 15M TREND-RESET CUMULATIVE DELTA ENTRY
-// ChartPrime methodology
+// 5M TREND-RESET CUMULATIVE DELTA + DIVERGENCE ENTRY
 // =====================================================
 //
 // 1H STC = TREND
+// 5M Delta divergence = PULLBACK-ENDING SETUP
+// 5M Delta direction + SMA(10) + strength = FINAL ENTRY
 //
-// 15M Delta:
+// A coin can be activated during a pullback without entering immediately.
+// A fresh 5M divergence must first be detected after activation.
 //
-// BUY:
-//   Delta > 0
-//   AND Delta > SMA(10)
-//
-// SELL:
-//   Delta < 0
-//   AND Delta < SMA(10)
-//
-// Only CLOSED 15M candles are used.
+// Only CLOSED 5M candles are used.
 // =====================================================
 
-const candles15 =
+const candles5 =
   await fetchFuturesKlines(
     symbol,
-    "15m",
+    "5m",
     150
   );
 
 if (
-  !candles15 ||
-  candles15.length < 40
+  !candles5 ||
+  candles5.length < 40
 ) continue;
 
+// Remove currently forming 5M candle.
+const closedCandles5 = candles5.slice(0, -1);
 
-// Remove currently forming 15M candle.
+// Calculate ChartPrime-style Trend-Reset Cumulative Delta.
+const trDelta5 = calculateTrendResetCumulativeDelta(closedCandles5);
 
-const closedCandles15 =
-  candles15.slice(0, -1);
+if (!trDelta5) continue;
 
-
-// Calculate ChartPrime-style
-// Trend-Reset Cumulative Delta.
-
-const trDelta15 =
-  calculateTrendResetCumulativeDelta(
-    closedCandles15
-  );
-
-
-if (!trDelta15) continue;
-
-// Absorption is a warning only. It never blocks the entry.
-await checkAndWarnAbsorption(symbol,
-  trendCycle === "BULL" ? "BUY" : "SELL",
-  closedCandles15
+// Detect a fresh 5M price/delta divergence setup.
+// This does not place a trade; it only arms the corresponding direction.
+const deltaDivergence5 = detect5MDeltaDivergence(
+  closedCandles5,
+  trDelta5
 );
+rememberFreshDeltaDivergence(symbol, deltaDivergence5);
+
+// Absorption remains a 15M informational warning.
+// It is deliberately NOT changed to the 5M entry timeframe.
+const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
+if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
+  const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
+  await checkAndWarnAbsorption(
+    symbol,
+    trendCycle === "BULL" ? "BUY" : "SELL",
+    closedCandles15ForAbsorption
+  );
+}
 
 // =====================================================
 // ENTRY DIRECTION
@@ -1803,9 +1938,14 @@ let direction = null;
 
 if (
   trendCycle === "BULL" &&
-  trDelta15.cumDelta > 0 &&
-  trDelta15.cumDelta > trDelta15.deltaMA &&
-  trDelta15.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+  hasFreshDeltaDivergence(
+    symbol,
+    "BUY",
+    closedCandles5[closedCandles5.length - 1]?.time
+  ) &&
+  trDelta5.cumDelta > 0 &&
+  trDelta5.cumDelta > trDelta5.deltaMA &&
+  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "BUY";
@@ -1819,9 +1959,14 @@ if (
 
 if (
   trendCycle === "BEAR" &&
-  trDelta15.cumDelta < 0 &&
-  trDelta15.cumDelta < trDelta15.deltaMA &&
-  trDelta15.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
+  hasFreshDeltaDivergence(
+    symbol,
+    "SELL",
+    closedCandles5[closedCandles5.length - 1]?.time
+  ) &&
+  trDelta5.cumDelta < 0 &&
+  trDelta5.cumDelta < trDelta5.deltaMA &&
+  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "SELL";
@@ -1854,8 +1999,14 @@ if (
 
         await executeMarketOrderForAllUsers(symbol, direction);
 
-        const buyVol = closedCandles15.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-        const sellVol = closedCandles15.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+        // Consume the divergence setup so the same divergence cannot trigger
+        // another entry before a new divergence is detected.
+        if (deltaDivergenceState[symbol]) {
+          deltaDivergenceState[symbol][direction] = null;
+        }
+
+        const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
+        const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
         const totalVol = buyVol + sellVol;
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
@@ -4219,6 +4370,7 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
     return;
   }
   symbolActive[symbol] = false;
+  deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
 });
 
@@ -4230,13 +4382,15 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
     return;
   }
   symbolActive[symbol] = true;
-  await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol.`);
+  deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M delta divergence is required before entry.`);
 });
 
 bot.onText(/\/deactivateall/, async (msg) => {
   if (!isAdmin(msg)) return;
   COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
+    deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
