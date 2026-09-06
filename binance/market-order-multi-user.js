@@ -508,7 +508,7 @@ function calculateATR(candles, period = ATR_PERIOD) {
 // ATR Multiplier  = 1
 // Delta MA        = SMA 10
 //
-// Used for 15M ENTRY confirmation.
+// Used by the 5M entry filter; 15M remains informational/runner context.
 // ======================================================
 
 const TR_DELTA_EMA_LENGTH = 20;
@@ -527,6 +527,12 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 // remains the final entry confirmation.
 const DELTA_DIVERGENCE_WINDOW = 8;
 const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
+
+// 5M ATR-band confirmation. Bands use EMA(20) +/- ATR(14) x 1.
+// A fresh divergence must be followed by contraction, then directional expansion.
+const ATR_BAND_EMA_LENGTH = 20;
+const ATR_BAND_ATR_LENGTH = 14;
+const ATR_BAND_MULTIPLIER = 1;
 
 
 // ------------------------------------------------------
@@ -1073,23 +1079,105 @@ function detect5MDeltaDivergence(candles, trDelta) {
   };
 }
 
+function calculate5MATRBands(candles) {
+  if (!candles || candles.length < ATR_BAND_EMA_LENGTH + ATR_BAND_ATR_LENGTH + 2) return null;
+
+  const bands = [];
+
+  for (let i = ATR_BAND_EMA_LENGTH + ATR_BAND_ATR_LENGTH; i < candles.length; i++) {
+    const window = candles.slice(0, i + 1);
+    const emaSeries = calculateEMASeries(window, ATR_BAND_EMA_LENGTH);
+    const ema = emaSeries[emaSeries.length - 1];
+    const atr = calculateATR(window, ATR_BAND_ATR_LENGTH);
+
+    if (!Number.isFinite(ema) || !Number.isFinite(atr)) continue;
+
+    bands.push({
+      time: candles[i].time,
+      mid: ema,
+      upper: ema + atr * ATR_BAND_MULTIPLIER,
+      lower: ema - atr * ATR_BAND_MULTIPLIER,
+      width: atr * ATR_BAND_MULTIPLIER * 2
+    });
+  }
+
+  if (bands.length < 2) return null;
+
+  const current = bands[bands.length - 1];
+  const previous = bands[bands.length - 2];
+
+  return {
+    current,
+    previous,
+    contracting: current.width < previous.width,
+    expanding: current.width > previous.width,
+    expansionUp: current.width > previous.width && current.upper > previous.upper,
+    expansionDown: current.width > previous.width && current.lower < previous.lower
+  };
+}
+
+function update5MATRBandState(symbol, candles5) {
+  const state = atrBandState[symbol];
+  if (!state) return { buyExpansion: false, sellExpansion: false, contracting: false };
+
+  const status = calculate5MATRBands(candles5);
+  if (!status) return { buyExpansion: false, sellExpansion: false, contracting: false };
+
+  const latestTime = candles5[candles5.length - 1]?.time;
+
+  if (state.BUY && state.BUY.divergenceCandleTime !== null && latestTime > state.BUY.divergenceCandleTime) {
+    if (status.contracting) state.BUY.contracted = true;
+    if (state.BUY.contracted && status.expansionUp) state.BUY.expansionConfirmed = true;
+  }
+
+  if (state.SELL && state.SELL.divergenceCandleTime !== null && latestTime > state.SELL.divergenceCandleTime) {
+    if (status.contracting) state.SELL.contracted = true;
+    if (state.SELL.contracted && status.expansionDown) state.SELL.expansionConfirmed = true;
+  }
+
+  return {
+    buyExpansion: Boolean(state.BUY?.expansionConfirmed),
+    sellExpansion: Boolean(state.SELL?.expansionConfirmed),
+    contracting: status.contracting
+  };
+}
+
 function rememberFreshDeltaDivergence(symbol, divergence) {
   if (!deltaDivergenceState[symbol]) {
     deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   }
+  if (!atrBandState[symbol]) {
+    atrBandState[symbol] = { BUY: null, SELL: null };
+  }
 
   if (divergence.bullish) {
+    const existing = deltaDivergenceState[symbol].BUY;
     deltaDivergenceState[symbol].BUY = {
       candleTime: divergence.bullishCandleTime,
-      detectedAt: Date.now()
+      detectedAt: existing?.candleTime === divergence.bullishCandleTime ? existing.detectedAt : Date.now()
     };
+    if (atrBandState[symbol].BUY?.divergenceCandleTime !== divergence.bullishCandleTime) {
+      atrBandState[symbol].BUY = {
+        divergenceCandleTime: divergence.bullishCandleTime,
+        contracted: false,
+        expansionConfirmed: false
+      };
+    }
   }
 
   if (divergence.bearish) {
+    const existing = deltaDivergenceState[symbol].SELL;
     deltaDivergenceState[symbol].SELL = {
       candleTime: divergence.bearishCandleTime,
-      detectedAt: Date.now()
+      detectedAt: existing?.candleTime === divergence.bearishCandleTime ? existing.detectedAt : Date.now()
     };
+    if (atrBandState[symbol].SELL?.divergenceCandleTime !== divergence.bearishCandleTime) {
+      atrBandState[symbol].SELL = {
+        divergenceCandleTime: divergence.bearishCandleTime,
+        contracted: false,
+        expansionConfirmed: false
+      };
+    }
   }
 }
 
@@ -1651,6 +1739,7 @@ let symbolActive = {};
 // Tracks a fresh 5M delta-divergence setup for each symbol/direction.
 // A divergence must be detected after activation before an entry can occur.
 let deltaDivergenceState = {};
+let atrBandState = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // =====================================================
@@ -1703,6 +1792,7 @@ async function monitorPriceActivations() {
         priceActivated[symbol] = true;
         symbolActive[symbol] = true;
         deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  atrBandState[symbol] = { BUY: null, SELL: null };
 
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
@@ -1872,15 +1962,18 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// 5M TREND-RESET CUMULATIVE DELTA + DIVERGENCE ENTRY
+// 5M TREND-RESET CUMULATIVE DELTA + DIVERGENCE + ATR-BAND ENTRY
 // =====================================================
 //
 // 1H STC = TREND
 // 5M Delta divergence = PULLBACK-ENDING SETUP
+// 5M ATR bands = contraction followed by directional expansion
 // 5M Delta direction + SMA(10) + strength = FINAL ENTRY
 //
 // A coin can be activated during a pullback without entering immediately.
 // A fresh 5M divergence must first be detected after activation.
+// After divergence, the ATR bands must contract and then expand in the
+// trade direction before the delta confirmation can trigger an entry.
 //
 // Only CLOSED 5M candles are used.
 // =====================================================
@@ -1912,6 +2005,10 @@ const deltaDivergence5 = detect5MDeltaDivergence(
   trDelta5
 );
 rememberFreshDeltaDivergence(symbol, deltaDivergence5);
+
+// After divergence, require 5M ATR-band contraction followed by
+// directional volatility expansion before the delta entry confirmation.
+const atrBand5 = update5MATRBandState(symbol, closedCandles5);
 
 // Absorption remains a 15M informational warning.
 // It is deliberately NOT changed to the 5M entry timeframe.
@@ -1945,7 +2042,8 @@ if (
   ) &&
   trDelta5.cumDelta > 0 &&
   trDelta5.cumDelta > trDelta5.deltaMA &&
-  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD &&
+  atrBand5.buyExpansion
 ) {
 
   direction = "BUY";
@@ -1966,7 +2064,8 @@ if (
   ) &&
   trDelta5.cumDelta < 0 &&
   trDelta5.cumDelta < trDelta5.deltaMA &&
-  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
+  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD &&
+  atrBand5.sellExpansion
 ) {
 
   direction = "SELL";
@@ -2003,6 +2102,9 @@ if (
         // another entry before a new divergence is detected.
         if (deltaDivergenceState[symbol]) {
           deltaDivergenceState[symbol][direction] = null;
+        }
+        if (atrBandState[symbol]) {
+          atrBandState[symbol][direction] = null;
         }
 
         const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
@@ -4371,6 +4473,7 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
   }
   symbolActive[symbol] = false;
   deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  atrBandState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
 });
 
@@ -4383,6 +4486,7 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
   }
   symbolActive[symbol] = true;
   deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  atrBandState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M delta divergence is required before entry.`);
 });
 
@@ -4391,6 +4495,7 @@ bot.onText(/\/deactivateall/, async (msg) => {
   COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
     deltaDivergenceState[symbol] = { BUY: null, SELL: null };
+  atrBandState[symbol] = { BUY: null, SELL: null };
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
