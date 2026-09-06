@@ -94,6 +94,15 @@ const COIN_LIST = [
   "SAHARAUSDT",
   "ARCUSDT",
   "FORMUSDT",
+  "ARBUSDT",
+  "AKTUSDT",
+  "GRTUSDT",
+  "STRKUSDT",
+  "AEROUSDT",
+  "BRETTUSDT",
+  "JUPUSDT",
+  "OPUSDT",
+  "ZKUSDT",
 ];
 
 // --- In-memory ---
