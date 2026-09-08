@@ -2205,6 +2205,16 @@ const TREND_ATR_LENGTH = 14;
 
 const TREND_ATR_MULTIPLIER = 1;
 
+// --- Trend Quality / Consolidation Filter ---
+// A coin must show directional structure, efficient price movement,
+// and a meaningful 4H EMA slope before it can enter the TOP 7.
+const TREND_QUALITY_LOOKBACK = 10;
+const TREND_QUALITY_STRUCTURE_LOOKBACK = 5;
+const TREND_QUALITY_MIN_EFFICIENCY = 0.30;
+const TREND_QUALITY_MIN_ATR_RATIO = 0.80;
+const TREND_QUALITY_MIN_EMA_SLOPE_PCT = 0.05;
+
+
 
 //======================================================
 // CUMULATIVE DELTA
@@ -3351,6 +3361,279 @@ function analyzeTrendHealth(
 
 
 //======================================================
+// 4H TREND QUALITY / CONSOLIDATION FILTER
+//
+// The 4H ATR-band trend can remain bullish/bearish even while
+// price becomes compressed and moves sideways. This filter checks:
+//
+// • directional structure
+// • price efficiency (trend vs chop)
+// • EMA20 slope
+// • current ATR relative to recent ATR
+//
+// STRONG TREND requires all core directional conditions.
+// TRANSITION is shown for diagnostics but is NOT eligible for TOP 7.
+// CONSOLIDATING coins are excluded from recommendations.
+//======================================================
+
+function analyzeTrendQuality(
+    candles4H,
+    trend4H
+) {
+
+    if (
+        !candles4H ||
+        !trend4H ||
+        trend4H.trendState === 0
+    ) {
+        return {
+            status: "CONSOLIDATING",
+            score: 0,
+            efficiency: 0,
+            atrRatio: 0,
+            emaSlopePct: 0,
+            structure: "NONE",
+            reason: "No established directional 4H trend"
+        };
+    }
+
+    const needed =
+        Math.max(
+            TREND_EMA_LENGTH + 5,
+            TREND_QUALITY_LOOKBACK + 1,
+            TREND_QUALITY_STRUCTURE_LOOKBACK + 2
+        );
+
+    if (candles4H.length < needed) {
+        return {
+            status: "CONSOLIDATING",
+            score: 0,
+            efficiency: 0,
+            atrRatio: 0,
+            emaSlopePct: 0,
+            structure: "UNKNOWN",
+            reason: "Insufficient 4H data"
+        };
+    }
+
+    const end = candles4H.length - 1;
+    const lookbackStart = end - TREND_QUALITY_LOOKBACK;
+    const structureStart = end - TREND_QUALITY_STRUCTURE_LOOKBACK;
+
+    const closes = candles4H.map(c => Number(c.close));
+    const highs = candles4H.map(c => Number(c.high));
+    const lows = candles4H.map(c => Number(c.low));
+
+    if (
+        !Number.isFinite(closes[end]) ||
+        !Number.isFinite(closes[lookbackStart])
+    ) {
+        return {
+            status: "CONSOLIDATING",
+            score: 0,
+            efficiency: 0,
+            atrRatio: 0,
+            emaSlopePct: 0,
+            structure: "UNKNOWN",
+            reason: "Invalid 4H price data"
+        };
+    }
+
+    // -----------------------------------------------
+    // PRICE EFFICIENCY
+    // Net directional movement divided by total
+    // absolute movement over the last 10 closed 4H bars.
+    // Higher values = cleaner trend; lower values = chop.
+    // -----------------------------------------------
+    let path = 0;
+
+    for (let i = lookbackStart + 1; i <= end; i++) {
+        if (
+            Number.isFinite(closes[i]) &&
+            Number.isFinite(closes[i - 1])
+        ) {
+            path += Math.abs(closes[i] - closes[i - 1]);
+        }
+    }
+
+    const netMove =
+        closes[end] - closes[lookbackStart];
+
+    const efficiency =
+        path > 0
+            ? Math.abs(netMove) / path
+            : 0;
+
+    // -----------------------------------------------
+    // EMA20 SLOPE
+    // Compare the latest EMA20 with its value five
+    // closed 4H candles earlier.
+    // -----------------------------------------------
+    const emaNow =
+        calculateEMAValue(
+            candles4H.slice(0, end + 1),
+            TREND_EMA_LENGTH
+        );
+
+    const emaEarlier =
+        calculateEMAValue(
+            candles4H.slice(0, end - 5 + 1),
+            TREND_EMA_LENGTH
+        );
+
+    const emaSlopePct =
+        Number.isFinite(emaNow) &&
+        Number.isFinite(emaEarlier) &&
+        emaEarlier !== 0
+            ? ((emaNow - emaEarlier) / Math.abs(emaEarlier)) * 100
+            : 0;
+
+    // -----------------------------------------------
+    // ATR EXPANSION / COMPRESSION
+    // Current ATR14 compared with the average ATR14
+    // over the previous 10 available ATR readings.
+    // -----------------------------------------------
+    const atrValues = [];
+
+    for (
+        let i = Math.max(TREND_ATR_LENGTH, end - 19);
+        i <= end;
+        i++
+    ) {
+        const atr =
+            calculateATRValue(
+                candles4H.slice(0, i + 1),
+                TREND_ATR_LENGTH
+            );
+
+        if (Number.isFinite(atr) && atr > 0) {
+            atrValues.push(atr);
+        }
+    }
+
+    const currentATR =
+        atrValues.length
+            ? atrValues[atrValues.length - 1]
+            : null;
+
+    const previousATRValues =
+        atrValues.length > 1
+            ? atrValues.slice(0, -1)
+            : [];
+
+    const averagePreviousATR =
+        previousATRValues.length
+            ? previousATRValues.reduce((sum, value) => sum + value, 0) / previousATRValues.length
+            : null;
+
+    const atrRatio =
+        Number.isFinite(currentATR) &&
+        Number.isFinite(averagePreviousATR) &&
+        averagePreviousATR > 0
+            ? currentATR / averagePreviousATR
+            : 0;
+
+    // -----------------------------------------------
+    // DIRECTIONAL STRUCTURE
+    // Require the latest close to continue moving in
+    // the established 4H direction and to sit on the
+    // correct side of the recent range midpoint.
+    // -----------------------------------------------
+    const recentHighs = highs.slice(structureStart, end + 1).filter(Number.isFinite);
+    const recentLows = lows.slice(structureStart, end + 1).filter(Number.isFinite);
+
+    const priorHighs = highs.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
+    const priorLows = lows.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
+
+    const recentHigh = recentHighs.length ? Math.max(...recentHighs) : null;
+    const recentLow = recentLows.length ? Math.min(...recentLows) : null;
+    const priorHigh = priorHighs.length ? Math.max(...priorHighs) : null;
+    const priorLow = priorLows.length ? Math.min(...priorLows) : null;
+
+    const rangeHigh = Math.max(...highs.slice(lookbackStart, end + 1).filter(Number.isFinite));
+    const rangeLow = Math.min(...lows.slice(lookbackStart, end + 1).filter(Number.isFinite));
+    const rangeMid = (rangeHigh + rangeLow) / 2;
+
+    let structure = "NEUTRAL";
+
+    if (trend4H.trendState === 1) {
+        structure =
+            closes[end] > closes[structureStart] &&
+            closes[end] > rangeMid &&
+            recentHigh !== null &&
+            priorHigh !== null &&
+            recentHigh > priorHigh
+                ? "BULLISH STRUCTURE"
+                : "WEAK BULLISH STRUCTURE";
+    }
+    else if (trend4H.trendState === -1) {
+        structure =
+            closes[end] < closes[structureStart] &&
+            closes[end] < rangeMid &&
+            recentLow !== null &&
+            priorLow !== null &&
+            recentLow < priorLow
+                ? "BEARISH STRUCTURE"
+                : "WEAK BEARISH STRUCTURE";
+    }
+
+    const structureAligned =
+        structure === "BULLISH STRUCTURE" ||
+        structure === "BEARISH STRUCTURE";
+
+    const emaSlopeAligned =
+        (trend4H.trendState === 1 && emaSlopePct >= TREND_QUALITY_MIN_EMA_SLOPE_PCT) ||
+        (trend4H.trendState === -1 && emaSlopePct <= -TREND_QUALITY_MIN_EMA_SLOPE_PCT);
+
+    const efficiencyStrong =
+        efficiency >= TREND_QUALITY_MIN_EFFICIENCY;
+
+    const volatilityHealthy =
+        atrRatio >= TREND_QUALITY_MIN_ATR_RATIO;
+
+    const strongTrend =
+        structureAligned &&
+        emaSlopeAligned &&
+        efficiencyStrong &&
+        volatilityHealthy;
+
+    const transitionTrend =
+        structureAligned &&
+        emaSlopeAligned &&
+        efficiency >= 0.20;
+
+    let status = "CONSOLIDATING";
+    let score = 0;
+
+    if (strongTrend) {
+        status = "STRONG TREND";
+        score = 100;
+        if (atrRatio >= 1) score += 10;
+        if (efficiency >= 0.50) score += 10;
+    }
+    else if (transitionTrend) {
+        status = "TRANSITION";
+        score = 50;
+    }
+
+    return {
+        status,
+        score,
+        efficiency,
+        atrRatio,
+        emaSlopePct,
+        structure,
+        reason: strongTrend
+            ? "Directional structure, EMA slope, efficiency and volatility confirmed"
+            : transitionTrend
+                ? "Directional structure present but trend strength/volatility is not fully confirmed"
+                : "Price action lacks sufficient directional structure; consolidation risk is high"
+    };
+
+}
+
+
+//======================================================
 // ALIGNMENT SCORE
 //
 // 4H BROADER TREND
@@ -3499,6 +3782,9 @@ async function calculateCoinScore(
         let momentum1H =
             null;
 
+        let trendQuality =
+            null;
+
 
         //================================================
         // 30M DATA
@@ -3615,6 +3901,12 @@ async function calculateCoinScore(
             trend4H =
                 calculate4HTrendATR(
                     closed4H
+                );
+
+            trendQuality =
+                analyzeTrendQuality(
+                    closed4H,
+                    trend4H
                 );
 
 
@@ -3740,6 +4032,8 @@ async function calculateCoinScore(
             momentum1H,
 
             trendHealth,
+
+            trendQuality,
 
             alignmentScore,
 
@@ -3922,12 +4216,18 @@ async function generateCoinScoreReport() {
                             coin.trendHealth.exhaustion ===
                             "LOW";
 
+                        const strongTrend =
+                            coin.trendQuality &&
+                            coin.trendQuality.status ===
+                            "STRONG TREND";
+
 
                         return (
                             bullishMomentum &&
                             bullishDelta &&
                             healthy &&
-                            lowExhaustion
+                            lowExhaustion &&
+                            strongTrend
                         );
 
                     }
@@ -3971,12 +4271,18 @@ async function generateCoinScoreReport() {
                             coin.trendHealth.exhaustion ===
                             "LOW";
 
+                        const strongTrend =
+                            coin.trendQuality &&
+                            coin.trendQuality.status ===
+                            "STRONG TREND";
+
 
                         return (
                             bearishMomentum &&
                             bearishDelta &&
                             healthy &&
-                            lowExhaustion
+                            lowExhaustion &&
+                            strongTrend
                         );
 
                     }
@@ -4071,6 +4377,7 @@ No coin currently satisfies all of the following:
 • 30M delta aligned
 • Healthy trend
 • Low exhaustion
+• Strong 4H trend quality (not consolidation)
 
 The scanner is still monitoring all coins.
 
@@ -4236,6 +4543,30 @@ The scanner is still monitoring all coins.
 
 
                     //================================================
+                    // TREND QUALITY
+                    //================================================
+
+                    const quality =
+                        coin.trendQuality || {
+                            status: "UNKNOWN",
+                            efficiency: 0,
+                            atrRatio: 0,
+                            emaSlopePct: 0,
+                            structure: "UNKNOWN"
+                        };
+
+                    const qualityIcon =
+                        quality.status === "STRONG TREND"
+                            ? "🟢"
+                            : quality.status === "TRANSITION"
+                                ? "🟡"
+                                : "🔴";
+
+                    const qualityText =
+                        `${qualityIcon} ${quality.status}`;
+
+
+                    //================================================
                     // TREND HEALTH
                     //================================================
 
@@ -4275,6 +4606,7 @@ The scanner is still monitoring all coins.
 📏 Distance: ${distanceText}
 📈 1H MOM: ${momentumText}
 ⚡ 30M DELTA: ${flowText}
+📐 4H QUALITY: ${qualityText}
 
 💪 TREND: ${trendIcon} ${health.trend}
 ⚠️ EXHAUSTION: ${exhaustionIcon} ${health.exhaustion}
@@ -4318,6 +4650,12 @@ The scanner is still monitoring all coins.
 30M delta must agree
 Trend must be HEALTHY
 Exhaustion must be LOW
+4H trend quality must be STRONG TREND
+
+📌 *TREND QUALITY GUIDE*
+🟢 STRONG TREND = directional structure + efficient movement + EMA slope + healthy volatility
+🟡 TRANSITION = directional structure is forming but confirmation is incomplete
+🔴 CONSOLIDATING = insufficient directional structure / price efficiency
 
 📌 *GUIDE*
 🟢 HEALTHY = trend intact
