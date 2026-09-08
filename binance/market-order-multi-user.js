@@ -526,9 +526,9 @@ const TR_DELTA_ATR_MULTIPLIER = 1;
 const TR_DELTA_MA_LENGTH = 10;
 
 // Minimum adaptive Delta strength required for a new entry.
-// 0.50 = Delta must be at least half of the recent average
+// 0.75 = Delta must reach at least 75% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 0.50;
+const DELTA_STRENGTH_THRESHOLD = 0.75;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M price/delta divergence setup.
