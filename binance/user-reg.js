@@ -139,7 +139,7 @@ Navigate using the buttons below.`,
           [
             {
               text: "💳 Subscription",
-              url: "https://t.me/DanuvieCryptopayments_bot",
+              url: "https://t.me/DanuviePay_bot",
             },
           ],
 
