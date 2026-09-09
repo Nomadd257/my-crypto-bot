@@ -1532,6 +1532,370 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
   }
 }
 
+// =====================================================
+// 15M TRADE PROGRESS / TREND CONTINUATION MONITOR
+// =====================================================
+// Informational only. This scans every bot-opened position
+// every 15 minutes and reports whether the existing trend is
+// continuing, weakening, or showing failure risk.
+//
+// It does NOT replace or modify the existing:
+// • SL
+// • pre-runner trailing stop
+// • +2% runner activation
+// • 15M delta runner exit
+//
+// The monitor combines the same market context already used
+// by the bot: 4H trend/quality, 1H momentum + STC, 15M ATR
+// bands/structure/delta, and 5M price structure.
+// =====================================================
+
+const TRADE_PROGRESS_INTERVAL_MS = 15 * 60 * 1000;
+const TRADE_PROGRESS_SCHEDULER_MS = 60 * 1000;
+const tradeProgressLastReport = {};
+const tradeProgressPrevious = {};
+
+function getTradeProgressStructure(candles, direction, lookback = 6) {
+  if (!candles || candles.length < lookback + 2) {
+    return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
+  }
+
+  const recent = candles.slice(-lookback);
+  const prior = candles.slice(-(lookback * 2), -lookback);
+  if (recent.length < 3 || prior.length < 3) {
+    return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
+  }
+
+  const recentHigh = Math.max(...recent.map(c => Number(c.high)));
+  const recentLow = Math.min(...recent.map(c => Number(c.low)));
+  const priorHigh = Math.max(...prior.map(c => Number(c.high)));
+  const priorLow = Math.min(...prior.map(c => Number(c.low)));
+  const last = recent[recent.length - 1];
+  const prev = recent[recent.length - 2];
+
+  const hh = recentHigh > priorHigh;
+  const hl = recentLow > priorLow;
+  const lh = recentHigh < priorHigh;
+  const ll = recentLow < priorLow;
+  const close = Number(last.close);
+  const prevClose = Number(prev.close);
+
+  if (direction === "BUY") {
+    const aligned = (hh && hl) || (close > prevClose && recentLow >= priorLow);
+    return {
+      aligned,
+      status: aligned ? "HH/HL" : (ll || lh ? "LH/LL" : "PULLBACK/FLAT"),
+      text: aligned ? "HH/HL intact" : (ll || lh ? "LH/LL risk" : "pullback/flat")
+    };
+  }
+
+  const aligned = (lh && ll) || (close < prevClose && recentHigh <= priorHigh);
+  return {
+    aligned,
+    status: aligned ? "LH/LL" : (hh || hl ? "HH/HL" : "PULLBACK/FLAT"),
+    text: aligned ? "LH/LL intact" : (hh || hl ? "HH/HL risk" : "pullback/flat")
+  };
+}
+
+function getTradeProgressBands(candles, direction) {
+  const bands = calculate5MATRBands(candles);
+  if (!bands) return { aligned: false, expanding: false, status: "UNAVAILABLE", text: "N/A" };
+
+  const latest = candles[candles.length - 1];
+  const close = Number(latest.close);
+  const aboveMid = close > bands.current.mid;
+  const belowMid = close < bands.current.mid;
+
+  if (direction === "BUY") {
+    const aligned = aboveMid && close >= bands.current.lower;
+    return {
+      aligned,
+      expanding: bands.expansionUp,
+      status: close > bands.current.upper ? "ABOVE UPPER" : (aboveMid ? "ABOVE MID" : "BELOW MID"),
+      text: close > bands.current.upper ? "above upper band" : (aboveMid ? "above EMA mid" : "below EMA mid"),
+      width: bands.current.width,
+      widthChange: bands.current.width - bands.previous.width
+    };
+  }
+
+  const aligned = belowMid && close <= bands.current.upper;
+  return {
+    aligned,
+    expanding: bands.expansionDown,
+    status: close < bands.current.lower ? "BELOW LOWER" : (belowMid ? "BELOW MID" : "ABOVE MID"),
+    text: close < bands.current.lower ? "below lower band" : (belowMid ? "below EMA mid" : "above EMA mid"),
+    width: bands.current.width,
+    widthChange: bands.current.width - bands.previous.width
+  };
+}
+
+function getTradeProgressDelta(candles, direction) {
+  const trDelta = calculateTrendResetCumulativeDelta(candles);
+  if (!trDelta) return { aligned: false, strong: false, status: "UNAVAILABLE", text: "N/A" };
+
+  const aligned = direction === "BUY"
+    ? trDelta.cumDelta > 0 && trDelta.cumDelta > trDelta.deltaMA
+    : trDelta.cumDelta < 0 && trDelta.cumDelta < trDelta.deltaMA;
+
+  const strong = direction === "BUY"
+    ? trDelta.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+    : trDelta.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
+
+  return {
+    aligned,
+    strong,
+    status: aligned ? (strong ? "STRONG" : "ALIGNED") : "CONFLICTING",
+    text: aligned ? (strong ? "aligned + strong" : "aligned but weaker") : "against trade",
+    cumDelta: trDelta.cumDelta,
+    deltaMA: trDelta.deltaMA,
+    deltaStrength: trDelta.deltaStrength
+  };
+}
+
+function getTradeProgressStc(candles, direction) {
+  if (!candles || candles.length < 40) {
+    return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
+  }
+
+  const closes = candles.map(c => Number(c.close));
+  const current = calculateSTC(closes);
+  const previous = calculateSTC(closes.slice(0, -1));
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+    return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
+  }
+
+  const aligned = direction === "BUY" ? current >= 50 : current <= 50;
+  const movingWithTrade = direction === "BUY" ? current >= previous : current <= previous;
+
+  return {
+    aligned,
+    movingWithTrade,
+    status: aligned ? (movingWithTrade ? "CONFIRMING" : "WEAKENING") : "AGAINST",
+    text: aligned ? (movingWithTrade ? "aligned/rising" : "aligned/falling") : "against trade",
+    current,
+    previous
+  };
+}
+
+function getTradeProgress4H(candles, direction) {
+  if (!candles || candles.length < 50) {
+    return { aligned: false, quality: null, trend: "N/A", text: "N/A" };
+  }
+
+  const trend = calculate4HTrendATR(candles);
+  if (!trend) return { aligned: false, quality: null, trend: "N/A", text: "N/A" };
+
+  const aligned = direction === "BUY"
+    ? trend.trendState === 1
+    : trend.trendState === -1;
+
+  let quality = null;
+  try {
+    quality = analyzeTrendQuality(candles, trend);
+  } catch {}
+
+  return {
+    aligned,
+    quality,
+    trend: trend.trend || "NEUTRAL",
+    text: aligned ? (quality?.status || "directional") : "trend conflict"
+  };
+}
+
+function getTradeProgressAbsorption(candles, direction) {
+  if (!candles || candles.length < 22) return { warning: false, text: "N/A" };
+
+  const candle = candles[candles.length - 1];
+  const prior = candles.slice(-21, -1);
+  const avgVolume = prior.reduce((sum, c) => sum + Number(c.volume || 0), 0) / prior.length;
+  const range = Number(candle.high) - Number(candle.low);
+  if (!(range > 0) || !(avgVolume > 0)) return { warning: false, text: "none" };
+
+  const body = Math.abs(Number(candle.close) - Number(candle.open));
+  const upperWick = Number(candle.high) - Math.max(Number(candle.open), Number(candle.close));
+  const lowerWick = Math.min(Number(candle.open), Number(candle.close)) - Number(candle.low);
+  const highVolume = Number(candle.volume) >= avgVolume * ABSORPTION_VOLUME_MULTIPLE;
+
+  const bearishAbsorption = direction === "BUY" &&
+    Number(candle.close) > Number(candle.open) &&
+    highVolume &&
+    body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    upperWick / range >= ABSORPTION_MIN_WICK_TO_RANGE;
+
+  const bullishAbsorption = direction === "SELL" &&
+    Number(candle.close) < Number(candle.open) &&
+    highVolume &&
+    body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    lowerWick / range >= ABSORPTION_MIN_WICK_TO_RANGE;
+
+  return {
+    warning: bearishAbsorption || bullishAbsorption,
+    text: bearishAbsorption ? "bearish absorption" : (bullishAbsorption ? "bullish absorption" : "none")
+  };
+}
+
+function formatTradeProgressState(state) {
+  if (state === "HOLD") return "🟢 HOLD — TREND CONTINUATION";
+  if (state === "PROTECT") return "🟡 PROTECT PROFIT — TREND WEAKENING";
+  if (state === "TAKE_PROFIT") return "🟠 TAKE PROFIT — MOVE LOSING SUPPORT";
+  return "🔴 EXIT WATCH — TREND FAILURE RISK";
+}
+
+function evaluateTradeProgress(direction, data, previous) {
+  const hardConflict = !data.higher.aligned ||
+    data.structure.status === (direction === "BUY" ? "LH/LL" : "HH/HL");
+
+  const deltaConflict = !data.delta.aligned;
+  const stcConflict = !data.stc.aligned;
+  const bandConflict = !data.bands.aligned;
+  const structureConflict = !data.structure.aligned;
+  const weakeningSignals = [
+    !data.momentum.aligned,
+    !data.stc.movingWithTrade,
+    !data.bands.expanding,
+    !data.delta.strong,
+    data.absorption.warning
+  ].filter(Boolean).length;
+
+  if (hardConflict && (deltaConflict || structureConflict || stcConflict)) {
+    return "EXIT";
+  }
+
+  if (hardConflict || (structureConflict && deltaConflict)) {
+    return "TAKE_PROFIT";
+  }
+
+  if (deltaConflict && bandConflict && weakeningSignals >= 2) {
+    return "TAKE_PROFIT";
+  }
+
+  if (weakeningSignals >= 3 || (previous?.state === "HOLD" && weakeningSignals >= 2)) {
+    return "PROTECT";
+  }
+
+  return "HOLD";
+}
+
+async function monitorTradeProgress() {
+  const now = Date.now();
+  const slot = Math.floor(now / TRADE_PROGRESS_INTERVAL_MS);
+
+  for (const [symbol, users] of Object.entries(activePositions)) {
+    for (const [userId, pos] of Object.entries(users)) {
+      const key = `${symbol}:${userId}`;
+      if (tradeProgressLastReport[key] === slot) continue;
+
+      try {
+        const [candles4H, candles1H, candles15, candles5] = await Promise.all([
+          fetchFuturesKlines(symbol, "4h", 100),
+          fetchFuturesKlines(symbol, "1h", 80),
+          fetchFuturesKlines(symbol, "15m", 150),
+          fetchFuturesKlines(symbol, "5m", 100)
+        ]);
+
+        const closed4H = candles4H?.slice(0, -1) || [];
+        const closed1H = candles1H?.slice(0, -1) || [];
+        const closed15 = candles15?.slice(0, -1) || [];
+        const closed5 = candles5?.slice(0, -1) || [];
+
+        if (closed4H.length < 50 || closed1H.length < 40 || closed15.length < 40 || closed5.length < 25) {
+          continue;
+        }
+
+        const higher = getTradeProgress4H(closed4H, pos.side);
+        const momentum = calculate1HMomentum(closed1H);
+        const momentumAligned = pos.side === "BUY"
+          ? Number(momentum?.current) > 0
+          : Number(momentum?.current) < 0;
+        const momentumData = {
+          aligned: momentumAligned,
+          accelerating: momentum?.state === "ACCELERATING",
+          text: momentumAligned ? (momentum?.state || "aligned") : "against trade"
+        };
+
+        const stc = getTradeProgressStc(closed1H, pos.side);
+        const bands = getTradeProgressBands(closed15, pos.side);
+        const structure = getTradeProgressStructure(closed15, pos.side, 6);
+        const delta = getTradeProgressDelta(closed15, pos.side);
+        const absorption = getTradeProgressAbsorption(closed15, pos.side);
+        const structure5 = getTradeProgressStructure(closed5, pos.side, 6);
+
+        const data = {
+          higher,
+          momentum: momentumData,
+          stc,
+          bands,
+          structure,
+          delta,
+          absorption,
+          structure5
+        };
+
+        const previous = tradeProgressPrevious[key] || null;
+        const state = evaluateTradeProgress(pos.side, data, previous);
+        const move = pos.side === "BUY"
+          ? ((Number(closed15[closed15.length - 1].close) - pos.entryPrice) / pos.entryPrice) * 100
+          : ((pos.entryPrice - Number(closed15[closed15.length - 1].close)) / pos.entryPrice) * 100;
+
+        const qualityText = higher.quality?.status || "N/A";
+        const qualityScore = Number.isFinite(higher.quality?.score) ? higher.quality.score : null;
+
+        const report =
+          `📡 *15M TRADE PROGRESS — ${symbol}*\n\n` +
+          `👤 User: ${userId}\n` +
+          `📍 Side: *${pos.side}*\n` +
+          `💰 Current move: *${move >= 0 ? "+" : ""}${move.toFixed(2)}%*\n\n` +
+          `${formatTradeProgressState(state)}\n\n` +
+          `4️⃣ *4H TREND*\n` +
+          `• Direction: ${higher.trend}\n` +
+          `• Quality: ${qualityText}${qualityScore !== null ? ` (${qualityScore}/100)` : ""}\n` +
+          `• Status: ${higher.aligned ? "✅ aligned" : "❌ conflict"}\n\n` +
+          `1️⃣ *1H MOMENTUM / STC*\n` +
+          `• Momentum: ${momentumData.text}\n` +
+          `• STC: ${stc.text}${Number.isFinite(stc.current) ? ` (${stc.current.toFixed(1)})` : ""}\n\n` +
+          `1️⃣5️⃣ *15M STRUCTURE / ATR*\n` +
+          `• Structure: ${structure.text}\n` +
+          `• ATR bands: ${bands.text}\n` +
+          `• Band expansion: ${bands.expanding ? "✅ directional" : "⚠️ not expanding"}\n\n` +
+          `📊 *15M CUMULATIVE DELTA*\n` +
+          `• Pressure: ${delta.text}\n` +
+          `• Strength: ${Number.isFinite(delta.deltaStrength) ? delta.deltaStrength.toFixed(2) : "N/A"}\n\n` +
+          `5️⃣ *5M PRICE STRUCTURE*\n` +
+          `• ${structure5.text}\n\n` +
+          `⚠️ Absorption: ${absorption.text}\n\n` +
+          `🧭 This is a *monitoring report only*. Existing SL, trailing stop and runner rules remain unchanged.`;
+
+        await sendMessage(report);
+        tradeProgressLastReport[key] = slot;
+        tradeProgressPrevious[key] = {
+          state,
+          timestamp: now,
+          deltaStrength: delta.deltaStrength,
+          stc: stc.current,
+          bandWidth: bands.width
+        };
+      } catch (err) {
+        log(`❌ 15M trade progress error ${symbol}/${userId}: ${err?.message || err}`);
+      }
+    }
+  }
+
+  // Clean state for positions that no longer exist.
+  for (const key of Object.keys(tradeProgressLastReport)) {
+    const [symbol, userId] = key.split(":");
+    if (!activePositions[symbol]?.[userId]) {
+      delete tradeProgressLastReport[key];
+      delete tradeProgressPrevious[key];
+    }
+  }
+}
+
+setInterval(() => {
+  monitorTradeProgress().catch(err =>
+    log(`❌ Trade progress scheduler error: ${err?.message || err}`)
+  );
+}, TRADE_PROGRESS_SCHEDULER_MS);
+
 // --- Monitor positions (TP/SL/Trailing Stop) ---
 async function monitorPositions() {
   for (const [symbol, users] of Object.entries(activePositions)) {
