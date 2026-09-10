@@ -1780,12 +1780,25 @@ async function monitorTradeProgress() {
   const now = Date.now();
   const slot = Math.floor(now / TRADE_PROGRESS_INTERVAL_MS);
 
+  // Group users by the actual position (symbol + side) so everyone
+  // holding the same bot position receives one shared market report.
   for (const [symbol, users] of Object.entries(activePositions)) {
+    const positionGroups = {};
+
     for (const [userId, pos] of Object.entries(users)) {
-      const key = `${symbol}:${userId}`;
-      if (tradeProgressLastReport[key] === slot) continue;
+      const groupKey = `${symbol}:${pos.side}`;
+      if (!positionGroups[groupKey]) positionGroups[groupKey] = [];
+      positionGroups[groupKey].push({ userId, pos });
+    }
+
+    for (const [groupKey, group] of Object.entries(positionGroups)) {
+      if (tradeProgressLastReport[groupKey] === slot) continue;
+
+      const side = group[0].pos.side;
 
       try {
+        // Market data is fetched/calculated once for the whole position group,
+        // instead of repeating the same work for every user.
         const [candles4H, candles1H, candles15, candles5] = await Promise.all([
           fetchFuturesKlines(symbol, "4h", 100),
           fetchFuturesKlines(symbol, "1h", 80),
@@ -1802,9 +1815,9 @@ async function monitorTradeProgress() {
           continue;
         }
 
-        const higher = getTradeProgress4H(closed4H, pos.side);
+        const higher = getTradeProgress4H(closed4H, side);
         const momentum = calculate1HMomentum(closed1H);
-        const momentumAligned = pos.side === "BUY"
+        const momentumAligned = side === "BUY"
           ? Number(momentum?.current) > 0
           : Number(momentum?.current) < 0;
         const momentumData = {
@@ -1813,12 +1826,12 @@ async function monitorTradeProgress() {
           text: momentumAligned ? (momentum?.state || "aligned") : "against trade"
         };
 
-        const stc = getTradeProgressStc(closed1H, pos.side);
-        const bands = getTradeProgressBands(closed15, pos.side);
-        const structure = getTradeProgressStructure(closed15, pos.side, 6);
-        const delta = getTradeProgressDelta(closed15, pos.side);
-        const absorption = getTradeProgressAbsorption(closed15, pos.side);
-        const structure5 = getTradeProgressStructure(closed5, pos.side, 6);
+        const stc = getTradeProgressStc(closed1H, side);
+        const bands = getTradeProgressBands(closed15, side);
+        const structure = getTradeProgressStructure(closed15, side, 6);
+        const delta = getTradeProgressDelta(closed15, side);
+        const absorption = getTradeProgressAbsorption(closed15, side);
+        const structure5 = getTradeProgressStructure(closed5, side, 6);
 
         const data = {
           higher,
@@ -1831,20 +1844,29 @@ async function monitorTradeProgress() {
           structure5
         };
 
-        const previous = tradeProgressPrevious[key] || null;
-        const state = evaluateTradeProgress(pos.side, data, previous);
-        const move = pos.side === "BUY"
-          ? ((Number(closed15[closed15.length - 1].close) - pos.entryPrice) / pos.entryPrice) * 100
-          : ((pos.entryPrice - Number(closed15[closed15.length - 1].close)) / pos.entryPrice) * 100;
+        const previous = tradeProgressPrevious[groupKey] || null;
+        const state = evaluateTradeProgress(side, data, previous);
+        const currentClose = Number(closed15[closed15.length - 1].close);
 
         const qualityText = higher.quality?.status || "N/A";
         const qualityScore = Number.isFinite(higher.quality?.score) ? higher.quality.score : null;
 
+        let userLines = "";
+        for (const { userId, pos } of group) {
+          const move = side === "BUY"
+            ? ((currentClose - pos.entryPrice) / pos.entryPrice) * 100
+            : ((pos.entryPrice - currentClose) / pos.entryPrice) * 100;
+
+          userLines +=
+            `• User ${userId}: *${move >= 0 ? "+" : ""}${move.toFixed(2)}%*` +
+            ` | Entry: ${pos.entryPrice}` +
+            ` | Qty: ${pos.qty}\n`;
+        }
+
         const report =
-          `📡 *15M TRADE PROGRESS — ${symbol}*\n\n` +
-          `👤 User: ${userId}\n` +
-          `📍 Side: *${pos.side}*\n` +
-          `💰 Current move: *${move >= 0 ? "+" : ""}${move.toFixed(2)}%*\n\n` +
+          `📡 *15M TRADE PROGRESS — ${symbol} ${side}*\n\n` +
+          `👥 *Users holding this position:* ${group.length}\n` +
+          userLines + `\n` +
           `${formatTradeProgressState(state)}\n\n` +
           `4️⃣ *4H TREND*\n` +
           `• Direction: ${higher.trend}\n` +
@@ -1866,8 +1888,8 @@ async function monitorTradeProgress() {
           `🧭 This is a *monitoring report only*. Existing SL, trailing stop and runner rules remain unchanged.`;
 
         await sendMessage(report);
-        tradeProgressLastReport[key] = slot;
-        tradeProgressPrevious[key] = {
+        tradeProgressLastReport[groupKey] = slot;
+        tradeProgressPrevious[groupKey] = {
           state,
           timestamp: now,
           deltaStrength: delta.deltaStrength,
@@ -1875,15 +1897,18 @@ async function monitorTradeProgress() {
           bandWidth: bands.width
         };
       } catch (err) {
-        log(`❌ 15M trade progress error ${symbol}/${userId}: ${err?.message || err}`);
+        log(`❌ 15M trade progress error ${groupKey}: ${err?.message || err}`);
       }
     }
   }
 
   // Clean state for positions that no longer exist.
   for (const key of Object.keys(tradeProgressLastReport)) {
-    const [symbol, userId] = key.split(":");
-    if (!activePositions[symbol]?.[userId]) {
+    const [symbol, side] = key.split(":");
+    const stillExists = Object.values(activePositions[symbol] || {})
+      .some(pos => pos.side === side);
+
+    if (!stillExists) {
       delete tradeProgressLastReport[key];
       delete tradeProgressPrevious[key];
     }
@@ -1895,6 +1920,7 @@ setInterval(() => {
     log(`❌ Trade progress scheduler error: ${err?.message || err}`)
   );
 }, TRADE_PROGRESS_SCHEDULER_MS);
+
 
 // --- Monitor positions (TP/SL/Trailing Stop) ---
 async function monitorPositions() {
