@@ -340,26 +340,52 @@ async function fetchMajorNewsEvents() {
 }
 
 function getNewsAlertKey(minutesRemaining, event) {
-  if (minutesRemaining <= 0) return "RELEASE";
+  // Release alert: allow a short delivery window after the scheduled time
+  // so a 30-second polling cycle does not miss the notification.
+  if (minutesRemaining <= 0 && minutesRemaining >= -5) return "RELEASE";
 
-  if (minutesRemaining <= 5) return "5M";
-  if (minutesRemaining <= 15) return "15M";
-  if (minutesRemaining <= 30) return "30M";
-  if (minutesRemaining <= 60) return "60M";
+  // Short countdown alerts. Each alert owns its own threshold so a delayed
+  // scheduler can still deliver the correct warning once it catches up.
+  if (minutesRemaining > 0 && minutesRemaining <= 5) return "5M";
+  if (minutesRemaining > 5 && minutesRemaining <= 15) return "15M";
+  if (minutesRemaining > 15 && minutesRemaining <= 30) return "30M";
+  if (minutesRemaining > 30 && minutesRemaining <= 60) return "60M";
 
-  // Hourly alerts are tied to the event's release minute.
-  // Example: a 13:30 release produces alerts at 12:30, 11:30,
-  // 10:30, etc., rather than at arbitrary wall-clock hours.
+  // Hourly alerts are tied to the event's exact release minute, but use a
+  // 5-minute delivery window so temporary network/scheduler delays do not
+  // cause the bot to miss the warning.
   const hoursRemaining = Math.round(minutesRemaining / 60);
   if (
     hoursRemaining >= 1 &&
     hoursRemaining <= NEWS_HOURLY_MAX_HOURS &&
-    Math.abs(minutesRemaining - hoursRemaining * 60) <= 0.5
+    Math.abs(minutesRemaining - hoursRemaining * 60) <= 5
   ) {
     return `${hoursRemaining}H`;
   }
 
   return null;
+}
+
+async function sendNewsMessage(message) {
+  // News has its own sender so Telegram delivery failures are visible in the
+  // bot log instead of being silently swallowed by the general sendMessage().
+  let delivered = false;
+
+  try {
+    await bot.sendMessage(GROUP_CHAT_ID, message, { parse_mode: "Markdown" });
+    delivered = true;
+  } catch (err) {
+    log(`❌ News Telegram group delivery failed: ${err?.message || err}`);
+  }
+
+  try {
+    await bot.sendMessage(ADMIN_ID, message, { parse_mode: "Markdown" });
+    delivered = true;
+  } catch (err) {
+    log(`❌ News Telegram admin delivery failed: ${err?.message || err}`);
+  }
+
+  return delivered;
 }
 
 async function sendMajorNewsWarning(event, minutesRemaining, alertKey) {
@@ -387,12 +413,17 @@ async function sendMajorNewsWarning(event, minutesRemaining, alertKey) {
     `⚠️ Rapid price spikes, reversals and wider-than-normal market movement are possible.\n` +
     `📌 This is an *informational warning only*; the bot's trading logic is unchanged.`;
 
-  if (event.forecast !== null || event.previous !== null) {
-    message += `\n\n📊 Forecast: *${event.forecast ?? "N/A"}*\n` +
-      `📊 Previous: *${event.previous ?? "N/A"}*`;
+  // Xoomar calendar data does not reliably provide a forecast field.
+  // Report only values actually supplied by the calendar.
+  if (event.previous !== null || event.actual !== null) {
+    message += `\n\n📊 Previous: *${event.previous ?? "N/A"}*`;
+    if (event.actual !== null) {
+      message += `\n📈 Actual: *${event.actual}*`;
+    }
   }
 
-  await sendMessage(message);
+  const delivered = await sendNewsMessage(message);
+  return delivered;
 }
 
 async function monitorMajorNewsAlerts() {
@@ -407,8 +438,9 @@ async function monitorMajorNewsAlerts() {
     for (const event of majorNewsEvents) {
       const minutesRemaining = (event.scheduledAt.getTime() - now.getTime()) / 60000;
 
-      // Ignore events that are already more than 12 hours past release.
-      if (minutesRemaining < -1) continue;
+      // Ignore events more than 5 minutes after release. The 5-minute
+      // grace window above is specifically for reliable release reporting.
+      if (minutesRemaining < -5) continue;
 
       const alertKey = getNewsAlertKey(minutesRemaining, event);
       if (!alertKey) continue;
@@ -416,8 +448,13 @@ async function monitorMajorNewsAlerts() {
       if (!newsAlertState[event.id]) newsAlertState[event.id] = { alertKeys: {} };
       if (newsAlertState[event.id].alertKeys[alertKey]) continue;
 
-      newsAlertState[event.id].alertKeys[alertKey] = true;
-      await sendMajorNewsWarning(event, minutesRemaining, alertKey);
+      const delivered = await sendMajorNewsWarning(event, minutesRemaining, alertKey);
+
+      // Only mark an alert as sent after at least one Telegram destination
+      // accepted it. A failed delivery can therefore be retried next cycle.
+      if (delivered) {
+        newsAlertState[event.id].alertKeys[alertKey] = true;
+      }
     }
   } catch (err) {
     log(`❌ Major news alert monitor error: ${err?.message || err}`);
