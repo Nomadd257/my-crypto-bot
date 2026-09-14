@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.5;
+const SL_PCT = 1.8;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -563,13 +563,13 @@ const TR_DELTA_ATR_MULTIPLIER = 1;
 const TR_DELTA_MA_LENGTH = 10;
 
 // Minimum adaptive Delta strength required for a new entry.
-// 0.75 = Delta must reach at least 75% of the recent average
+// 0.8 = Delta must reach at least 80% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 0.75;
+const DELTA_STRENGTH_THRESHOLD = 0.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M price/delta divergence setup.
-// Divergence is a setup condition; the existing 0.50 delta-strength check
+// Divergence is a setup condition; the existing delta-strength threshold
 // remains the final entry confirmation.
 const DELTA_DIVERGENCE_WINDOW = 8;
 const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
@@ -579,6 +579,10 @@ const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
 const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
+
+// After directional ATR expansion is confirmed, wait exactly 6 CLOSED
+// 5M candles (30 minutes) before checking the final delta confirmation.
+const ATR_EXPANSION_ENTRY_DELAY_CANDLES = 6;
 
 
 // ------------------------------------------------------
@@ -1164,26 +1168,96 @@ function calculate5MATRBands(candles) {
 
 function update5MATRBandState(symbol, candles5) {
   const state = atrBandState[symbol];
-  if (!state) return { buyExpansion: false, sellExpansion: false, contracting: false };
+  if (!state) {
+    return {
+      buyExpansion: false,
+      sellExpansion: false,
+      buyDelayComplete: false,
+      sellDelayComplete: false,
+      contracting: false
+    };
+  }
 
   const status = calculate5MATRBands(candles5);
-  if (!status) return { buyExpansion: false, sellExpansion: false, contracting: false };
+  if (!status) {
+    return {
+      buyExpansion: false,
+      sellExpansion: false,
+      buyDelayComplete: false,
+      sellDelayComplete: false,
+      contracting: false
+    };
+  }
 
   const latestTime = candles5[candles5.length - 1]?.time;
 
-  if (state.BUY && state.BUY.divergenceCandleTime !== null && latestTime > state.BUY.divergenceCandleTime) {
+  if (
+    state.BUY &&
+    state.BUY.divergenceCandleTime !== null &&
+    latestTime > state.BUY.divergenceCandleTime
+  ) {
     if (status.contracting) state.BUY.contracted = true;
-    if (state.BUY.contracted && status.expansionUp) state.BUY.expansionConfirmed = true;
+
+    if (
+      !state.BUY.expansionConfirmed &&
+      state.BUY.contracted &&
+      status.expansionUp
+    ) {
+      state.BUY.expansionConfirmed = true;
+      state.BUY.expansionCandleTime = latestTime;
+      state.BUY.expansionClosedCandleCount = 0;
+    } else if (
+      state.BUY.expansionConfirmed &&
+      state.BUY.expansionCandleTime !== null &&
+      latestTime > state.BUY.expansionCandleTime
+    ) {
+      state.BUY.expansionClosedCandleCount =
+        Math.floor(
+          (latestTime - state.BUY.expansionCandleTime) /
+          (5 * 60 * 1000)
+        );
+    }
   }
 
-  if (state.SELL && state.SELL.divergenceCandleTime !== null && latestTime > state.SELL.divergenceCandleTime) {
+  if (
+    state.SELL &&
+    state.SELL.divergenceCandleTime !== null &&
+    latestTime > state.SELL.divergenceCandleTime
+  ) {
     if (status.contracting) state.SELL.contracted = true;
-    if (state.SELL.contracted && status.expansionDown) state.SELL.expansionConfirmed = true;
+
+    if (
+      !state.SELL.expansionConfirmed &&
+      state.SELL.contracted &&
+      status.expansionDown
+    ) {
+      state.SELL.expansionConfirmed = true;
+      state.SELL.expansionCandleTime = latestTime;
+      state.SELL.expansionClosedCandleCount = 0;
+    } else if (
+      state.SELL.expansionConfirmed &&
+      state.SELL.expansionCandleTime !== null &&
+      latestTime > state.SELL.expansionCandleTime
+    ) {
+      state.SELL.expansionClosedCandleCount =
+        Math.floor(
+          (latestTime - state.SELL.expansionCandleTime) /
+          (5 * 60 * 1000)
+        );
+    }
   }
 
   return {
     buyExpansion: Boolean(state.BUY?.expansionConfirmed),
     sellExpansion: Boolean(state.SELL?.expansionConfirmed),
+    buyDelayComplete:
+      Boolean(state.BUY?.expansionConfirmed) &&
+      (state.BUY?.expansionClosedCandleCount || 0) >=
+        ATR_EXPANSION_ENTRY_DELAY_CANDLES,
+    sellDelayComplete:
+      Boolean(state.SELL?.expansionConfirmed) &&
+      (state.SELL?.expansionClosedCandleCount || 0) >=
+        ATR_EXPANSION_ENTRY_DELAY_CANDLES,
     contracting: status.contracting
   };
 }
@@ -1206,7 +1280,9 @@ function rememberFreshDeltaDivergence(symbol, divergence) {
       atrBandState[symbol].BUY = {
         divergenceCandleTime: divergence.bullishCandleTime,
         contracted: false,
-        expansionConfirmed: false
+        expansionConfirmed: false,
+        expansionCandleTime: null,
+        expansionClosedCandleCount: 0
       };
     }
   }
@@ -1221,7 +1297,9 @@ function rememberFreshDeltaDivergence(symbol, divergence) {
       atrBandState[symbol].SELL = {
         divergenceCandleTime: divergence.bearishCandleTime,
         contracted: false,
-        expansionConfirmed: false
+        expansionConfirmed: false,
+        expansionCandleTime: null,
+        expansionClosedCandleCount: 0
       };
     }
   }
@@ -2404,12 +2482,14 @@ setInterval(async () => {
 // 1H STC = TREND
 // 5M Delta divergence = PULLBACK-ENDING SETUP
 // 5M ATR bands = contraction followed by directional expansion
+// 30-minute delay = 6 CLOSED 5M candles after directional expansion
 // 5M Delta direction + SMA(10) + strength = FINAL ENTRY
 //
 // A coin can be activated during a pullback without entering immediately.
 // A fresh 5M divergence must first be detected after activation.
 // After divergence, the ATR bands must contract and then expand in the
-// trade direction before the delta confirmation can trigger an entry.
+// trade direction. Once expansion is confirmed, wait 6 CLOSED 5M candles.
+// No new divergence is required during or after this delay.
 //
 // Only CLOSED 5M candles are used.
 // =====================================================
@@ -2443,7 +2523,8 @@ const deltaDivergence5 = detect5MDeltaDivergence(
 rememberFreshDeltaDivergence(symbol, deltaDivergence5);
 
 // After divergence, require 5M ATR-band contraction followed by
-// directional volatility expansion before the delta entry confirmation.
+// directional volatility expansion, then wait 6 CLOSED 5M candles
+// before the existing delta entry confirmation.
 const atrBand5 = update5MATRBandState(symbol, closedCandles5);
 
 // Absorption remains a 15M informational warning.
@@ -2471,15 +2552,10 @@ let direction = null;
 
 if (
   trendCycle === "BULL" &&
-  hasFreshDeltaDivergence(
-    symbol,
-    "BUY",
-    closedCandles5[closedCandles5.length - 1]?.time
-  ) &&
+  atrBand5.buyDelayComplete &&
   trDelta5.cumDelta > 0 &&
   trDelta5.cumDelta > trDelta5.deltaMA &&
-  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD &&
-  atrBand5.buyExpansion
+  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "BUY";
@@ -2493,15 +2569,10 @@ if (
 
 if (
   trendCycle === "BEAR" &&
-  hasFreshDeltaDivergence(
-    symbol,
-    "SELL",
-    closedCandles5[closedCandles5.length - 1]?.time
-  ) &&
+  atrBand5.sellDelayComplete &&
   trDelta5.cumDelta < 0 &&
   trDelta5.cumDelta < trDelta5.deltaMA &&
-  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD &&
-  atrBand5.sellExpansion
+  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
 ) {
 
   direction = "SELL";
