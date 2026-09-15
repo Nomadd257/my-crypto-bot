@@ -569,20 +569,24 @@ const DELTA_STRENGTH_THRESHOLD = 0.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M price/delta divergence setup.
-// Divergence is a setup condition; the existing delta-strength threshold
-// remains the final entry confirmation.
+// Divergence is a setup condition; the Delta Strength threshold remains the final entry confirmation.
 const DELTA_DIVERGENCE_WINDOW = 8;
 const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
 
-// 5M ATR-band confirmation. Bands use EMA(20) +/- ATR(14) x 1.
-// A fresh divergence must be followed by contraction, then directional expansion.
+// 5M OBV confirmation after a fresh divergence.
+// OBV must cross its 50 EMA and remain on the correct side for
+// 3 consecutive CLOSED 5M candles, with meaningful separation
+// from the EMA on each of those 3 candles.
+const OBV_EMA_LENGTH = 50;
+const OBV_CONFIRMATION_CANDLES = 3;
+const OBV_MIN_DISTANCE_PERCENT = 0.20;
+const OBV_DISTANCE_LOOKBACK = 20;
+
+// 5M ATR-band calculations are retained only for existing trade-progress context.
+// ATR contraction/expansion is NOT an entry condition.
 const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
-
-// After directional ATR expansion is confirmed, wait exactly 6 CLOSED
-// 5M candles (30 minutes) before checking the final delta confirmation.
-const ATR_EXPANSION_ENTRY_DELAY_CANDLES = 6;
 
 
 // ------------------------------------------------------
@@ -1158,133 +1162,157 @@ function calculate5MATRBands(candles) {
 
   return {
     current,
-    previous,
-    contracting: current.width < previous.width,
-    expanding: current.width > previous.width,
-    expansionUp: current.width > previous.width && current.upper > previous.upper,
-    expansionDown: current.width > previous.width && current.lower < previous.lower
+    previous
   };
 }
 
-function update5MATRBandState(symbol, candles5) {
-  const state = atrBandState[symbol];
-  if (!state) {
-    return {
-      buyExpansion: false,
-      sellExpansion: false,
-      buyDelayComplete: false,
-      sellDelayComplete: false,
-      contracting: false
-    };
-  }
 
-  const status = calculate5MATRBands(candles5);
-  if (!status) {
-    return {
-      buyExpansion: false,
-      sellExpansion: false,
-      buyDelayComplete: false,
-      sellDelayComplete: false,
-      contracting: false
-    };
-  }
 
-  const latestTime = candles5[candles5.length - 1]?.time;
 
-  if (
-    state.BUY &&
-    state.BUY.divergenceCandleTime !== null &&
-    latestTime > state.BUY.divergenceCandleTime
-  ) {
-    if (status.contracting) state.BUY.contracted = true;
+function calculateOBVSeries(candles) {
+  if (!candles || candles.length < 2) return [];
+
+  const obv = [];
+  let currentOBV = 0;
+
+  for (let i = 0; i < candles.length; i++) {
+    if (i === 0) {
+      obv.push(currentOBV);
+      continue;
+    }
+
+    const close = Number(candles[i].close);
+    const previousClose = Number(candles[i - 1].close);
+    const volume = Number(candles[i].volume);
 
     if (
-      !state.BUY.expansionConfirmed &&
-      state.BUY.contracted &&
-      status.expansionUp
+      !Number.isFinite(close) ||
+      !Number.isFinite(previousClose) ||
+      !Number.isFinite(volume)
     ) {
-      state.BUY.expansionConfirmed = true;
-      state.BUY.expansionCandleTime = latestTime;
-      state.BUY.expansionClosedCandleCount = 0;
-    } else if (
-      state.BUY.expansionConfirmed &&
-      state.BUY.expansionCandleTime !== null &&
-      latestTime > state.BUY.expansionCandleTime
-    ) {
-      state.BUY.expansionClosedCandleCount =
-        Math.floor(
-          (latestTime - state.BUY.expansionCandleTime) /
-          (5 * 60 * 1000)
-        );
+      obv.push(currentOBV);
+      continue;
     }
+
+    if (close > previousClose) {
+      currentOBV += volume;
+    } else if (close < previousClose) {
+      currentOBV -= volume;
+    }
+
+    obv.push(currentOBV);
   }
 
+  return obv;
+}
+
+function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
   if (
-    state.SELL &&
-    state.SELL.divergenceCandleTime !== null &&
-    latestTime > state.SELL.divergenceCandleTime
+    !candles ||
+    candles.length < OBV_DISTANCE_LOOKBACK + OBV_EMA_LENGTH + OBV_CONFIRMATION_CANDLES + 2
   ) {
-    if (status.contracting) state.SELL.contracted = true;
-
-    if (
-      !state.SELL.expansionConfirmed &&
-      state.SELL.contracted &&
-      status.expansionDown
-    ) {
-      state.SELL.expansionConfirmed = true;
-      state.SELL.expansionCandleTime = latestTime;
-      state.SELL.expansionClosedCandleCount = 0;
-    } else if (
-      state.SELL.expansionConfirmed &&
-      state.SELL.expansionCandleTime !== null &&
-      latestTime > state.SELL.expansionCandleTime
-    ) {
-      state.SELL.expansionClosedCandleCount =
-        Math.floor(
-          (latestTime - state.SELL.expansionCandleTime) /
-          (5 * 60 * 1000)
-        );
-    }
+    return false;
   }
 
-  return {
-    buyExpansion: Boolean(state.BUY?.expansionConfirmed),
-    sellExpansion: Boolean(state.SELL?.expansionConfirmed),
-    buyDelayComplete:
-      Boolean(state.BUY?.expansionConfirmed) &&
-      (state.BUY?.expansionClosedCandleCount || 0) >=
-        ATR_EXPANSION_ENTRY_DELAY_CANDLES,
-    sellDelayComplete:
-      Boolean(state.SELL?.expansionConfirmed) &&
-      (state.SELL?.expansionClosedCandleCount || 0) >=
-        ATR_EXPANSION_ENTRY_DELAY_CANDLES,
-    contracting: status.contracting
-  };
+  const obvSeries = calculateOBVSeries(candles);
+  if (obvSeries.length !== candles.length) return false;
+
+  const obvCandles = candles.map((candle, index) => ({
+    ...candle,
+    close: obvSeries[index]
+  }));
+
+  const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
+  if (obvEMA.length !== candles.length) return false;
+
+  const divergenceIndex = candles.findIndex(
+    candle => candle.time === divergenceCandleTime
+  );
+
+  if (divergenceIndex < 0) return false;
+
+  const firstEligibleIndex = divergenceIndex + 1;
+  const lastIndex = candles.length - 1;
+
+  for (
+    let start = firstEligibleIndex;
+    start <= lastIndex - OBV_CONFIRMATION_CANDLES + 1;
+    start++
+  ) {
+    const end = start + OBV_CONFIRMATION_CANDLES - 1;
+    if (end > lastIndex) break;
+
+    // The first confirmation candle must be the actual EMA cross
+    // in the trade direction.
+    const previousIndex = start - 1;
+    if (previousIndex < 0) continue;
+
+    const previousOBV = obvSeries[previousIndex];
+    const previousEMA = obvEMA[previousIndex];
+    const firstOBV = obvSeries[start];
+    const firstEMA = obvEMA[start];
+
+    const crossed =
+      direction === "BUY"
+        ? previousOBV <= previousEMA && firstOBV > firstEMA
+        : previousOBV >= previousEMA && firstOBV < firstEMA;
+
+    if (!crossed) continue;
+
+    let confirmed = true;
+
+    for (let i = start; i <= end; i++) {
+      const rangeStart = Math.max(0, i - OBV_DISTANCE_LOOKBACK + 1);
+      const range = obvSeries.slice(rangeStart, i + 1);
+
+      if (range.length < OBV_DISTANCE_LOOKBACK) {
+        confirmed = false;
+        break;
+      }
+
+      const highestOBV = Math.max(...range);
+      const lowestOBV = Math.min(...range);
+      const obvRange = highestOBV - lowestOBV;
+
+      if (!Number.isFinite(obvRange) || obvRange <= 0) {
+        confirmed = false;
+        break;
+      }
+
+      const distance = Math.abs(obvSeries[i] - obvEMA[i]);
+      const minimumDistance = obvRange * OBV_MIN_DISTANCE_PERCENT;
+
+      const correctSide =
+        direction === "BUY"
+          ? obvSeries[i] > obvEMA[i]
+          : obvSeries[i] < obvEMA[i];
+
+      if (
+        !correctSide ||
+        !Number.isFinite(distance) ||
+        distance < minimumDistance
+      ) {
+        confirmed = false;
+        break;
+      }
+    }
+
+    if (confirmed) return true;
+  }
+
+  return false;
 }
 
 function rememberFreshDeltaDivergence(symbol, divergence) {
   if (!deltaDivergenceState[symbol]) {
     deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   }
-  if (!atrBandState[symbol]) {
-    atrBandState[symbol] = { BUY: null, SELL: null };
-  }
-
   if (divergence.bullish) {
     const existing = deltaDivergenceState[symbol].BUY;
     deltaDivergenceState[symbol].BUY = {
       candleTime: divergence.bullishCandleTime,
       detectedAt: existing?.candleTime === divergence.bullishCandleTime ? existing.detectedAt : Date.now()
     };
-    if (atrBandState[symbol].BUY?.divergenceCandleTime !== divergence.bullishCandleTime) {
-      atrBandState[symbol].BUY = {
-        divergenceCandleTime: divergence.bullishCandleTime,
-        contracted: false,
-        expansionConfirmed: false,
-        expansionCandleTime: null,
-        expansionClosedCandleCount: 0
-      };
-    }
   }
 
   if (divergence.bearish) {
@@ -1293,15 +1321,6 @@ function rememberFreshDeltaDivergence(symbol, divergence) {
       candleTime: divergence.bearishCandleTime,
       detectedAt: existing?.candleTime === divergence.bearishCandleTime ? existing.detectedAt : Date.now()
     };
-    if (atrBandState[symbol].SELL?.divergenceCandleTime !== divergence.bearishCandleTime) {
-      atrBandState[symbol].SELL = {
-        divergenceCandleTime: divergence.bearishCandleTime,
-        contracted: false,
-        expansionConfirmed: false,
-        expansionCandleTime: null,
-        expansionClosedCandleCount: 0
-      };
-    }
   }
 }
 
@@ -1714,7 +1733,7 @@ function getTradeProgressStructure(candles, direction, lookback = 6) {
 
 function getTradeProgressBands(candles, direction) {
   const bands = calculate5MATRBands(candles);
-  if (!bands) return { aligned: false, expanding: false, status: "UNAVAILABLE", text: "N/A" };
+  if (!bands) return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
 
   const latest = candles[candles.length - 1];
   const close = Number(latest.close);
@@ -1725,7 +1744,6 @@ function getTradeProgressBands(candles, direction) {
     const aligned = aboveMid && close >= bands.current.lower;
     return {
       aligned,
-      expanding: bands.expansionUp,
       status: close > bands.current.upper ? "ABOVE UPPER" : (aboveMid ? "ABOVE MID" : "BELOW MID"),
       text: close > bands.current.upper ? "above upper band" : (aboveMid ? "above EMA mid" : "below EMA mid"),
       width: bands.current.width,
@@ -1736,7 +1754,6 @@ function getTradeProgressBands(candles, direction) {
   const aligned = belowMid && close <= bands.current.upper;
   return {
     aligned,
-    expanding: bands.expansionDown,
     status: close < bands.current.lower ? "BELOW LOWER" : (belowMid ? "BELOW MID" : "ABOVE MID"),
     text: close < bands.current.lower ? "below lower band" : (belowMid ? "below EMA mid" : "above EMA mid"),
     width: bands.current.width,
@@ -2253,7 +2270,6 @@ let symbolActive = {};
 // Tracks a fresh 5M delta-divergence setup for each symbol/direction.
 // A divergence must be detected after activation before an entry can occur.
 let deltaDivergenceState = {};
-let atrBandState = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // =====================================================
@@ -2306,7 +2322,6 @@ async function monitorPriceActivations() {
         priceActivated[symbol] = true;
         symbolActive[symbol] = true;
         deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  atrBandState[symbol] = { BUY: null, SELL: null };
 
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
@@ -2482,14 +2497,11 @@ setInterval(async () => {
 // 1H STC = TREND
 // 5M Delta divergence = PULLBACK-ENDING SETUP
 // 5M ATR bands = contraction followed by directional expansion
-// 30-minute delay = 6 CLOSED 5M candles after directional expansion
 // 5M Delta direction + SMA(10) + strength = FINAL ENTRY
 //
 // A coin can be activated during a pullback without entering immediately.
 // A fresh 5M divergence must first be detected after activation.
-// After divergence, the ATR bands must contract and then expand in the
-// trade direction. Once expansion is confirmed, wait 6 CLOSED 5M candles.
-// No new divergence is required during or after this delay.
+// Delta confirmation then determines whether an entry is allowed.
 //
 // Only CLOSED 5M candles are used.
 // =====================================================
@@ -2522,10 +2534,9 @@ const deltaDivergence5 = detect5MDeltaDivergence(
 );
 rememberFreshDeltaDivergence(symbol, deltaDivergence5);
 
-// After divergence, require 5M ATR-band contraction followed by
-// directional volatility expansion, then wait 6 CLOSED 5M candles
-// before the existing delta entry confirmation.
-const atrBand5 = update5MATRBandState(symbol, closedCandles5);
+// After divergence, require 5M OBV to cross its 50 EMA and hold
+// on the correct side for 3 consecutive CLOSED 5M candles with
+// meaningful separation before the Delta entry confirmation.
 
 // Absorption remains a 15M informational warning.
 // It is deliberately NOT changed to the 5M entry timeframe.
@@ -2552,7 +2563,16 @@ let direction = null;
 
 if (
   trendCycle === "BULL" &&
-  atrBand5.buyDelayComplete &&
+  hasFreshDeltaDivergence(
+    symbol,
+    "BUY",
+    closedCandles5[closedCandles5.length - 1]?.time
+  ) &&
+  calculateOBVConfirmation(
+    closedCandles5,
+    "BUY",
+    deltaDivergenceState[symbol]?.BUY?.candleTime
+  ) &&
   trDelta5.cumDelta > 0 &&
   trDelta5.cumDelta > trDelta5.deltaMA &&
   trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
@@ -2569,7 +2589,16 @@ if (
 
 if (
   trendCycle === "BEAR" &&
-  atrBand5.sellDelayComplete &&
+  hasFreshDeltaDivergence(
+    symbol,
+    "SELL",
+    closedCandles5[closedCandles5.length - 1]?.time
+  ) &&
+  calculateOBVConfirmation(
+    closedCandles5,
+    "SELL",
+    deltaDivergenceState[symbol]?.SELL?.candleTime
+  ) &&
   trDelta5.cumDelta < 0 &&
   trDelta5.cumDelta < trDelta5.deltaMA &&
   trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
@@ -2609,9 +2638,6 @@ if (
         // another entry before a new divergence is detected.
         if (deltaDivergenceState[symbol]) {
           deltaDivergenceState[symbol][direction] = null;
-        }
-        if (atrBandState[symbol]) {
-          atrBandState[symbol][direction] = null;
         }
 
         const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
@@ -5318,7 +5344,6 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
   }
   symbolActive[symbol] = false;
   deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  atrBandState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
 });
 
@@ -5331,7 +5356,6 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
   }
   symbolActive[symbol] = true;
   deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  atrBandState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M delta divergence is required before entry.`);
 });
 
@@ -5340,7 +5364,6 @@ bot.onText(/\/deactivateall/, async (msg) => {
   COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
     deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  atrBandState[symbol] = { BUY: null, SELL: null };
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
