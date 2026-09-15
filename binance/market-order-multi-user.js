@@ -579,7 +579,7 @@ const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
 // from the EMA on each of those 3 candles.
 const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 3;
-const OBV_MIN_DISTANCE_PERCENT = 0.20;
+const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
