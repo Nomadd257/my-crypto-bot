@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.8;
+const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -581,6 +581,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 3;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
@@ -1204,6 +1205,59 @@ function calculateOBVSeries(candles) {
   }
 
   return obv;
+}
+
+function hasEntryVolumeImbalance(candles, direction) {
+  if (!candles || candles.length < 3) return false;
+
+  // Measure directional volume across the latest 3 CLOSED 5M candles,
+  // while requiring the latest closed candle itself to agree with the entry.
+  // This uses the same candle-direction volume classification as the bot's
+  // existing Volume Imbalance Report.
+  const recentCandles = candles.slice(-3);
+  let buyVol = 0;
+  let sellVol = 0;
+
+  for (const candle of recentCandles) {
+    const open = Number(candle.open);
+    const close = Number(candle.close);
+    const volume = Number(candle.volume);
+
+    if (
+      !Number.isFinite(open) ||
+      !Number.isFinite(close) ||
+      !Number.isFinite(volume) ||
+      volume <= 0
+    ) {
+      return false;
+    }
+
+    if (close > open) {
+      buyVol += volume;
+    } else if (close < open) {
+      sellVol += volume;
+    }
+  }
+
+  const totalVol = buyVol + sellVol;
+  if (totalVol <= 0) return false;
+
+  const buyPct = (buyVol / totalVol) * 100;
+  const sellPct = (sellVol / totalVol) * 100;
+
+  const latest = recentCandles[recentCandles.length - 1];
+  const latestBullish = Number(latest.close) > Number(latest.open);
+  const latestBearish = Number(latest.close) < Number(latest.open);
+
+  if (direction === "BUY") {
+    return latestBullish && buyPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+  }
+
+  if (direction === "SELL") {
+    return latestBearish && sellPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+  }
+
+  return false;
 }
 
 function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
@@ -2573,6 +2627,7 @@ if (
     "BUY",
     deltaDivergenceState[symbol]?.BUY?.candleTime
   ) &&
+  hasEntryVolumeImbalance(closedCandles5, "BUY") &&
   trDelta5.cumDelta > 0 &&
   trDelta5.cumDelta > trDelta5.deltaMA &&
   trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
@@ -2599,6 +2654,7 @@ if (
     "SELL",
     deltaDivergenceState[symbol]?.SELL?.candleTime
   ) &&
+  hasEntryVolumeImbalance(closedCandles5, "SELL") &&
   trDelta5.cumDelta < 0 &&
   trDelta5.cumDelta < trDelta5.deltaMA &&
   trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
