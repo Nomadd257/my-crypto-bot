@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.5;
+const SL_PCT = 1.8;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -120,7 +120,7 @@ function getTradeHistoryDate() {
     timeZone: "Africa/Lagos",
     year: "numeric",
     month: "2-digit",
-    day: "2-digit"
+    day: "2-digit",
   }).format(new Date());
 }
 
@@ -132,7 +132,7 @@ function getTradeHistoryDate() {
 // session. This is separate from /activate and /deactivate.
 // =====================================================
 let priceActivationLevels = {}; // { BTCUSDT: 105000 }
-let priceActivated = {};         // { BTCUSDT: true }
+let priceActivated = {}; // { BTCUSDT: true }
 let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 
 // --- STC cycle trackers ---
@@ -328,7 +328,7 @@ async function fetchMajorNewsEvents() {
     newsCalendarDate = today;
 
     // Remove stale alert state for events no longer present.
-    const validIds = new Set(normalized.map(event => event.id));
+    const validIds = new Set(normalized.map((event) => event.id));
     for (const key of Object.keys(newsAlertState)) {
       if (!validIds.has(key)) delete newsAlertState[key];
     }
@@ -568,18 +568,13 @@ const TR_DELTA_MA_LENGTH = 10;
 const DELTA_STRENGTH_THRESHOLD = 0.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
-// 5M price/delta divergence setup.
-// Divergence is a setup condition; the Delta Strength threshold remains the final entry confirmation.
-const DELTA_DIVERGENCE_WINDOW = 8;
-const DELTA_DIVERGENCE_MAX_AGE_CANDLES = 6;
-
-// 5M OBV confirmation after a fresh divergence.
-// OBV must cross its 50 EMA and remain on the correct side for
-// 3 consecutive CLOSED 5M candles, with meaningful separation
-// from the EMA on each of those 3 candles.
+// 5M OBV entry confirmation.
+// The entry sequence starts with the OBV crossing its 50 EMA, then
+// holding on the correct side for 2 consecutive CLOSED 5M candles,
+// with meaningful separation from the EMA on each candle.
 const OBV_EMA_LENGTH = 50;
-const OBV_CONFIRMATION_CANDLES = 3;
-const OBV_MIN_DISTANCE_PERCENT = 0.10;
+const OBV_CONFIRMATION_CANDLES = 2;
+const OBV_MIN_DISTANCE_PERCENT = 0.1;
 const OBV_DISTANCE_LOOKBACK = 20;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
 
@@ -589,13 +584,11 @@ const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
 
-
 // ------------------------------------------------------
 // EMA SERIES
 // ------------------------------------------------------
 
 function calculateEMASeries(candles, period) {
-
   if (!candles || candles.length < period) {
     return [];
   }
@@ -605,7 +598,6 @@ function calculateEMASeries(candles, period) {
   let sum = 0;
 
   for (let i = 0; i < period; i++) {
-
     const close = Number(candles[i].close);
 
     if (!Number.isFinite(close)) {
@@ -618,7 +610,6 @@ function calculateEMASeries(candles, period) {
   let ema = sum / period;
 
   for (let i = 0; i < candles.length; i++) {
-
     const close = Number(candles[i].close);
 
     if (!Number.isFinite(close)) {
@@ -636,12 +627,9 @@ function calculateEMASeries(candles, period) {
       continue;
     }
 
-    const multiplier =
-      2 / (period + 1);
+    const multiplier = 2 / (period + 1);
 
-    ema =
-      (close - ema) * multiplier +
-      ema;
+    ema = (close - ema) * multiplier + ema;
 
     result.push(ema);
   }
@@ -649,13 +637,11 @@ function calculateEMASeries(candles, period) {
   return result;
 }
 
-
 // ------------------------------------------------------
 // WILDER ATR SERIES
 // ------------------------------------------------------
 
 function calculateATRSeries(candles, period) {
-
   if (!candles || candles.length <= period) {
     return [];
   }
@@ -665,53 +651,33 @@ function calculateATRSeries(candles, period) {
   const trueRanges = new Array(candles.length).fill(null);
 
   for (let i = 0; i < candles.length; i++) {
-
     const high = Number(candles[i].high);
     const low = Number(candles[i].low);
 
-    if (
-      !Number.isFinite(high) ||
-      !Number.isFinite(low)
-    ) {
+    if (!Number.isFinite(high) || !Number.isFinite(low)) {
       return [];
     }
 
     if (i === 0) {
-
-      trueRanges[i] =
-        high - low;
+      trueRanges[i] = high - low;
 
       continue;
     }
 
-    const previousClose =
-      Number(candles[i - 1].close);
+    const previousClose = Number(candles[i - 1].close);
 
     if (!Number.isFinite(previousClose)) {
       return [];
     }
 
-    const range1 =
-      high - low;
+    const range1 = high - low;
 
-    const range2 =
-      Math.abs(
-        high - previousClose
-      );
+    const range2 = Math.abs(high - previousClose);
 
-    const range3 =
-      Math.abs(
-        low - previousClose
-      );
+    const range3 = Math.abs(low - previousClose);
 
-    trueRanges[i] =
-      Math.max(
-        range1,
-        range2,
-        range3
-      );
+    trueRanges[i] = Math.max(range1, range2, range3);
   }
-
 
   // -----------------------------------------------
   // Initial Wilder ATR
@@ -720,12 +686,7 @@ function calculateATRSeries(candles, period) {
 
   let atr = 0;
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
+  for (let i = 1; i <= period; i++) {
     atr += trueRanges[i];
   }
 
@@ -733,22 +694,12 @@ function calculateATRSeries(candles, period) {
 
   result[period] = atr;
 
-
   // -----------------------------------------------
   // Wilder smoothing
   // -----------------------------------------------
 
-  for (
-    let i = period + 1;
-    i < candles.length;
-    i++
-  ) {
-
-    atr =
-      (
-        atr * (period - 1) +
-        trueRanges[i]
-      ) / period;
+  for (let i = period + 1; i < candles.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
 
     result[i] = atr;
   }
@@ -773,44 +724,18 @@ function calculateATRSeries(candles, period) {
 //
 // ======================================================
 
-function calculateTrendResetCumulativeDelta(
-  candles
-) {
-
-  if (
-    !candles ||
-    candles.length <
-    Math.max(
-      TR_DELTA_EMA_LENGTH,
-      TR_DELTA_ATR_LENGTH
-    ) + TR_DELTA_MA_LENGTH
-  ) {
-
+function calculateTrendResetCumulativeDelta(candles) {
+  if (!candles || candles.length < Math.max(TR_DELTA_EMA_LENGTH, TR_DELTA_ATR_LENGTH) + TR_DELTA_MA_LENGTH) {
     return null;
   }
 
+  const emaSeries = calculateEMASeries(candles, TR_DELTA_EMA_LENGTH);
 
-  const emaSeries =
-    calculateEMASeries(
-      candles,
-      TR_DELTA_EMA_LENGTH
-    );
+  const atrSeries = calculateATRSeries(candles, TR_DELTA_ATR_LENGTH);
 
-  const atrSeries =
-    calculateATRSeries(
-      candles,
-      TR_DELTA_ATR_LENGTH
-    );
-
-
-  if (
-    !emaSeries.length ||
-    !atrSeries.length
-  ) {
-
+  if (!emaSeries.length || !atrSeries.length) {
     return null;
   }
-
 
   let trendState = 0;
 
@@ -818,135 +743,70 @@ function calculateTrendResetCumulativeDelta(
 
   const deltaSeries = [];
 
+  for (let i = 0; i < candles.length; i++) {
+    const close = Number(candles[i].close);
 
-  for (
-    let i = 0;
-    i < candles.length;
-    i++
-  ) {
+    const open = Number(candles[i].open);
 
-    const close =
-      Number(candles[i].close);
+    const volume = Number(candles[i].volume);
 
-    const open =
-      Number(candles[i].open);
-
-    const volume =
-      Number(candles[i].volume);
-
-    if (
-      !Number.isFinite(close) ||
-      !Number.isFinite(open) ||
-      !Number.isFinite(volume)
-    ) {
-
+    if (!Number.isFinite(close) || !Number.isFinite(open) || !Number.isFinite(volume)) {
       continue;
     }
-
 
     // ---------------------------------------------
     // ChartPrime barDelta
     // ---------------------------------------------
 
-    const barDelta =
-      close > open
-        ? volume
-        : -volume;
+    const barDelta = close > open ? volume : -volume;
 
+    let newTrendState = trendState;
 
-    let newTrendState =
-      trendState;
+    const ema = emaSeries[i];
 
-
-    const ema =
-      emaSeries[i];
-
-    const atr =
-      atrSeries[i];
-
+    const atr = atrSeries[i];
 
     // ---------------------------------------------
     // ChartPrime trend calculation
     // ---------------------------------------------
 
-    if (
-      ema !== null &&
-      atr !== null
-    ) {
+    if (ema !== null && atr !== null) {
+      const upperBand = ema + atr * TR_DELTA_ATR_MULTIPLIER;
 
-      const upperBand =
-        ema +
-        atr *
-        TR_DELTA_ATR_MULTIPLIER;
+      const lowerBand = ema - atr * TR_DELTA_ATR_MULTIPLIER;
 
-      const lowerBand =
-        ema -
-        atr *
-        TR_DELTA_ATR_MULTIPLIER;
-
-
-      if (
-        close > upperBand
-      ) {
-
+      if (close > upperBand) {
         newTrendState = 1;
-
-      }
-
-      else if (
-        close < lowerBand
-      ) {
-
+      } else if (close < lowerBand) {
         newTrendState = -1;
-
       }
     }
 
+    const trendChanged = newTrendState !== trendState;
 
-    const trendChanged =
-      newTrendState !== trendState;
-
-
-    trendState =
-      newTrendState;
-
+    trendState = newTrendState;
 
     // ---------------------------------------------
     // ChartPrime cumulative delta reset
     // ---------------------------------------------
 
     if (trendChanged) {
-
-      cumDelta =
-        barDelta;
-
+      cumDelta = barDelta;
+    } else {
+      cumDelta += barDelta;
     }
-
-    else {
-
-      cumDelta +=
-        barDelta;
-
-    }
-
 
     deltaSeries.push({
       index: i,
       cumDelta,
       trendState,
-      trendChanged
+      trendChanged,
     });
   }
 
-
-  if (
-    deltaSeries.length <
-    TR_DELTA_MA_LENGTH
-  ) {
-
+  if (deltaSeries.length < TR_DELTA_MA_LENGTH) {
     return null;
   }
-
 
   // -----------------------------------------------
   // SMA(10) of cumulative delta
@@ -955,23 +815,9 @@ function calculateTrendResetCumulativeDelta(
   // ta.sma(cumDelta, 10)
   // -----------------------------------------------
 
-  const recentDeltaValues =
-    deltaSeries
-      .slice(
-        -TR_DELTA_MA_LENGTH
-      )
-      .map(
-        item => item.cumDelta
-      );
+  const recentDeltaValues = deltaSeries.slice(-TR_DELTA_MA_LENGTH).map((item) => item.cumDelta);
 
-
-  const deltaMA =
-    recentDeltaValues.reduce(
-      (sum, value) =>
-        sum + value,
-      0
-    ) /
-    TR_DELTA_MA_LENGTH;
+  const deltaMA = recentDeltaValues.reduce((sum, value) => sum + value, 0) / TR_DELTA_MA_LENGTH;
 
   // -----------------------------------------------------
   // Adaptive Delta strength
@@ -980,157 +826,47 @@ function calculateTrendResetCumulativeDelta(
   // This prevents weak readings that are only slightly
   // above/below the MA from qualifying as entries.
   // -----------------------------------------------------
-  const strengthWindow =
-    deltaSeries.slice(
-      -Math.min(DELTA_STRENGTH_LOOKBACK, deltaSeries.length)
-    );
+  const strengthWindow = deltaSeries.slice(-Math.min(DELTA_STRENGTH_LOOKBACK, deltaSeries.length));
 
   const recentBarDeltaMoves = [];
 
   for (let i = 1; i < strengthWindow.length; i++) {
-    recentBarDeltaMoves.push(
-      Math.abs(
-        strengthWindow[i].cumDelta -
-        strengthWindow[i - 1].cumDelta
-      )
-    );
+    recentBarDeltaMoves.push(Math.abs(strengthWindow[i].cumDelta - strengthWindow[i - 1].cumDelta));
   }
 
-  const avgAbsBarDelta =
-    recentBarDeltaMoves.length
-      ? recentBarDeltaMoves.reduce(
-          (sum, value) => sum + value,
-          0
-        ) / recentBarDeltaMoves.length
-      : 0;
+  const avgAbsBarDelta = recentBarDeltaMoves.length
+    ? recentBarDeltaMoves.reduce((sum, value) => sum + value, 0) / recentBarDeltaMoves.length
+    : 0;
 
-
-  const latest =
-    deltaSeries[
-      deltaSeries.length - 1
-    ];
-
+  const latest = deltaSeries[deltaSeries.length - 1];
 
   return {
-
-    cumDelta:
-      latest.cumDelta,
+    cumDelta: latest.cumDelta,
 
     deltaMA,
 
-    trendState:
-      latest.trendState,
+    trendState: latest.trendState,
 
-    trendChanged:
-      latest.trendChanged,
+    trendChanged: latest.trendChanged,
 
-    deltaDistance:
-      latest.cumDelta - deltaMA,
+    deltaDistance: latest.cumDelta - deltaMA,
 
-    deltaStrength:
-      avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0,
+    deltaStrength: avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0,
 
     avgAbsBarDelta,
 
-    // Full closed-candle delta series is returned so the scanner can compare
-    // price swing points against delta swing points for divergence.
+    // Full closed-candle delta series is retained for the delta calculation.
     deltaSeries,
 
     bullish:
       latest.cumDelta > 0 &&
       latest.cumDelta > deltaMA &&
-      (avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0) >= DELTA_STRENGTH_THRESHOLD,
+      (avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0) >= DELTA_STRENGTH_THRESHOLD,
 
     bearish:
       latest.cumDelta < 0 &&
       latest.cumDelta < deltaMA &&
-      (avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0) <= -DELTA_STRENGTH_THRESHOLD
-  };
-}
-
-// =====================================================
-// 5M PRICE / DELTA DIVERGENCE
-// =====================================================
-//
-// Bullish divergence:
-//   Recent price swing low  < previous price swing low
-//   AND
-//   Recent cumulative-delta low > previous cumulative-delta low
-//
-// Bearish divergence:
-//   Recent price swing high > previous price swing high
-//   AND
-//   Recent cumulative-delta high < previous cumulative-delta high
-//
-// This is a setup condition only. It does NOT place a trade by itself.
-// The scanner still requires the existing 5M Delta direction + SMA(10)
-// + 0.50 strength confirmation.
-// =====================================================
-function detect5MDeltaDivergence(candles, trDelta) {
-  const window = DELTA_DIVERGENCE_WINDOW;
-
-  if (
-    !candles ||
-    !trDelta ||
-    !Array.isArray(trDelta.deltaSeries) ||
-    candles.length < window * 2 ||
-    trDelta.deltaSeries.length !== candles.length
-  ) {
-    return { bullish: false, bearish: false, bullishCandleTime: null, bearishCandleTime: null };
-  }
-
-  const previousStart = candles.length - window * 2;
-  const previousEnd = candles.length - window;
-  const recentStart = previousEnd;
-  const recentEnd = candles.length;
-
-  let previousLowIndex = previousStart;
-  let recentLowIndex = recentStart;
-  let previousHighIndex = previousStart;
-  let recentHighIndex = recentStart;
-
-  for (let i = previousStart + 1; i < previousEnd; i++) {
-    if (candles[i].low < candles[previousLowIndex].low) previousLowIndex = i;
-    if (candles[i].high > candles[previousHighIndex].high) previousHighIndex = i;
-  }
-
-  for (let i = recentStart + 1; i < recentEnd; i++) {
-    if (candles[i].low < candles[recentLowIndex].low) recentLowIndex = i;
-    if (candles[i].high > candles[recentHighIndex].high) recentHighIndex = i;
-  }
-
-  const previousLowDelta = trDelta.deltaSeries[previousLowIndex]?.cumDelta;
-  const recentLowDelta = trDelta.deltaSeries[recentLowIndex]?.cumDelta;
-  const previousHighDelta = trDelta.deltaSeries[previousHighIndex]?.cumDelta;
-  const recentHighDelta = trDelta.deltaSeries[recentHighIndex]?.cumDelta;
-
-  const bullish =
-    candles[recentLowIndex].low < candles[previousLowIndex].low &&
-    Number.isFinite(previousLowDelta) &&
-    Number.isFinite(recentLowDelta) &&
-    recentLowDelta > previousLowDelta;
-
-  const bearish =
-    candles[recentHighIndex].high > candles[previousHighIndex].high &&
-    Number.isFinite(previousHighDelta) &&
-    Number.isFinite(recentHighDelta) &&
-    recentHighDelta < previousHighDelta;
-
-  return {
-    bullish,
-    bearish,
-    bullishCandleTime: bullish ? candles[recentLowIndex].time : null,
-    bearishCandleTime: bearish ? candles[recentHighIndex].time : null,
-    previousLowDelta,
-    recentLowDelta,
-    previousHighDelta,
-    recentHighDelta
+      (avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0) <= -DELTA_STRENGTH_THRESHOLD,
   };
 }
 
@@ -1152,7 +888,7 @@ function calculate5MATRBands(candles) {
       mid: ema,
       upper: ema + atr * ATR_BAND_MULTIPLIER,
       lower: ema - atr * ATR_BAND_MULTIPLIER,
-      width: atr * ATR_BAND_MULTIPLIER * 2
+      width: atr * ATR_BAND_MULTIPLIER * 2,
     });
   }
 
@@ -1163,12 +899,9 @@ function calculate5MATRBands(candles) {
 
   return {
     current,
-    previous
+    previous,
   };
 }
-
-
-
 
 function calculateOBVSeries(candles) {
   if (!candles || candles.length < 2) return [];
@@ -1186,11 +919,7 @@ function calculateOBVSeries(candles) {
     const previousClose = Number(candles[i - 1].close);
     const volume = Number(candles[i].volume);
 
-    if (
-      !Number.isFinite(close) ||
-      !Number.isFinite(previousClose) ||
-      !Number.isFinite(volume)
-    ) {
+    if (!Number.isFinite(close) || !Number.isFinite(previousClose) || !Number.isFinite(volume)) {
       obv.push(currentOBV);
       continue;
     }
@@ -1208,13 +937,13 @@ function calculateOBVSeries(candles) {
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
-  if (!candles || candles.length < 3) return false;
+  if (!candles || candles.length < 2) return false;
 
-  // Measure directional volume across the latest 3 CLOSED 5M candles,
+  // Measure directional volume across the latest 2 CLOSED 5M candles,
   // while requiring the latest closed candle itself to agree with the entry.
   // This uses the same candle-direction volume classification as the bot's
   // existing Volume Imbalance Report.
-  const recentCandles = candles.slice(-3);
+  const recentCandles = candles.slice(-2);
   let buyVol = 0;
   let sellVol = 0;
 
@@ -1223,12 +952,7 @@ function hasEntryVolumeImbalance(candles, direction) {
     const close = Number(candle.close);
     const volume = Number(candle.volume);
 
-    if (
-      !Number.isFinite(open) ||
-      !Number.isFinite(close) ||
-      !Number.isFinite(volume) ||
-      volume <= 0
-    ) {
+    if (!Number.isFinite(open) || !Number.isFinite(close) || !Number.isFinite(volume) || volume <= 0) {
       return false;
     }
 
@@ -1260,11 +984,8 @@ function hasEntryVolumeImbalance(candles, direction) {
   return false;
 }
 
-function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
-  if (
-    !candles ||
-    candles.length < OBV_DISTANCE_LOOKBACK + OBV_EMA_LENGTH + OBV_CONFIRMATION_CANDLES + 2
-  ) {
+function calculateOBVConfirmation(candles, direction) {
+  if (!candles || candles.length < OBV_DISTANCE_LOOKBACK + OBV_EMA_LENGTH + OBV_CONFIRMATION_CANDLES + 2) {
     return false;
   }
 
@@ -1273,38 +994,31 @@ function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
 
   const obvCandles = candles.map((candle, index) => ({
     ...candle,
-    close: obvSeries[index]
+    close: obvSeries[index],
   }));
 
   const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
   if (obvEMA.length !== candles.length) return false;
 
-  const divergenceIndex = candles.findIndex(
-    candle => candle.time === divergenceCandleTime
-  );
-
-  if (divergenceIndex < 0) return false;
-
-  const firstEligibleIndex = divergenceIndex + 1;
   const lastIndex = candles.length - 1;
 
-  for (
-    let start = firstEligibleIndex;
-    start <= lastIndex - OBV_CONFIRMATION_CANDLES + 1;
-    start++
-  ) {
-    const end = start + OBV_CONFIRMATION_CANDLES - 1;
-    if (end > lastIndex) break;
-
-    // The first confirmation candle must be the actual EMA cross
-    // in the trade direction.
+  // The sequence begins exactly when OBV crosses its 50 EMA.
+  // The crossing candle must be the first confirmation candle, and
+  // the OBV must remain on the correct side for the next candle.
+  for (let start = OBV_EMA_LENGTH; start <= lastIndex - OBV_CONFIRMATION_CANDLES + 1; start++) {
     const previousIndex = start - 1;
-    if (previousIndex < 0) continue;
-
     const previousOBV = obvSeries[previousIndex];
     const previousEMA = obvEMA[previousIndex];
     const firstOBV = obvSeries[start];
     const firstEMA = obvEMA[start];
+
+    if (
+      !Number.isFinite(previousOBV) ||
+      !Number.isFinite(previousEMA) ||
+      !Number.isFinite(firstOBV) ||
+      !Number.isFinite(firstEMA)
+    )
+      continue;
 
     const crossed =
       direction === "BUY"
@@ -1313,6 +1027,7 @@ function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
 
     if (!crossed) continue;
 
+    const end = start + OBV_CONFIRMATION_CANDLES - 1;
     let confirmed = true;
 
     for (let i = start; i <= end; i++) {
@@ -1336,68 +1051,23 @@ function calculateOBVConfirmation(candles, direction, divergenceCandleTime) {
       const distance = Math.abs(obvSeries[i] - obvEMA[i]);
       const minimumDistance = obvRange * OBV_MIN_DISTANCE_PERCENT;
 
-      const correctSide =
-        direction === "BUY"
-          ? obvSeries[i] > obvEMA[i]
-          : obvSeries[i] < obvEMA[i];
+      const correctSide = direction === "BUY" ? obvSeries[i] > obvEMA[i] : obvSeries[i] < obvEMA[i];
 
-      if (
-        !correctSide ||
-        !Number.isFinite(distance) ||
-        distance < minimumDistance
-      ) {
+      if (!correctSide || !Number.isFinite(distance) || distance < minimumDistance) {
         confirmed = false;
         break;
       }
     }
 
-    if (confirmed) return true;
+    if (confirmed) {
+      // Only allow the latest closed candle to be part of the active
+      // confirmation sequence. This makes the signal respond to the
+      // most recent completed 5M OBV/EMA cross rather than an old cross.
+      return end === lastIndex;
+    }
   }
 
   return false;
-}
-
-function rememberFreshDeltaDivergence(symbol, divergence) {
-  if (!deltaDivergenceState[symbol]) {
-    deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  }
-  if (divergence.bullish) {
-    const existing = deltaDivergenceState[symbol].BUY;
-    deltaDivergenceState[symbol].BUY = {
-      candleTime: divergence.bullishCandleTime,
-      detectedAt: existing?.candleTime === divergence.bullishCandleTime ? existing.detectedAt : Date.now()
-    };
-  }
-
-  if (divergence.bearish) {
-    const existing = deltaDivergenceState[symbol].SELL;
-    deltaDivergenceState[symbol].SELL = {
-      candleTime: divergence.bearishCandleTime,
-      detectedAt: existing?.candleTime === divergence.bearishCandleTime ? existing.detectedAt : Date.now()
-    };
-  }
-}
-
-function hasFreshDeltaDivergence(symbol, direction, latestCandleTime) {
-  const state = deltaDivergenceState[symbol]?.[direction];
-  if (!state) return false;
-
-  const maxAgeMs =
-    DELTA_DIVERGENCE_MAX_AGE_CANDLES * 5 * 60 * 1000;
-
-  if (Date.now() - state.detectedAt > maxAgeMs) {
-    deltaDivergenceState[symbol][direction] = null;
-    return false;
-  }
-
-  // The divergence candle must be at or before the current closed candle.
-  if (
-    latestCandleTime !== undefined &&
-    state.candleTime !== null &&
-    state.candleTime > latestCandleTime
-  ) return false;
-
-  return true;
 }
 
 // =====================================================
@@ -1438,22 +1108,14 @@ async function checkLiquidity(symbol, direction, estimatedTradeNotional = 0) {
     const bestAsk = Number(asks[0][0]);
     const quoteVolume24h = Number(ticker?.quoteVolume || 0);
 
-    const spreadPct = bestBid > 0
-      ? ((bestAsk - bestBid) / bestBid) * 100
-      : Infinity;
+    const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : Infinity;
 
-    const bidDepth = bids.reduce(
-      (sum, level) => sum + Number(level[0]) * Number(level[1]),
-      0
-    );
-    const askDepth = asks.reduce(
-      (sum, level) => sum + Number(level[0]) * Number(level[1]),
-      0
-    );
+    const bidDepth = bids.reduce((sum, level) => sum + Number(level[0]) * Number(level[1]), 0);
+    const askDepth = asks.reduce((sum, level) => sum + Number(level[0]) * Number(level[1]), 0);
 
     const requiredDepth = Math.max(
       LIQUIDITY_MIN_BOOK_DEPTH_USDT,
-      Number(estimatedTradeNotional || 0) * LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE
+      Number(estimatedTradeNotional || 0) * LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE,
     );
 
     const volumePass = quoteVolume24h >= LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT;
@@ -1498,26 +1160,24 @@ async function sendLiquidityWarning(symbol, direction, liquidity) {
   if (now - lastWarning < ABSORPTION_ALERT_COOLDOWN_MS) return;
   liquidityWarningState[symbol] = now;
 
-  const spreadText = Number.isFinite(liquidity.spreadPct)
-    ? `${liquidity.spreadPct.toFixed(3)}%`
-    : "N/A";
+  const spreadText = Number.isFinite(liquidity.spreadPct) ? `${liquidity.spreadPct.toFixed(3)}%` : "N/A";
   const volumeText = Number.isFinite(liquidity.quoteVolume24h)
     ? `${liquidity.quoteVolume24h.toLocaleString(undefined, { maximumFractionDigits: 0 })} USDT`
     : "N/A";
 
   await sendMessage(
     `🚫 *LIQUIDITY FILTER — TRADE BLOCKED*\n\n` +
-    `🪙 Coin: *${symbol}*\n` +
-    `📈 Direction: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n\n` +
-    `❌ Liquidity: *INSUFFICIENT*\n` +
-    `📊 24H Quote Volume: *${volumeText}*\n` +
-    `↔️ Spread: *${spreadText}*\n` +
-    `📚 Bid Depth (Top 10): *${Number(liquidity.bidDepth || 0).toFixed(0)} USDT*\n` +
-    `📚 Ask Depth (Top 10): *${Number(liquidity.askDepth || 0).toFixed(0)} USDT*\n\n` +
-    `⚠️ Reason: *${liquidity.reason}*\n\n` +
-    `🚫 *No trade was placed.*\n` +
-    `➡️ The scanner will continue to the next active coin.\n` +
-    `💡 You may deactivate *${symbol}* manually if you do not want it considered.`
+      `🪙 Coin: *${symbol}*\n` +
+      `📈 Direction: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n\n` +
+      `❌ Liquidity: *INSUFFICIENT*\n` +
+      `📊 24H Quote Volume: *${volumeText}*\n` +
+      `↔️ Spread: *${spreadText}*\n` +
+      `📚 Bid Depth (Top 10): *${Number(liquidity.bidDepth || 0).toFixed(0)} USDT*\n` +
+      `📚 Ask Depth (Top 10): *${Number(liquidity.askDepth || 0).toFixed(0)} USDT*\n\n` +
+      `⚠️ Reason: *${liquidity.reason}*\n\n` +
+      `🚫 *No trade was placed.*\n` +
+      `➡️ The scanner will continue to the next active coin.\n` +
+      `💡 You may deactivate *${symbol}* manually if you do not want it considered.`,
   );
 }
 
@@ -1600,14 +1260,14 @@ async function checkAndWarnAbsorption(symbol, direction, closedCandles15) {
 
     await sendMessage(
       `⚠️ *ABSORPTION WARNING*\n\n` +
-      `🪙 Coin: *${symbol}*\n` +
-      `📈 Setup: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n` +
-      `🛑 Detected: *${absorption}*\n\n` +
-      `📊 Volume vs 20-bar average: *${effortRatio.toFixed(2)}x*\n` +
-      `📏 Candle body/range: *${bodyPct}%*\n` +
-      `↩️ Opposing wick/range: *${wickPct}%*\n\n` +
-      `⚠️ Price is showing possible absorption of the directional pressure.\n` +
-      `ℹ️ *INFORMATIONAL ONLY — trade will NOT be blocked.*`
+        `🪙 Coin: *${symbol}*\n` +
+        `📈 Setup: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n` +
+        `🛑 Detected: *${absorption}*\n\n` +
+        `📊 Volume vs 20-bar average: *${effortRatio.toFixed(2)}x*\n` +
+        `📏 Candle body/range: *${bodyPct}%*\n` +
+        `↩️ Opposing wick/range: *${wickPct}%*\n\n` +
+        `⚠️ Price is showing possible absorption of the directional pressure.\n` +
+        `ℹ️ *INFORMATIONAL ONLY — trade will NOT be blocked.*`,
     );
 
     return true;
@@ -1707,7 +1367,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           entryPrice: markPrice,
           qty,
           userId,
-          timestamp: Date.now()
+          timestamp: Date.now(),
         });
 
         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
@@ -1754,10 +1414,10 @@ function getTradeProgressStructure(candles, direction, lookback = 6) {
     return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
   }
 
-  const recentHigh = Math.max(...recent.map(c => Number(c.high)));
-  const recentLow = Math.min(...recent.map(c => Number(c.low)));
-  const priorHigh = Math.max(...prior.map(c => Number(c.high)));
-  const priorLow = Math.min(...prior.map(c => Number(c.low)));
+  const recentHigh = Math.max(...recent.map((c) => Number(c.high)));
+  const recentLow = Math.min(...recent.map((c) => Number(c.low)));
+  const priorHigh = Math.max(...prior.map((c) => Number(c.high)));
+  const priorLow = Math.min(...prior.map((c) => Number(c.low)));
   const last = recent[recent.length - 1];
   const prev = recent[recent.length - 2];
 
@@ -1772,16 +1432,16 @@ function getTradeProgressStructure(candles, direction, lookback = 6) {
     const aligned = (hh && hl) || (close > prevClose && recentLow >= priorLow);
     return {
       aligned,
-      status: aligned ? "HH/HL" : (ll || lh ? "LH/LL" : "PULLBACK/FLAT"),
-      text: aligned ? "HH/HL intact" : (ll || lh ? "LH/LL risk" : "pullback/flat")
+      status: aligned ? "HH/HL" : ll || lh ? "LH/LL" : "PULLBACK/FLAT",
+      text: aligned ? "HH/HL intact" : ll || lh ? "LH/LL risk" : "pullback/flat",
     };
   }
 
   const aligned = (lh && ll) || (close < prevClose && recentHigh <= priorHigh);
   return {
     aligned,
-    status: aligned ? "LH/LL" : (hh || hl ? "HH/HL" : "PULLBACK/FLAT"),
-    text: aligned ? "LH/LL intact" : (hh || hl ? "HH/HL risk" : "pullback/flat")
+    status: aligned ? "LH/LL" : hh || hl ? "HH/HL" : "PULLBACK/FLAT",
+    text: aligned ? "LH/LL intact" : hh || hl ? "HH/HL risk" : "pullback/flat",
   };
 }
 
@@ -1798,20 +1458,20 @@ function getTradeProgressBands(candles, direction) {
     const aligned = aboveMid && close >= bands.current.lower;
     return {
       aligned,
-      status: close > bands.current.upper ? "ABOVE UPPER" : (aboveMid ? "ABOVE MID" : "BELOW MID"),
-      text: close > bands.current.upper ? "above upper band" : (aboveMid ? "above EMA mid" : "below EMA mid"),
+      status: close > bands.current.upper ? "ABOVE UPPER" : aboveMid ? "ABOVE MID" : "BELOW MID",
+      text: close > bands.current.upper ? "above upper band" : aboveMid ? "above EMA mid" : "below EMA mid",
       width: bands.current.width,
-      widthChange: bands.current.width - bands.previous.width
+      widthChange: bands.current.width - bands.previous.width,
     };
   }
 
   const aligned = belowMid && close <= bands.current.upper;
   return {
     aligned,
-    status: close < bands.current.lower ? "BELOW LOWER" : (belowMid ? "BELOW MID" : "ABOVE MID"),
-    text: close < bands.current.lower ? "below lower band" : (belowMid ? "below EMA mid" : "above EMA mid"),
+    status: close < bands.current.lower ? "BELOW LOWER" : belowMid ? "BELOW MID" : "ABOVE MID",
+    text: close < bands.current.lower ? "below lower band" : belowMid ? "below EMA mid" : "above EMA mid",
     width: bands.current.width,
-    widthChange: bands.current.width - bands.previous.width
+    widthChange: bands.current.width - bands.previous.width,
   };
 }
 
@@ -1819,13 +1479,15 @@ function getTradeProgressDelta(candles, direction) {
   const trDelta = calculateTrendResetCumulativeDelta(candles);
   if (!trDelta) return { aligned: false, strong: false, status: "UNAVAILABLE", text: "N/A" };
 
-  const aligned = direction === "BUY"
-    ? trDelta.cumDelta > 0 && trDelta.cumDelta > trDelta.deltaMA
-    : trDelta.cumDelta < 0 && trDelta.cumDelta < trDelta.deltaMA;
+  const aligned =
+    direction === "BUY"
+      ? trDelta.cumDelta > 0 && trDelta.cumDelta > trDelta.deltaMA
+      : trDelta.cumDelta < 0 && trDelta.cumDelta < trDelta.deltaMA;
 
-  const strong = direction === "BUY"
-    ? trDelta.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-    : trDelta.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
+  const strong =
+    direction === "BUY"
+      ? trDelta.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+      : trDelta.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
 
   return {
     aligned,
@@ -1834,7 +1496,7 @@ function getTradeProgressDelta(candles, direction) {
     text: aligned ? (strong ? "aligned + strong" : "aligned but weaker") : "against trade",
     cumDelta: trDelta.cumDelta,
     deltaMA: trDelta.deltaMA,
-    deltaStrength: trDelta.deltaStrength
+    deltaStrength: trDelta.deltaStrength,
   };
 }
 
@@ -1843,7 +1505,7 @@ function getTradeProgressStc(candles, direction) {
     return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
   }
 
-  const closes = candles.map(c => Number(c.close));
+  const closes = candles.map((c) => Number(c.close));
   const current = calculateSTC(closes);
   const previous = calculateSTC(closes.slice(0, -1));
   if (!Number.isFinite(current) || !Number.isFinite(previous)) {
@@ -1859,7 +1521,7 @@ function getTradeProgressStc(candles, direction) {
     status: aligned ? (movingWithTrade ? "CONFIRMING" : "WEAKENING") : "AGAINST",
     text: aligned ? (movingWithTrade ? "aligned/rising" : "aligned/falling") : "against trade",
     current,
-    previous
+    previous,
   };
 }
 
@@ -1871,9 +1533,7 @@ function getTradeProgress4H(candles, direction) {
   const trend = calculate4HTrendATR(candles);
   if (!trend) return { aligned: false, quality: null, trend: "N/A", text: "N/A" };
 
-  const aligned = direction === "BUY"
-    ? trend.trendState === 1
-    : trend.trendState === -1;
+  const aligned = direction === "BUY" ? trend.trendState === 1 : trend.trendState === -1;
 
   let quality = null;
   try {
@@ -1884,7 +1544,7 @@ function getTradeProgress4H(candles, direction) {
     aligned,
     quality,
     trend: trend.trend || "NEUTRAL",
-    text: aligned ? (quality?.status || "directional") : "trend conflict"
+    text: aligned ? quality?.status || "directional" : "trend conflict",
   };
 }
 
@@ -1902,13 +1562,15 @@ function getTradeProgressAbsorption(candles, direction) {
   const lowerWick = Math.min(Number(candle.open), Number(candle.close)) - Number(candle.low);
   const highVolume = Number(candle.volume) >= avgVolume * ABSORPTION_VOLUME_MULTIPLE;
 
-  const bearishAbsorption = direction === "BUY" &&
+  const bearishAbsorption =
+    direction === "BUY" &&
     Number(candle.close) > Number(candle.open) &&
     highVolume &&
     body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
     upperWick / range >= ABSORPTION_MIN_WICK_TO_RANGE;
 
-  const bullishAbsorption = direction === "SELL" &&
+  const bullishAbsorption =
+    direction === "SELL" &&
     Number(candle.close) < Number(candle.open) &&
     highVolume &&
     body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
@@ -1916,7 +1578,7 @@ function getTradeProgressAbsorption(candles, direction) {
 
   return {
     warning: bearishAbsorption || bullishAbsorption,
-    text: bearishAbsorption ? "bearish absorption" : (bullishAbsorption ? "bullish absorption" : "none")
+    text: bearishAbsorption ? "bearish absorption" : bullishAbsorption ? "bullish absorption" : "none",
   };
 }
 
@@ -1928,8 +1590,7 @@ function formatTradeProgressState(state) {
 }
 
 function evaluateTradeProgress(direction, data, previous) {
-  const hardConflict = !data.higher.aligned ||
-    data.structure.status === (direction === "BUY" ? "LH/LL" : "HH/HL");
+  const hardConflict = !data.higher.aligned || data.structure.status === (direction === "BUY" ? "LH/LL" : "HH/HL");
 
   const deltaConflict = !data.delta.aligned;
   const stcConflict = !data.stc.aligned;
@@ -1940,7 +1601,7 @@ function evaluateTradeProgress(direction, data, previous) {
     !data.stc.movingWithTrade,
     !data.bands.expanding,
     !data.delta.strong,
-    data.absorption.warning
+    data.absorption.warning,
   ].filter(Boolean).length;
 
   if (hardConflict && (deltaConflict || structureConflict || stcConflict)) {
@@ -1989,7 +1650,7 @@ async function monitorTradeProgress() {
           fetchFuturesKlines(symbol, "4h", 100),
           fetchFuturesKlines(symbol, "1h", 80),
           fetchFuturesKlines(symbol, "15m", 150),
-          fetchFuturesKlines(symbol, "5m", 100)
+          fetchFuturesKlines(symbol, "5m", 100),
         ]);
 
         const closed4H = candles4H?.slice(0, -1) || [];
@@ -2003,13 +1664,11 @@ async function monitorTradeProgress() {
 
         const higher = getTradeProgress4H(closed4H, side);
         const momentum = calculate1HMomentum(closed1H);
-        const momentumAligned = side === "BUY"
-          ? Number(momentum?.current) > 0
-          : Number(momentum?.current) < 0;
+        const momentumAligned = side === "BUY" ? Number(momentum?.current) > 0 : Number(momentum?.current) < 0;
         const momentumData = {
           aligned: momentumAligned,
           accelerating: momentum?.state === "ACCELERATING",
-          text: momentumAligned ? (momentum?.state || "aligned") : "against trade"
+          text: momentumAligned ? momentum?.state || "aligned" : "against trade",
         };
 
         const stc = getTradeProgressStc(closed1H, side);
@@ -2027,7 +1686,7 @@ async function monitorTradeProgress() {
           structure,
           delta,
           absorption,
-          structure5
+          structure5,
         };
 
         const previous = tradeProgressPrevious[groupKey] || null;
@@ -2039,9 +1698,10 @@ async function monitorTradeProgress() {
 
         let userLines = "";
         for (const { userId, pos } of group) {
-          const move = side === "BUY"
-            ? ((currentClose - pos.entryPrice) / pos.entryPrice) * 100
-            : ((pos.entryPrice - currentClose) / pos.entryPrice) * 100;
+          const move =
+            side === "BUY"
+              ? ((currentClose - pos.entryPrice) / pos.entryPrice) * 100
+              : ((pos.entryPrice - currentClose) / pos.entryPrice) * 100;
 
           userLines +=
             `• User ${userId}: *${move >= 0 ? "+" : ""}${move.toFixed(2)}%*` +
@@ -2052,7 +1712,8 @@ async function monitorTradeProgress() {
         const report =
           `📡 *15M TRADE PROGRESS — ${symbol} ${side}*\n\n` +
           `👥 *Users holding this position:* ${group.length}\n` +
-          userLines + `\n` +
+          userLines +
+          `\n` +
           `${formatTradeProgressState(state)}\n\n` +
           `4️⃣ *4H TREND*\n` +
           `• Direction: ${higher.trend}\n` +
@@ -2080,7 +1741,7 @@ async function monitorTradeProgress() {
           timestamp: now,
           deltaStrength: delta.deltaStrength,
           stc: stc.current,
-          bandWidth: bands.width
+          bandWidth: bands.width,
         };
       } catch (err) {
         log(`❌ 15M trade progress error ${groupKey}: ${err?.message || err}`);
@@ -2091,8 +1752,7 @@ async function monitorTradeProgress() {
   // Clean state for positions that no longer exist.
   for (const key of Object.keys(tradeProgressLastReport)) {
     const [symbol, side] = key.split(":");
-    const stillExists = Object.values(activePositions[symbol] || {})
-      .some(pos => pos.side === side);
+    const stillExists = Object.values(activePositions[symbol] || {}).some((pos) => pos.side === side);
 
     if (!stillExists) {
       delete tradeProgressLastReport[key];
@@ -2102,11 +1762,8 @@ async function monitorTradeProgress() {
 }
 
 setInterval(() => {
-  monitorTradeProgress().catch(err =>
-    log(`❌ Trade progress scheduler error: ${err?.message || err}`)
-  );
+  monitorTradeProgress().catch((err) => log(`❌ Trade progress scheduler error: ${err?.message || err}`));
 }, TRADE_PROGRESS_SCHEDULER_MS);
-
 
 // --- Monitor positions (TP/SL/Trailing Stop) ---
 async function monitorPositions() {
@@ -2120,9 +1777,7 @@ async function monitorPositions() {
 
       try {
         const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions)
-          ? positions.find((x) => x.symbol === symbol)
-          : null;
+        const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
         const amt = p ? parseFloat(p.positionAmt || 0) : 0;
 
         if (!p || amt === 0) {
@@ -2157,11 +1812,11 @@ async function monitorPositions() {
 
             await sendMessage(
               `🏃 RUNNER ACTIVATED: *${symbol}* ${pos.side}\n\n` +
-              `💰 Profit: +${move.toFixed(2)}%\n` +
-              `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
-              `📊 Runner Mode: ACTIVE\n` +
-              `🔎 Exit Signal: 15M Delta vs Delta MA\n\n` +
-              `👥 All users' ${symbol} positions are now in runner mode.`
+                `💰 Profit: +${move.toFixed(2)}%\n` +
+                `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
+                `📊 Runner Mode: ACTIVE\n` +
+                `🔎 Exit Signal: 15M Delta vs Delta MA\n\n` +
+                `👥 All users' ${symbol} positions are now in runner mode.`,
             );
           }
         }
@@ -2183,9 +1838,7 @@ async function monitorPositions() {
             await client.futuresMarketSell(symbol, Math.abs(amt));
             delete activePositions[symbol][userId];
 
-            await sendMessage(
-              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
-            );
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
 
             continue;
           }
@@ -2201,9 +1854,7 @@ async function monitorPositions() {
             await client.futuresMarketBuy(symbol, Math.abs(amt));
             delete activePositions[symbol][userId];
 
-            await sendMessage(
-              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
-            );
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
 
             continue;
           }
@@ -2231,48 +1882,35 @@ async function monitorPositions() {
             // Use closed 15M candles only.
             const closedCandles15 = candles15.slice(0, -1);
 
-            const trDelta15 =
-              calculateTrendResetCumulativeDelta(closedCandles15);
+            const trDelta15 = calculateTrendResetCumulativeDelta(closedCandles15);
 
-            if (
-              pos.side === "BUY" &&
-              trDelta15.cumDelta > 0 &&
-              trDelta15.cumDelta < trDelta15.deltaMA
-            ) {
+            if (pos.side === "BUY" && trDelta15.cumDelta > 0 && trDelta15.cumDelta < trDelta15.deltaMA) {
               await client.futuresMarketSell(symbol, Math.abs(amt));
               delete activePositions[symbol][userId];
 
               await sendMessage(
                 `🏃 RUNNER EXIT: *${symbol}* LONG\n` +
-                `Profit: ${move.toFixed(2)}%\n` +
-                `Delta weakened below Delta MA.`
+                  `Profit: ${move.toFixed(2)}%\n` +
+                  `Delta weakened below Delta MA.`,
               );
 
               continue;
             }
 
-            if (
-              pos.side === "SELL" &&
-              trDelta15.cumDelta < 0 &&
-              trDelta15.cumDelta > trDelta15.deltaMA
-            ) {
+            if (pos.side === "SELL" && trDelta15.cumDelta < 0 && trDelta15.cumDelta > trDelta15.deltaMA) {
               await client.futuresMarketBuy(symbol, Math.abs(amt));
               delete activePositions[symbol][userId];
 
               await sendMessage(
                 `🏃 RUNNER EXIT: *${symbol}* SHORT\n` +
-                `Profit: ${move.toFixed(2)}%\n` +
-                `Delta weakened above Delta MA.`
+                  `Profit: ${move.toFixed(2)}%\n` +
+                  `Delta weakened above Delta MA.`,
               );
 
               continue;
             }
           } catch (deltaErr) {
-            log(
-              `⚠️ Runner delta check error ${userId} ${symbol}: ${
-                deltaErr?.message || deltaErr
-              }`
-            );
+            log(`⚠️ Runner delta check error ${userId} ${symbol}: ${deltaErr?.message || deltaErr}`);
           }
         }
 
@@ -2288,27 +1926,18 @@ async function monitorPositions() {
 
           delete activePositions[symbol][userId];
 
-          await sendMessage(
-            `🔻 STOP LOSS: *${symbol}* User ${userId}`
-          );
+          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
 
           continue;
         }
       } catch (err) {
-        log(
-          `❌ monitorPositions error ${userId} ${symbol}: ${
-            err?.message || err
-          }`
-        );
+        log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
       }
     }
 
     // Reset notification state when there are no positions left
     // for this symbol, allowing a future trade to activate a new runner.
-    if (
-      !activePositions[symbol] ||
-      Object.keys(activePositions[symbol]).length === 0
-    ) {
+    if (!activePositions[symbol] || Object.keys(activePositions[symbol]).length === 0) {
       delete runnerActivationNotified[symbol];
       delete activePositions[symbol];
     }
@@ -2321,9 +1950,6 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
 
-// Tracks a fresh 5M delta-divergence setup for each symbol/direction.
-// A divergence must be detected after activation before an entry can occur.
-let deltaDivergenceState = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // =====================================================
@@ -2340,9 +1966,7 @@ async function monitorPriceActivations() {
     if (priceActivated[symbol] === true) continue;
 
     try {
-      const res = await fetch(
-        `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`
-      );
+      const res = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -2364,10 +1988,8 @@ async function monitorPriceActivations() {
         continue;
       }
 
-      const crossedUp =
-        previousPrice < activationPrice && currentPrice >= activationPrice;
-      const crossedDown =
-        previousPrice > activationPrice && currentPrice <= activationPrice;
+      const crossedUp = previousPrice < activationPrice && currentPrice >= activationPrice;
+      const crossedDown = previousPrice > activationPrice && currentPrice <= activationPrice;
 
       if (crossedUp || crossedDown) {
         // Automatically perform the same state change as /activate <symbol>.
@@ -2375,24 +1997,22 @@ async function monitorPriceActivations() {
         // for the normal trading scanner, not just unlock the price gate.
         priceActivated[symbol] = true;
         symbolActive[symbol] = true;
-        deltaDivergenceState[symbol] = { BUY: null, SELL: null };
 
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
         await sendMessage(
           `🔓 *PRICE ACTIVATION TRIGGERED*\n\n` +
-          `🪙 Coin: *${symbol}*\n` +
-          `🎯 Activation Price: *${activationPrice}*\n` +
-          `💰 Current Price: *${currentPrice}*\n` +
-          `↕️ Cross: *${crossDirection}*\n\n` +
-          `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
-          `This is the same action as /activate ${symbol}.\n` +
-          `The normal 1H STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
+            `🪙 Coin: *${symbol}*\n` +
+            `🎯 Activation Price: *${activationPrice}*\n` +
+            `💰 Current Price: *${currentPrice}*\n` +
+            `↕️ Cross: *${crossDirection}*\n\n` +
+            `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
+            `This is the same action as /activate ${symbol}.\n` +
+            `The normal 1H STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`,
         );
 
         log(
-          `🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. ` +
-          `Trigger: ${activationPrice}. Cross: ${crossDirection}`
+          `🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. ` + `Trigger: ${activationPrice}. Cross: ${crossDirection}`,
         );
       }
 
@@ -2406,7 +2026,7 @@ async function monitorPriceActivations() {
 
 setInterval(monitorPriceActivations, 5000);
 
-// --- Full-auto STC + ATR combined scanning loop ---
+// --- Full-auto STC + OBV entry scanning loop ---
 
 let prevBullishFlip = [];
 let prevBearishFlip = [];
@@ -2521,10 +2141,7 @@ setInterval(async () => {
       if (!isActive || BOT_PAUSED) continue;
 
       // Price activation gate. This does not change /activate or /deactivate.
-      if (
-        priceActivationLevels[symbol] !== undefined &&
-        priceActivated[symbol] !== true
-      ) continue;
+      if (priceActivationLevels[symbol] !== undefined && priceActivated[symbol] !== true) continue;
 
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
@@ -2545,124 +2162,79 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// 5M TREND-RESET CUMULATIVE DELTA + DIVERGENCE + ATR-BAND ENTRY
-// =====================================================
-//
-// 1H STC = TREND
-// 5M Delta divergence = PULLBACK-ENDING SETUP
-// 5M ATR bands = contraction followed by directional expansion
-// 5M Delta direction + SMA(10) + strength = FINAL ENTRY
-//
-// A coin can be activated during a pullback without entering immediately.
-// A fresh 5M divergence must first be detected after activation.
-// Delta confirmation then determines whether an entry is allowed.
-//
-// Only CLOSED 5M candles are used.
-// =====================================================
+      // 5M OBV + TREND-RESET CUMULATIVE DELTA ENTRY
+      // =====================================================
+      //
+      // 1H STC = TREND
+      // 5M OBV 50 EMA cross = ENTRY SETUP
+      // 5M Delta direction + SMA(10) + strength = FINAL ENTRY
+      //
+      // A coin can be activated without entering immediately.
+      // A fresh 5M OBV/50 EMA cross must first confirm the direction.
+      // Delta confirmation then determines whether an entry is allowed.
+      //
+      // Only CLOSED 5M candles are used.
+      // =====================================================
 
-const candles5 =
-  await fetchFuturesKlines(
-    symbol,
-    "5m",
-    150
-  );
+      const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
 
-if (
-  !candles5 ||
-  candles5.length < 40
-) continue;
+      if (!candles5 || candles5.length < 40) continue;
 
-// Remove currently forming 5M candle.
-const closedCandles5 = candles5.slice(0, -1);
+      // Remove currently forming 5M candle.
+      const closedCandles5 = candles5.slice(0, -1);
 
-// Calculate ChartPrime-style Trend-Reset Cumulative Delta.
-const trDelta5 = calculateTrendResetCumulativeDelta(closedCandles5);
+      // Calculate ChartPrime-style Trend-Reset Cumulative Delta.
+      const trDelta5 = calculateTrendResetCumulativeDelta(closedCandles5);
 
-if (!trDelta5) continue;
+      if (!trDelta5) continue;
 
-// Detect a fresh 5M price/delta divergence setup.
-// This does not place a trade; it only arms the corresponding direction.
-const deltaDivergence5 = detect5MDeltaDivergence(
-  closedCandles5,
-  trDelta5
-);
-rememberFreshDeltaDivergence(symbol, deltaDivergence5);
+      // Require 5M OBV to cross its 50 EMA and hold on the correct side
+      // for 2 consecutive CLOSED 5M candles with meaningful separation
+      // before the Delta entry confirmation.
 
-// After divergence, require 5M OBV to cross its 50 EMA and hold
-// on the correct side for 3 consecutive CLOSED 5M candles with
-// meaningful separation before the Delta entry confirmation.
+      // Absorption remains a 15M informational warning.
+      // It is deliberately NOT changed to the 5M entry timeframe.
+      const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
+      if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
+        const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
+        await checkAndWarnAbsorption(symbol, trendCycle === "BULL" ? "BUY" : "SELL", closedCandles15ForAbsorption);
+      }
 
-// Absorption remains a 15M informational warning.
-// It is deliberately NOT changed to the 5M entry timeframe.
-const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
-if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
-  const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
-  await checkAndWarnAbsorption(
-    symbol,
-    trendCycle === "BULL" ? "BUY" : "SELL",
-    closedCandles15ForAbsorption
-  );
-}
+      // =====================================================
+      // ENTRY DIRECTION
+      // =====================================================
 
-// =====================================================
-// ENTRY DIRECTION
-// =====================================================
+      let direction = null;
 
-let direction = null;
+      // -----------------------------------------------------
+      // BULLISH 1H + BULLISH 15M DELTA
+      // -----------------------------------------------------
 
+      if (
+        trendCycle === "BULL" &&
+        calculateOBVConfirmation(closedCandles5, "BUY") &&
+        hasEntryVolumeImbalance(closedCandles5, "BUY") &&
+        trDelta5.cumDelta > 0 &&
+        trDelta5.cumDelta > trDelta5.deltaMA &&
+        trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+      ) {
+        direction = "BUY";
+      }
 
-// -----------------------------------------------------
-// BULLISH 1H + BULLISH 15M DELTA
-// -----------------------------------------------------
+      // -----------------------------------------------------
+      // BEARISH 1H + BEARISH 15M DELTA
+      // -----------------------------------------------------
 
-if (
-  trendCycle === "BULL" &&
-  hasFreshDeltaDivergence(
-    symbol,
-    "BUY",
-    closedCandles5[closedCandles5.length - 1]?.time
-  ) &&
-  calculateOBVConfirmation(
-    closedCandles5,
-    "BUY",
-    deltaDivergenceState[symbol]?.BUY?.candleTime
-  ) &&
-  hasEntryVolumeImbalance(closedCandles5, "BUY") &&
-  trDelta5.cumDelta > 0 &&
-  trDelta5.cumDelta > trDelta5.deltaMA &&
-  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-) {
-
-  direction = "BUY";
-
-}
-
-
-// -----------------------------------------------------
-// BEARISH 1H + BEARISH 15M DELTA
-// -----------------------------------------------------
-
-if (
-  trendCycle === "BEAR" &&
-  hasFreshDeltaDivergence(
-    symbol,
-    "SELL",
-    closedCandles5[closedCandles5.length - 1]?.time
-  ) &&
-  calculateOBVConfirmation(
-    closedCandles5,
-    "SELL",
-    deltaDivergenceState[symbol]?.SELL?.candleTime
-  ) &&
-  hasEntryVolumeImbalance(closedCandles5, "SELL") &&
-  trDelta5.cumDelta < 0 &&
-  trDelta5.cumDelta < trDelta5.deltaMA &&
-  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
-) {
-
-  direction = "SELL";
-
-}
+      if (
+        trendCycle === "BEAR" &&
+        calculateOBVConfirmation(closedCandles5, "SELL") &&
+        hasEntryVolumeImbalance(closedCandles5, "SELL") &&
+        trDelta5.cumDelta < 0 &&
+        trDelta5.cumDelta < trDelta5.deltaMA &&
+        trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
+      ) {
+        direction = "SELL";
+      }
 
       // =====================================================
       // LIQUIDITY GATE + EXECUTION
@@ -2689,12 +2261,6 @@ if (
         }
 
         await executeMarketOrderForAllUsers(symbol, direction);
-
-        // Consume the divergence setup so the same divergence cannot trigger
-        // another entry before a new divergence is detected.
-        if (deltaDivergenceState[symbol]) {
-          deltaDivergenceState[symbol][direction] = null;
-        }
 
         const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
         const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
@@ -2769,7 +2335,6 @@ if (
 // 1H  = MOMENTUM / TREND HEALTH
 //======================================================
 
-
 //======================================================
 // 4H TREND SETTINGS
 //
@@ -2790,478 +2355,223 @@ const TREND_ATR_MULTIPLIER = 1;
 // and a meaningful 4H EMA slope before it can enter the TOP 7.
 const TREND_QUALITY_LOOKBACK = 10;
 const TREND_QUALITY_STRUCTURE_LOOKBACK = 5;
-const TREND_QUALITY_MIN_EFFICIENCY = 0.30;
-const TREND_QUALITY_MIN_ATR_RATIO = 0.80;
+const TREND_QUALITY_MIN_EFFICIENCY = 0.3;
+const TREND_QUALITY_MIN_ATR_RATIO = 0.8;
 const TREND_QUALITY_MIN_EMA_SLOPE_PCT = 0.05;
-
-
 
 //======================================================
 // CUMULATIVE DELTA
 //======================================================
 
 function calculateCumulativeDelta(candles) {
+  if (!candles || candles.length < 2) {
+    return [];
+  }
 
-    if (
-        !candles ||
-        candles.length < 2
-    ) {
+  let delta = 0;
 
-        return [];
+  const cumulativeDelta = [];
 
+  for (const candle of candles) {
+    const open = Number(candle.open);
+
+    const close = Number(candle.close);
+
+    const volume = Number(candle.volume);
+
+    if (!Number.isFinite(open) || !Number.isFinite(close) || !Number.isFinite(volume)) {
+      continue;
     }
 
-    let delta = 0;
-
-    const cumulativeDelta = [];
-
-    for (
-        const candle of candles
-    ) {
-
-        const open =
-            Number(candle.open);
-
-        const close =
-            Number(candle.close);
-
-        const volume =
-            Number(candle.volume);
-
-        if (
-            !Number.isFinite(open) ||
-            !Number.isFinite(close) ||
-            !Number.isFinite(volume)
-        ) {
-
-            continue;
-
-        }
-
-        if (
-            close > open
-        ) {
-
-            delta += volume;
-
-        }
-
-        else if (
-            close < open
-        ) {
-
-            delta -= volume;
-
-        }
-
-        cumulativeDelta.push(
-            delta
-        );
-
+    if (close > open) {
+      delta += volume;
+    } else if (close < open) {
+      delta -= volume;
     }
 
-    return cumulativeDelta;
+    cumulativeDelta.push(delta);
+  }
 
+  return cumulativeDelta;
 }
-
 
 //======================================================
 // ANALYZE DELTA
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
+  if (!cumulativeDelta || cumulativeDelta.length < 2) {
+    return null;
+  }
 
-    if (
-        !cumulativeDelta ||
-        cumulativeDelta.length < 2
-    ) {
+  const currentIndex = cumulativeDelta.length - 1;
 
-        return null;
+  const previousIndex = currentIndex - 1;
 
+  const currentDelta = Number(cumulativeDelta[currentIndex]);
+
+  const previousDelta = Number(cumulativeDelta[previousIndex]);
+
+  if (!Number.isFinite(currentDelta) || !Number.isFinite(previousDelta)) {
+    return null;
+  }
+
+  const deltaChange = currentDelta - previousDelta;
+
+  let trend = "FLAT";
+
+  let control = "BALANCED";
+
+  //==================================================
+  // POSITIVE DELTA
+  //==================================================
+
+  if (currentDelta > 0) {
+    control = "BUYERS IN CONTROL";
+
+    if (currentDelta > previousDelta) {
+      trend = "HIGHER POSITIVE";
+    } else if (currentDelta < previousDelta) {
+      trend = "LOWER POSITIVE";
+    } else {
+      trend = "POSITIVE / FLAT";
     }
+  }
 
-    const currentIndex =
-        cumulativeDelta.length - 1;
+  //==================================================
+  // NEGATIVE DELTA
+  //==================================================
+  else if (currentDelta < 0) {
+    control = "SELLERS IN CONTROL";
 
-    const previousIndex =
-        currentIndex - 1;
-
-    const currentDelta =
-        Number(
-            cumulativeDelta[
-                currentIndex
-            ]
-        );
-
-    const previousDelta =
-        Number(
-            cumulativeDelta[
-                previousIndex
-            ]
-        );
-
-    if (
-        !Number.isFinite(currentDelta) ||
-        !Number.isFinite(previousDelta)
-    ) {
-
-        return null;
-
+    if (currentDelta < previousDelta) {
+      trend = "LOWER NEGATIVE";
+    } else if (currentDelta > previousDelta) {
+      trend = "HIGHER NEGATIVE";
+    } else {
+      trend = "NEGATIVE / FLAT";
     }
+  }
 
-    const deltaChange =
-        currentDelta -
-        previousDelta;
+  //==================================================
+  // ZERO
+  //==================================================
+  else {
+    control = "BALANCED";
 
-    let trend =
-        "FLAT";
+    trend = "AT ZERO";
+  }
 
-    let control =
-        "BALANCED";
+  return {
+    currentDelta,
 
+    previousDelta,
 
-    //==================================================
-    // POSITIVE DELTA
-    //==================================================
+    deltaChange,
 
-    if (
-        currentDelta > 0
-    ) {
+    trend,
 
-        control =
-            "BUYERS IN CONTROL";
-
-        if (
-            currentDelta >
-            previousDelta
-        ) {
-
-            trend =
-                "HIGHER POSITIVE";
-
-        }
-
-        else if (
-            currentDelta <
-            previousDelta
-        ) {
-
-            trend =
-                "LOWER POSITIVE";
-
-        }
-
-        else {
-
-            trend =
-                "POSITIVE / FLAT";
-
-        }
-
-    }
-
-
-    //==================================================
-    // NEGATIVE DELTA
-    //==================================================
-
-    else if (
-        currentDelta < 0
-    ) {
-
-        control =
-            "SELLERS IN CONTROL";
-
-        if (
-            currentDelta <
-            previousDelta
-        ) {
-
-            trend =
-                "LOWER NEGATIVE";
-
-        }
-
-        else if (
-            currentDelta >
-            previousDelta
-        ) {
-
-            trend =
-                "HIGHER NEGATIVE";
-
-        }
-
-        else {
-
-            trend =
-                "NEGATIVE / FLAT";
-
-        }
-
-    }
-
-
-    //==================================================
-    // ZERO
-    //==================================================
-
-    else {
-
-        control =
-            "BALANCED";
-
-        trend =
-            "AT ZERO";
-
-    }
-
-    return {
-
-        currentDelta,
-
-        previousDelta,
-
-        deltaChange,
-
-        trend,
-
-        control
-
-    };
-
+    control,
+  };
 }
-
 
 //======================================================
 // EMA VALUE
 //======================================================
 
-function calculateEMAValue(
-    candles,
-    period
-) {
+function calculateEMAValue(candles, period) {
+  if (!candles || candles.length < period) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length < period
-    ) {
+  let sum = 0;
 
-        return null;
+  for (let i = 0; i < period; i++) {
+    const close = Number(candles[i].close);
 
+    if (!Number.isFinite(close)) {
+      return null;
     }
 
-    let sum = 0;
+    sum += close;
+  }
 
-    for (
-        let i = 0;
-        i < period;
-        i++
-    ) {
+  let ema = sum / period;
 
-        const close =
-            Number(
-                candles[i].close
-            );
+  const multiplier = 2 / (period + 1);
 
-        if (
-            !Number.isFinite(close)
-        ) {
+  for (let i = period; i < candles.length; i++) {
+    const close = Number(candles[i].close);
 
-            return null;
-
-        }
-
-        sum += close;
-
+    if (!Number.isFinite(close)) {
+      continue;
     }
 
-    let ema =
-        sum / period;
+    ema = (close - ema) * multiplier + ema;
+  }
 
-    const multiplier =
-        2 /
-        (period + 1);
-
-    for (
-        let i = period;
-        i < candles.length;
-        i++
-    ) {
-
-        const close =
-            Number(
-                candles[i].close
-            );
-
-        if (
-            !Number.isFinite(close)
-        ) {
-
-            continue;
-
-        }
-
-        ema =
-            (
-                close -
-                ema
-            ) *
-            multiplier +
-            ema;
-
-    }
-
-    return ema;
-
+  return ema;
 }
-
 
 //======================================================
 // ATR VALUE
 //======================================================
 
-function calculateATRValue(
-    candles,
-    period
-) {
+function calculateATRValue(candles, period) {
+  if (!candles || candles.length <= period) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <= period
-    ) {
+  const trueRanges = [];
 
-        return null;
+  for (let i = 0; i < candles.length; i++) {
+    const high = Number(candles[i].high);
 
+    const low = Number(candles[i].low);
+
+    if (!Number.isFinite(high) || !Number.isFinite(low)) {
+      return null;
     }
 
-    const trueRanges = [];
+    if (i === 0) {
+      trueRanges.push(high - low);
 
-    for (
-        let i = 0;
-        i < candles.length;
-        i++
-    ) {
-
-        const high =
-            Number(
-                candles[i].high
-            );
-
-        const low =
-            Number(
-                candles[i].low
-            );
-
-        if (
-            !Number.isFinite(high) ||
-            !Number.isFinite(low)
-        ) {
-
-            return null;
-
-        }
-
-        if (
-            i === 0
-        ) {
-
-            trueRanges.push(
-                high - low
-            );
-
-            continue;
-
-        }
-
-        const previousClose =
-            Number(
-                candles[
-                    i - 1
-                ].close
-            );
-
-        if (
-            !Number.isFinite(
-                previousClose
-            )
-        ) {
-
-            return null;
-
-        }
-
-        const range1 =
-            high - low;
-
-        const range2 =
-            Math.abs(
-                high -
-                previousClose
-            );
-
-        const range3 =
-            Math.abs(
-                low -
-                previousClose
-            );
-
-        trueRanges.push(
-            Math.max(
-                range1,
-                range2,
-                range3
-            )
-        );
-
+      continue;
     }
 
-    if (
-        trueRanges.length <= period
-    ) {
+    const previousClose = Number(candles[i - 1].close);
 
-        return null;
-
+    if (!Number.isFinite(previousClose)) {
+      return null;
     }
 
-    let atr = 0;
+    const range1 = high - low;
 
-    for (
-        let i = 1;
-        i <= period;
-        i++
-    ) {
+    const range2 = Math.abs(high - previousClose);
 
-        atr +=
-            trueRanges[i];
+    const range3 = Math.abs(low - previousClose);
 
-    }
+    trueRanges.push(Math.max(range1, range2, range3));
+  }
 
-    atr /=
-        period;
+  if (trueRanges.length <= period) {
+    return null;
+  }
 
-    for (
-        let i = period + 1;
-        i < trueRanges.length;
-        i++
-    ) {
+  let atr = 0;
 
-        atr =
-            (
-                (
-                    atr *
-                    (period - 1)
-                ) +
-                trueRanges[i]
-            ) /
-            period;
+  for (let i = 1; i <= period; i++) {
+    atr += trueRanges[i];
+  }
 
-    }
+  atr /= period;
 
-    return atr;
+  for (let i = period + 1; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
+  }
 
+  return atr;
 }
-
 
 //======================================================
 // 4H TREND / ATR STRUCTURE
@@ -3277,253 +2587,124 @@ function calculateATRValue(
 // Otherwise previous trend remains.
 //======================================================
 
-function calculate4HTrendATR(
-    candles
-) {
+function calculate4HTrendATR(candles) {
+  if (!candles || candles.length < TREND_EMA_LENGTH + 2) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <
-        TREND_EMA_LENGTH + 2
-    ) {
+  let trendState = 0;
 
-        return null;
+  let lastBreakType = "NONE";
 
+  let lastBreakIndex = -1;
+
+  let activeUpperBand = null;
+
+  let activeLowerBand = null;
+
+  for (let i = TREND_EMA_LENGTH; i < candles.length; i++) {
+    const availableCandles = candles.slice(0, i + 1);
+
+    const ema = calculateEMAValue(availableCandles, TREND_EMA_LENGTH);
+
+    const atr = calculateATRValue(availableCandles, TREND_ATR_LENGTH);
+
+    if (ema === null || atr === null) {
+      continue;
     }
 
-    let trendState =
-        0;
+    const upperBand = ema + atr * TREND_ATR_MULTIPLIER;
 
-    let lastBreakType =
-        "NONE";
+    const lowerBand = ema - atr * TREND_ATR_MULTIPLIER;
 
-    let lastBreakIndex =
-        -1;
+    const close = Number(candles[i].close);
 
-    let activeUpperBand =
-        null;
-
-    let activeLowerBand =
-        null;
-
-
-    for (
-        let i =
-            TREND_EMA_LENGTH;
-        i < candles.length;
-        i++
-    ) {
-
-        const availableCandles =
-            candles.slice(
-                0,
-                i + 1
-            );
-
-        const ema =
-            calculateEMAValue(
-                availableCandles,
-                TREND_EMA_LENGTH
-            );
-
-        const atr =
-            calculateATRValue(
-                availableCandles,
-                TREND_ATR_LENGTH
-            );
-
-        if (
-            ema === null ||
-            atr === null
-        ) {
-
-            continue;
-
-        }
-
-        const upperBand =
-            ema +
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-        const lowerBand =
-            ema -
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-        const close =
-            Number(
-                candles[i].close
-            );
-
-        if (
-            !Number.isFinite(close)
-        ) {
-
-            continue;
-
-        }
-
-        const previousTrend =
-            trendState;
-
-
-        if (
-            close >
-            upperBand
-        ) {
-
-            trendState =
-                1;
-
-        }
-
-        else if (
-            close <
-            lowerBand
-        ) {
-
-            trendState =
-                -1;
-
-        }
-
-
-        if (
-            trendState === 1 &&
-            previousTrend !== 1
-        ) {
-
-            lastBreakType =
-                "UPPER BAND BREAK";
-
-            lastBreakIndex =
-                i;
-
-        }
-
-
-        if (
-            trendState === -1 &&
-            previousTrend !== -1
-        ) {
-
-            lastBreakType =
-                "LOWER BAND BREAK";
-
-            lastBreakIndex =
-                i;
-
-        }
-
-        activeUpperBand =
-            upperBand;
-
-        activeLowerBand =
-            lowerBand;
-
+    if (!Number.isFinite(close)) {
+      continue;
     }
 
+    const previousTrend = trendState;
 
-    if (
-        trendState === 0
-    ) {
-
-        return {
-
-            trend:
-                "NEUTRAL",
-
-            trendState:
-                0,
-
-            upperBand:
-                activeUpperBand,
-
-            lowerBand:
-                activeLowerBand,
-
-            activeLevel:
-                null,
-
-            activeType:
-                "NONE",
-
-            lastBreak:
-                "NONE",
-
-            lastBreakIndex
-
-        };
-
+    if (close > upperBand) {
+      trendState = 1;
+    } else if (close < lowerBand) {
+      trendState = -1;
     }
 
+    if (trendState === 1 && previousTrend !== 1) {
+      lastBreakType = "UPPER BAND BREAK";
 
-    if (
-        trendState === 1
-    ) {
-
-        return {
-
-            trend:
-                "BULLISH TREND",
-
-            trendState:
-                1,
-
-            upperBand:
-                activeUpperBand,
-
-            lowerBand:
-                activeLowerBand,
-
-            activeLevel:
-                activeLowerBand,
-
-            activeType:
-                "SUPPORT",
-
-            lastBreak:
-                lastBreakType,
-
-            lastBreakIndex
-
-        };
-
+      lastBreakIndex = i;
     }
 
+    if (trendState === -1 && previousTrend !== -1) {
+      lastBreakType = "LOWER BAND BREAK";
 
+      lastBreakIndex = i;
+    }
+
+    activeUpperBand = upperBand;
+
+    activeLowerBand = lowerBand;
+  }
+
+  if (trendState === 0) {
     return {
+      trend: "NEUTRAL",
 
-        trend:
-            "BEARISH TREND",
+      trendState: 0,
 
-        trendState:
-            -1,
+      upperBand: activeUpperBand,
 
-        upperBand:
-            activeUpperBand,
+      lowerBand: activeLowerBand,
 
-        lowerBand:
-            activeLowerBand,
+      activeLevel: null,
 
-        activeLevel:
-            activeUpperBand,
+      activeType: "NONE",
 
-        activeType:
-            "RESISTANCE",
+      lastBreak: "NONE",
 
-        lastBreak:
-            lastBreakType,
-
-        lastBreakIndex
-
+      lastBreakIndex,
     };
+  }
 
+  if (trendState === 1) {
+    return {
+      trend: "BULLISH TREND",
+
+      trendState: 1,
+
+      upperBand: activeUpperBand,
+
+      lowerBand: activeLowerBand,
+
+      activeLevel: activeLowerBand,
+
+      activeType: "SUPPORT",
+
+      lastBreak: lastBreakType,
+
+      lastBreakIndex,
+    };
+  }
+
+  return {
+    trend: "BEARISH TREND",
+
+    trendState: -1,
+
+    upperBand: activeUpperBand,
+
+    lowerBand: activeLowerBand,
+
+    activeLevel: activeUpperBand,
+
+    activeType: "RESISTANCE",
+
+    lastBreak: lastBreakType,
+
+    lastBreakIndex,
+  };
 }
 
 //======================================================
@@ -3542,154 +2723,73 @@ function calculate4HTrendATR(
 
 const MOMENTUM_LOOKBACK_1H = 10;
 
-
 function calculate1HMomentum(candles) {
+  if (!candles || candles.length < MOMENTUM_LOOKBACK_1H * 2 + 1) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <
-        (MOMENTUM_LOOKBACK_1H * 2) + 1
-    ) {
+  const end = candles.length - 1;
 
-        return null;
+  const currentClose = Number(candles[end].close);
 
-    }
+  const close10HoursAgo = Number(candles[end - MOMENTUM_LOOKBACK_1H].close);
 
-    const end =
-        candles.length - 1;
+  const close20HoursAgo = Number(candles[end - MOMENTUM_LOOKBACK_1H * 2].close);
 
+  if (!Number.isFinite(currentClose) || !Number.isFinite(close10HoursAgo) || !Number.isFinite(close20HoursAgo)) {
+    return null;
+  }
 
-    const currentClose =
-        Number(
-            candles[end].close
-        );
+  //==================================================
+  // CURRENT 10H MOMENTUM
+  //==================================================
 
+  const currentMomentum = (currentClose - close10HoursAgo) / MOMENTUM_LOOKBACK_1H;
 
-    const close10HoursAgo =
-        Number(
-            candles[
-                end -
-                MOMENTUM_LOOKBACK_1H
-            ].close
-        );
+  //==================================================
+  // PREVIOUS 10H MOMENTUM
+  //==================================================
 
+  const previousMomentum = (close10HoursAgo - close20HoursAgo) / MOMENTUM_LOOKBACK_1H;
 
-    const close20HoursAgo =
-        Number(
-            candles[
-                end -
-                (
-                    MOMENTUM_LOOKBACK_1H * 2
-                )
-            ].close
-        );
+  //==================================================
+  // MOMENTUM CHANGE
+  //==================================================
 
+  const momentumChange = currentMomentum - previousMomentum;
 
-    if (
-        !Number.isFinite(currentClose) ||
-        !Number.isFinite(close10HoursAgo) ||
-        !Number.isFinite(close20HoursAgo)
-    ) {
+  //==================================================
+  // DIRECTION
+  //==================================================
 
-        return null;
+  let direction = "FLAT";
 
-    }
+  if (currentMomentum > 0) {
+    direction = "POSITIVE";
+  } else if (currentMomentum < 0) {
+    direction = "NEGATIVE";
+  }
 
+  //==================================================
+  // ACCELERATION / DECELERATION
+  //==================================================
 
-    //==================================================
-    // CURRENT 10H MOMENTUM
-    //==================================================
+  const accelerating = Math.abs(currentMomentum) >= Math.abs(previousMomentum);
 
-    const currentMomentum =
-        (
-            currentClose -
-            close10HoursAgo
-        ) /
-        MOMENTUM_LOOKBACK_1H;
+  const state = accelerating ? "ACCELERATING" : "DECELERATING";
 
+  return {
+    current: currentMomentum,
 
-    //==================================================
-    // PREVIOUS 10H MOMENTUM
-    //==================================================
+    previous: previousMomentum,
 
-    const previousMomentum =
-        (
-            close10HoursAgo -
-            close20HoursAgo
-        ) /
-        MOMENTUM_LOOKBACK_1H;
+    change: momentumChange,
 
+    direction,
 
-    //==================================================
-    // MOMENTUM CHANGE
-    //==================================================
-
-    const momentumChange =
-        currentMomentum -
-        previousMomentum;
-
-
-    //==================================================
-    // DIRECTION
-    //==================================================
-
-    let direction =
-        "FLAT";
-
-
-    if (
-        currentMomentum > 0
-    ) {
-
-        direction =
-            "POSITIVE";
-
-    }
-
-    else if (
-        currentMomentum < 0
-    ) {
-
-        direction =
-            "NEGATIVE";
-
-    }
-
-
-    //==================================================
-    // ACCELERATION / DECELERATION
-    //==================================================
-
-    const accelerating =
-        Math.abs(currentMomentum) >=
-        Math.abs(previousMomentum);
-
-
-    const state =
-        accelerating
-            ? "ACCELERATING"
-            : "DECELERATING";
-
-
-    return {
-
-        current:
-            currentMomentum,
-
-        previous:
-            previousMomentum,
-
-        change:
-            momentumChange,
-
-        direction,
-
-        state
-
-    };
-
+    state,
+  };
 }
-
 
 //======================================================
 // TREND HEALTH / EXHAUSTION
@@ -3712,233 +2812,120 @@ function calculate1HMomentum(candles) {
 // Momentum is no longer aligned with the broader trend.
 //======================================================
 
-function analyzeTrendHealth(
-    trend4H,
-    delta30M,
-    momentum1H
-) {
-
-    if (
-        !trend4H ||
-        !delta30M ||
-        !momentum1H
-    ) {
-
-        return {
-
-            trend:
-                "UNKNOWN",
-
-            exhaustion:
-                "UNKNOWN",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    const bullish =
-        trend4H.trendState === 1;
-
-
-    const bearish =
-        trend4H.trendState === -1;
-
-
-    //==================================================
-    // MOMENTUM ALIGNMENT
-    //==================================================
-
-    const momentumAligned =
-        (
-            bullish &&
-            momentum1H.current > 0
-        ) ||
-        (
-            bearish &&
-            momentum1H.current < 0
-        );
-
-
-    //==================================================
-    // DELTA ALIGNMENT
-    //==================================================
-
-    const deltaAligned =
-        (
-            bullish &&
-            (
-                delta30M.trend ===
-                "HIGHER POSITIVE" ||
-
-                delta30M.trend ===
-                "LOWER POSITIVE"
-            )
-        ) ||
-
-        (
-            bearish &&
-            (
-                delta30M.trend ===
-                "LOWER NEGATIVE" ||
-
-                delta30M.trend ===
-                "HIGHER NEGATIVE"
-            )
-        );
-
-
-    //==================================================
-    // MOMENTUM WEAKENING
-    //==================================================
-
-    const momentumWeakening =
-        momentum1H.state ===
-        "DECELERATING";
-
-
-    //==================================================
-    // ORDER FLOW WEAKENING
-    //==================================================
-
-    const deltaWeakening =
-        (
-            bullish &&
-            delta30M.trend ===
-            "LOWER POSITIVE"
-        ) ||
-
-        (
-            bearish &&
-            delta30M.trend ===
-            "HIGHER NEGATIVE"
-        );
-
-
-    //==================================================
-    // HIGH EXHAUSTION
-    //
-    // Momentum has moved against the broader trend.
-    //==================================================
-
-    if (
-        !momentumAligned
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "HIGH",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // MODERATE EXHAUSTION
-    //
-    // Order flow no longer confirms the broader trend.
-    //==================================================
-
-    if (
-        !deltaAligned
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // MOMENTUM + DELTA BOTH WEAKENING
-    //==================================================
-
-    if (
-        momentumWeakening &&
-        deltaWeakening
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // ONE COMPONENT WEAKENING
-    //==================================================
-
-    if (
-        momentumWeakening ||
-        deltaWeakening
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // HEALTHY TREND
-    //==================================================
-
+function analyzeTrendHealth(trend4H, delta30M, momentum1H) {
+  if (!trend4H || !delta30M || !momentum1H) {
     return {
+      trend: "UNKNOWN",
 
-        trend:
-            "HEALTHY",
+      exhaustion: "UNKNOWN",
 
-        exhaustion:
-            "LOW",
-
-        action:
-            "HOLD"
-
+      action: "MONITOR",
     };
+  }
 
+  const bullish = trend4H.trendState === 1;
+
+  const bearish = trend4H.trendState === -1;
+
+  //==================================================
+  // MOMENTUM ALIGNMENT
+  //==================================================
+
+  const momentumAligned = (bullish && momentum1H.current > 0) || (bearish && momentum1H.current < 0);
+
+  //==================================================
+  // DELTA ALIGNMENT
+  //==================================================
+
+  const deltaAligned =
+    (bullish && (delta30M.trend === "HIGHER POSITIVE" || delta30M.trend === "LOWER POSITIVE")) ||
+    (bearish && (delta30M.trend === "LOWER NEGATIVE" || delta30M.trend === "HIGHER NEGATIVE"));
+
+  //==================================================
+  // MOMENTUM WEAKENING
+  //==================================================
+
+  const momentumWeakening = momentum1H.state === "DECELERATING";
+
+  //==================================================
+  // ORDER FLOW WEAKENING
+  //==================================================
+
+  const deltaWeakening =
+    (bullish && delta30M.trend === "LOWER POSITIVE") || (bearish && delta30M.trend === "HIGHER NEGATIVE");
+
+  //==================================================
+  // HIGH EXHAUSTION
+  //
+  // Momentum has moved against the broader trend.
+  //==================================================
+
+  if (!momentumAligned) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "HIGH",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // MODERATE EXHAUSTION
+  //
+  // Order flow no longer confirms the broader trend.
+  //==================================================
+
+  if (!deltaAligned) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // MOMENTUM + DELTA BOTH WEAKENING
+  //==================================================
+
+  if (momentumWeakening && deltaWeakening) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // ONE COMPONENT WEAKENING
+  //==================================================
+
+  if (momentumWeakening || deltaWeakening) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // HEALTHY TREND
+  //==================================================
+
+  return {
+    trend: "HEALTHY",
+
+    exhaustion: "LOW",
+
+    action: "HOLD",
+  };
 }
-
 
 //======================================================
 // 4H TREND QUALITY / CONSOLIDATION FILTER
@@ -3956,262 +2943,201 @@ function analyzeTrendHealth(
 // CONSOLIDATING coins are excluded from recommendations.
 //======================================================
 
-function analyzeTrendQuality(
-    candles4H,
-    trend4H
-) {
-
-    if (
-        !candles4H ||
-        !trend4H ||
-        trend4H.trendState === 0
-    ) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "NONE",
-            reason: "No established directional 4H trend"
-        };
-    }
-
-    const needed =
-        Math.max(
-            TREND_EMA_LENGTH + 5,
-            TREND_QUALITY_LOOKBACK + 1,
-            TREND_QUALITY_STRUCTURE_LOOKBACK + 2
-        );
-
-    if (candles4H.length < needed) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "UNKNOWN",
-            reason: "Insufficient 4H data"
-        };
-    }
-
-    const end = candles4H.length - 1;
-    const lookbackStart = end - TREND_QUALITY_LOOKBACK;
-    const structureStart = end - TREND_QUALITY_STRUCTURE_LOOKBACK;
-
-    const closes = candles4H.map(c => Number(c.close));
-    const highs = candles4H.map(c => Number(c.high));
-    const lows = candles4H.map(c => Number(c.low));
-
-    if (
-        !Number.isFinite(closes[end]) ||
-        !Number.isFinite(closes[lookbackStart])
-    ) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "UNKNOWN",
-            reason: "Invalid 4H price data"
-        };
-    }
-
-    // -----------------------------------------------
-    // PRICE EFFICIENCY
-    // Net directional movement divided by total
-    // absolute movement over the last 10 closed 4H bars.
-    // Higher values = cleaner trend; lower values = chop.
-    // -----------------------------------------------
-    let path = 0;
-
-    for (let i = lookbackStart + 1; i <= end; i++) {
-        if (
-            Number.isFinite(closes[i]) &&
-            Number.isFinite(closes[i - 1])
-        ) {
-            path += Math.abs(closes[i] - closes[i - 1]);
-        }
-    }
-
-    const netMove =
-        closes[end] - closes[lookbackStart];
-
-    const efficiency =
-        path > 0
-            ? Math.abs(netMove) / path
-            : 0;
-
-    // -----------------------------------------------
-    // EMA20 SLOPE
-    // Compare the latest EMA20 with its value five
-    // closed 4H candles earlier.
-    // -----------------------------------------------
-    const emaNow =
-        calculateEMAValue(
-            candles4H.slice(0, end + 1),
-            TREND_EMA_LENGTH
-        );
-
-    const emaEarlier =
-        calculateEMAValue(
-            candles4H.slice(0, end - 5 + 1),
-            TREND_EMA_LENGTH
-        );
-
-    const emaSlopePct =
-        Number.isFinite(emaNow) &&
-        Number.isFinite(emaEarlier) &&
-        emaEarlier !== 0
-            ? ((emaNow - emaEarlier) / Math.abs(emaEarlier)) * 100
-            : 0;
-
-    // -----------------------------------------------
-    // ATR EXPANSION / COMPRESSION
-    // Current ATR14 compared with the average ATR14
-    // over the previous 10 available ATR readings.
-    // -----------------------------------------------
-    const atrValues = [];
-
-    for (
-        let i = Math.max(TREND_ATR_LENGTH, end - 19);
-        i <= end;
-        i++
-    ) {
-        const atr =
-            calculateATRValue(
-                candles4H.slice(0, i + 1),
-                TREND_ATR_LENGTH
-            );
-
-        if (Number.isFinite(atr) && atr > 0) {
-            atrValues.push(atr);
-        }
-    }
-
-    const currentATR =
-        atrValues.length
-            ? atrValues[atrValues.length - 1]
-            : null;
-
-    const previousATRValues =
-        atrValues.length > 1
-            ? atrValues.slice(0, -1)
-            : [];
-
-    const averagePreviousATR =
-        previousATRValues.length
-            ? previousATRValues.reduce((sum, value) => sum + value, 0) / previousATRValues.length
-            : null;
-
-    const atrRatio =
-        Number.isFinite(currentATR) &&
-        Number.isFinite(averagePreviousATR) &&
-        averagePreviousATR > 0
-            ? currentATR / averagePreviousATR
-            : 0;
-
-    // -----------------------------------------------
-    // DIRECTIONAL STRUCTURE
-    // Require the latest close to continue moving in
-    // the established 4H direction and to sit on the
-    // correct side of the recent range midpoint.
-    // -----------------------------------------------
-    const recentHighs = highs.slice(structureStart, end + 1).filter(Number.isFinite);
-    const recentLows = lows.slice(structureStart, end + 1).filter(Number.isFinite);
-
-    const priorHighs = highs.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
-    const priorLows = lows.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
-
-    const recentHigh = recentHighs.length ? Math.max(...recentHighs) : null;
-    const recentLow = recentLows.length ? Math.min(...recentLows) : null;
-    const priorHigh = priorHighs.length ? Math.max(...priorHighs) : null;
-    const priorLow = priorLows.length ? Math.min(...priorLows) : null;
-
-    const rangeHigh = Math.max(...highs.slice(lookbackStart, end + 1).filter(Number.isFinite));
-    const rangeLow = Math.min(...lows.slice(lookbackStart, end + 1).filter(Number.isFinite));
-    const rangeMid = (rangeHigh + rangeLow) / 2;
-
-    let structure = "NEUTRAL";
-
-    if (trend4H.trendState === 1) {
-        structure =
-            closes[end] > closes[structureStart] &&
-            closes[end] > rangeMid &&
-            recentHigh !== null &&
-            priorHigh !== null &&
-            recentHigh > priorHigh
-                ? "BULLISH STRUCTURE"
-                : "WEAK BULLISH STRUCTURE";
-    }
-    else if (trend4H.trendState === -1) {
-        structure =
-            closes[end] < closes[structureStart] &&
-            closes[end] < rangeMid &&
-            recentLow !== null &&
-            priorLow !== null &&
-            recentLow < priorLow
-                ? "BEARISH STRUCTURE"
-                : "WEAK BEARISH STRUCTURE";
-    }
-
-    const structureAligned =
-        structure === "BULLISH STRUCTURE" ||
-        structure === "BEARISH STRUCTURE";
-
-    const emaSlopeAligned =
-        (trend4H.trendState === 1 && emaSlopePct >= TREND_QUALITY_MIN_EMA_SLOPE_PCT) ||
-        (trend4H.trendState === -1 && emaSlopePct <= -TREND_QUALITY_MIN_EMA_SLOPE_PCT);
-
-    const efficiencyStrong =
-        efficiency >= TREND_QUALITY_MIN_EFFICIENCY;
-
-    const volatilityHealthy =
-        atrRatio >= TREND_QUALITY_MIN_ATR_RATIO;
-
-    const strongTrend =
-        structureAligned &&
-        emaSlopeAligned &&
-        efficiencyStrong &&
-        volatilityHealthy;
-
-    const transitionTrend =
-        structureAligned &&
-        emaSlopeAligned &&
-        efficiency >= 0.20;
-
-    let status = "CONSOLIDATING";
-    let score = 0;
-
-    if (strongTrend) {
-        status = "STRONG TREND";
-        score = 100;
-        if (atrRatio >= 1) score += 10;
-        if (efficiency >= 0.50) score += 10;
-    }
-    else if (transitionTrend) {
-        status = "TRANSITION";
-        score = 50;
-    }
-
+function analyzeTrendQuality(candles4H, trend4H) {
+  if (!candles4H || !trend4H || trend4H.trendState === 0) {
     return {
-        status,
-        score,
-        efficiency,
-        atrRatio,
-        emaSlopePct,
-        structure,
-        reason: strongTrend
-            ? "Directional structure, EMA slope, efficiency and volatility confirmed"
-            : transitionTrend
-                ? "Directional structure present but trend strength/volatility is not fully confirmed"
-                : "Price action lacks sufficient directional structure; consolidation risk is high"
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "NONE",
+      reason: "No established directional 4H trend",
     };
+  }
 
+  const needed = Math.max(TREND_EMA_LENGTH + 5, TREND_QUALITY_LOOKBACK + 1, TREND_QUALITY_STRUCTURE_LOOKBACK + 2);
+
+  if (candles4H.length < needed) {
+    return {
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "UNKNOWN",
+      reason: "Insufficient 4H data",
+    };
+  }
+
+  const end = candles4H.length - 1;
+  const lookbackStart = end - TREND_QUALITY_LOOKBACK;
+  const structureStart = end - TREND_QUALITY_STRUCTURE_LOOKBACK;
+
+  const closes = candles4H.map((c) => Number(c.close));
+  const highs = candles4H.map((c) => Number(c.high));
+  const lows = candles4H.map((c) => Number(c.low));
+
+  if (!Number.isFinite(closes[end]) || !Number.isFinite(closes[lookbackStart])) {
+    return {
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "UNKNOWN",
+      reason: "Invalid 4H price data",
+    };
+  }
+
+  // -----------------------------------------------
+  // PRICE EFFICIENCY
+  // Net directional movement divided by total
+  // absolute movement over the last 10 closed 4H bars.
+  // Higher values = cleaner trend; lower values = chop.
+  // -----------------------------------------------
+  let path = 0;
+
+  for (let i = lookbackStart + 1; i <= end; i++) {
+    if (Number.isFinite(closes[i]) && Number.isFinite(closes[i - 1])) {
+      path += Math.abs(closes[i] - closes[i - 1]);
+    }
+  }
+
+  const netMove = closes[end] - closes[lookbackStart];
+
+  const efficiency = path > 0 ? Math.abs(netMove) / path : 0;
+
+  // -----------------------------------------------
+  // EMA20 SLOPE
+  // Compare the latest EMA20 with its value five
+  // closed 4H candles earlier.
+  // -----------------------------------------------
+  const emaNow = calculateEMAValue(candles4H.slice(0, end + 1), TREND_EMA_LENGTH);
+
+  const emaEarlier = calculateEMAValue(candles4H.slice(0, end - 5 + 1), TREND_EMA_LENGTH);
+
+  const emaSlopePct =
+    Number.isFinite(emaNow) && Number.isFinite(emaEarlier) && emaEarlier !== 0
+      ? ((emaNow - emaEarlier) / Math.abs(emaEarlier)) * 100
+      : 0;
+
+  // -----------------------------------------------
+  // ATR EXPANSION / COMPRESSION
+  // Current ATR14 compared with the average ATR14
+  // over the previous 10 available ATR readings.
+  // -----------------------------------------------
+  const atrValues = [];
+
+  for (let i = Math.max(TREND_ATR_LENGTH, end - 19); i <= end; i++) {
+    const atr = calculateATRValue(candles4H.slice(0, i + 1), TREND_ATR_LENGTH);
+
+    if (Number.isFinite(atr) && atr > 0) {
+      atrValues.push(atr);
+    }
+  }
+
+  const currentATR = atrValues.length ? atrValues[atrValues.length - 1] : null;
+
+  const previousATRValues = atrValues.length > 1 ? atrValues.slice(0, -1) : [];
+
+  const averagePreviousATR = previousATRValues.length
+    ? previousATRValues.reduce((sum, value) => sum + value, 0) / previousATRValues.length
+    : null;
+
+  const atrRatio =
+    Number.isFinite(currentATR) && Number.isFinite(averagePreviousATR) && averagePreviousATR > 0
+      ? currentATR / averagePreviousATR
+      : 0;
+
+  // -----------------------------------------------
+  // DIRECTIONAL STRUCTURE
+  // Require the latest close to continue moving in
+  // the established 4H direction and to sit on the
+  // correct side of the recent range midpoint.
+  // -----------------------------------------------
+  const recentHighs = highs.slice(structureStart, end + 1).filter(Number.isFinite);
+  const recentLows = lows.slice(structureStart, end + 1).filter(Number.isFinite);
+
+  const priorHighs = highs
+    .slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart)
+    .filter(Number.isFinite);
+  const priorLows = lows
+    .slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart)
+    .filter(Number.isFinite);
+
+  const recentHigh = recentHighs.length ? Math.max(...recentHighs) : null;
+  const recentLow = recentLows.length ? Math.min(...recentLows) : null;
+  const priorHigh = priorHighs.length ? Math.max(...priorHighs) : null;
+  const priorLow = priorLows.length ? Math.min(...priorLows) : null;
+
+  const rangeHigh = Math.max(...highs.slice(lookbackStart, end + 1).filter(Number.isFinite));
+  const rangeLow = Math.min(...lows.slice(lookbackStart, end + 1).filter(Number.isFinite));
+  const rangeMid = (rangeHigh + rangeLow) / 2;
+
+  let structure = "NEUTRAL";
+
+  if (trend4H.trendState === 1) {
+    structure =
+      closes[end] > closes[structureStart] &&
+      closes[end] > rangeMid &&
+      recentHigh !== null &&
+      priorHigh !== null &&
+      recentHigh > priorHigh
+        ? "BULLISH STRUCTURE"
+        : "WEAK BULLISH STRUCTURE";
+  } else if (trend4H.trendState === -1) {
+    structure =
+      closes[end] < closes[structureStart] &&
+      closes[end] < rangeMid &&
+      recentLow !== null &&
+      priorLow !== null &&
+      recentLow < priorLow
+        ? "BEARISH STRUCTURE"
+        : "WEAK BEARISH STRUCTURE";
+  }
+
+  const structureAligned = structure === "BULLISH STRUCTURE" || structure === "BEARISH STRUCTURE";
+
+  const emaSlopeAligned =
+    (trend4H.trendState === 1 && emaSlopePct >= TREND_QUALITY_MIN_EMA_SLOPE_PCT) ||
+    (trend4H.trendState === -1 && emaSlopePct <= -TREND_QUALITY_MIN_EMA_SLOPE_PCT);
+
+  const efficiencyStrong = efficiency >= TREND_QUALITY_MIN_EFFICIENCY;
+
+  const volatilityHealthy = atrRatio >= TREND_QUALITY_MIN_ATR_RATIO;
+
+  const strongTrend = structureAligned && emaSlopeAligned && efficiencyStrong && volatilityHealthy;
+
+  const transitionTrend = structureAligned && emaSlopeAligned && efficiency >= 0.2;
+
+  let status = "CONSOLIDATING";
+  let score = 0;
+
+  if (strongTrend) {
+    status = "STRONG TREND";
+    score = 100;
+    if (atrRatio >= 1) score += 10;
+    if (efficiency >= 0.5) score += 10;
+  } else if (transitionTrend) {
+    status = "TRANSITION";
+    score = 50;
+  }
+
+  return {
+    status,
+    score,
+    efficiency,
+    atrRatio,
+    emaSlopePct,
+    structure,
+    reason: strongTrend
+      ? "Directional structure, EMA slope, efficiency and volatility confirmed"
+      : transitionTrend
+        ? "Directional structure present but trend strength/volatility is not fully confirmed"
+        : "Price action lacks sufficient directional structure; consolidation risk is high",
+  };
 }
-
 
 //======================================================
 // ALIGNMENT SCORE
@@ -4234,407 +3160,183 @@ function analyzeTrendQuality(
 // Conflicting conditions = 0
 //======================================================
 
-function calculateAlignmentScore(
-    trend4H,
-    delta30M
-) {
+function calculateAlignmentScore(trend4H, delta30M) {
+  let score = 0;
 
-    let score =
-        0;
+  let trendPoints = 0;
 
-    let trendPoints =
-        0;
+  let orderFlowPoints = 0;
 
-    let orderFlowPoints =
-        0;
+  //==================================================
+  // BULLISH 4H
+  //==================================================
 
+  if (trend4H && trend4H.trendState === 1) {
+    trendPoints = 50;
 
-    //==================================================
-    // BULLISH 4H
-    //==================================================
-
-    if (
-        trend4H &&
-        trend4H.trendState === 1
-    ) {
-
-        trendPoints =
-            50;
-
-
-        if (
-            delta30M &&
-            delta30M.trend ===
-            "HIGHER POSITIVE"
-        ) {
-
-            orderFlowPoints =
-                50;
-
-        }
-
-        else if (
-            delta30M &&
-            delta30M.trend ===
-            "LOWER POSITIVE"
-        ) {
-
-            orderFlowPoints =
-                25;
-
-        }
-
+    if (delta30M && delta30M.trend === "HIGHER POSITIVE") {
+      orderFlowPoints = 50;
+    } else if (delta30M && delta30M.trend === "LOWER POSITIVE") {
+      orderFlowPoints = 25;
     }
+  }
 
+  //==================================================
+  // BEARISH 4H
+  //==================================================
+  else if (trend4H && trend4H.trendState === -1) {
+    trendPoints = 50;
 
-    //==================================================
-    // BEARISH 4H
-    //==================================================
-
-    else if (
-        trend4H &&
-        trend4H.trendState === -1
-    ) {
-
-        trendPoints =
-            50;
-
-
-        if (
-            delta30M &&
-            delta30M.trend ===
-            "LOWER NEGATIVE"
-        ) {
-
-            orderFlowPoints =
-                50;
-
-        }
-
-        else if (
-            delta30M &&
-            delta30M.trend ===
-            "HIGHER NEGATIVE"
-        ) {
-
-            orderFlowPoints =
-                25;
-
-        }
-
+    if (delta30M && delta30M.trend === "LOWER NEGATIVE") {
+      orderFlowPoints = 50;
+    } else if (delta30M && delta30M.trend === "HIGHER NEGATIVE") {
+      orderFlowPoints = 25;
     }
+  }
 
+  score = trendPoints + orderFlowPoints;
 
-    score =
-        trendPoints +
-        orderFlowPoints;
+  return {
+    score,
 
+    trendPoints,
 
-    return {
-
-        score,
-
-        trendPoints,
-
-        orderFlowPoints
-
-    };
-
+    orderFlowPoints,
+  };
 }
-
 
 //======================================================
 // CALCULATE COIN SCORE
 //======================================================
 
-async function calculateCoinScore(
-    symbol
-) {
+async function calculateCoinScore(symbol) {
+  try {
+    let delta30M = null;
 
-    try {
+    let trend4H = null;
 
-        let delta30M =
-            null;
+    let momentum1H = null;
 
-        let trend4H =
-            null;
+    let trendQuality = null;
 
-        let momentum1H =
-            null;
+    //================================================
+    // 30M DATA
+    //================================================
 
-        let trendQuality =
-            null;
+    const candles30M = await fetchFuturesKlines(symbol, "30m", 120);
 
+    if (!candles30M || candles30M.length < 3) {
+      log(`30M data unavailable for ${symbol}`);
 
-        //================================================
-        // 30M DATA
-        //================================================
-
-        const candles30M =
-            await fetchFuturesKlines(
-                symbol,
-                "30m",
-                120
-            );
-
-
-        if (
-            !candles30M ||
-            candles30M.length < 3
-        ) {
-
-            log(
-                `30M data unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        // Remove currently forming candle.
-
-        const closed30M =
-            candles30M.slice(
-                0,
-                -1
-            );
-
-
-        const currentPrice =
-            Number(
-                closed30M[
-                    closed30M.length - 1
-                ].close
-            );
-
-
-        if (
-            !Number.isFinite(
-                currentPrice
-            )
-        ) {
-
-            log(
-                `Current price unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        //================================================
-        // 30M CUMULATIVE DELTA
-        //================================================
-
-        const delta30MSeries =
-            calculateCumulativeDelta(
-                closed30M
-            );
-
-
-        delta30M =
-            analyzeDelta(
-                delta30MSeries
-            );
-
-
-        if (
-            !delta30M
-        ) {
-
-            log(
-                `30M Delta unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        //================================================
-        // 4H DATA
-        //================================================
-
-        const candles4H =
-            await fetchFuturesKlines(
-                symbol,
-                "4h",
-                120
-            );
-
-
-        if (
-            candles4H &&
-            candles4H.length >=
-            TREND_EMA_LENGTH + 2
-        ) {
-
-            const closed4H =
-                candles4H.slice(
-                    0,
-                    -1
-                );
-
-
-            trend4H =
-                calculate4HTrendATR(
-                    closed4H
-                );
-
-            trendQuality =
-                analyzeTrendQuality(
-                    closed4H,
-                    trend4H
-                );
-
-
-            if (
-                !trend4H
-            ) {
-
-                log(
-                    `4H Trend/ATR calculation unavailable for ${symbol}`
-                );
-
-            }
-
-        }
-
-        else {
-
-            log(
-                `4H data unavailable for ${symbol}. Candles received: ${
-                    candles4H
-                        ? candles4H.length
-                        : 0
-                }`
-            );
-
-        }
-
-
-        //================================================
-        // 1H DATA
-        //================================================
-
-        const candles1H =
-            await fetchFuturesKlines(
-                symbol,
-                "1h",
-                60
-            );
-
-
-        if (
-            candles1H &&
-            candles1H.length >=
-            (
-                (MOMENTUM_LOOKBACK_1H * 2) + 2
-            )
-        ) {
-
-            const closed1H =
-                candles1H.slice(
-                    0,
-                    -1
-                );
-
-
-            momentum1H =
-                calculate1HMomentum(
-                    closed1H
-                );
-
-        }
-
-        else {
-
-            log(
-                `1H Momentum data unavailable for ${symbol}. Candles received: ${
-                    candles1H
-                        ? candles1H.length
-                        : 0
-                }`
-            );
-
-        }
-
-
-        //================================================
-        // TREND HEALTH
-        //================================================
-
-        const trendHealth =
-            analyzeTrendHealth(
-                trend4H,
-                delta30M,
-                momentum1H
-            );
-
-
-        //================================================
-        // ALIGNMENT SCORE
-        //================================================
-
-        const alignmentScore =
-            calculateAlignmentScore(
-                trend4H,
-                delta30M
-            );
-
-
-        //================================================
-        // DELTA STRENGTH
-        //================================================
-
-        const orderFlowStrength =
-            Math.abs(
-                delta30M.deltaChange
-            );
-
-
-        //================================================
-        // RETURN RESULT
-        //================================================
-
-        return {
-
-            symbol,
-
-            currentPrice,
-
-            delta30M,
-
-            trend4H,
-
-            momentum1H,
-
-            trendHealth,
-
-            trendQuality,
-
-            alignmentScore,
-
-            orderFlowStrength
-
-        };
-
+      return null;
     }
 
-    catch (err) {
+    // Remove currently forming candle.
 
-        log(
-            `Order Flow Error ${symbol}: ${
-                err.message
-            }`
-        );
+    const closed30M = candles30M.slice(0, -1);
 
-        return null;
+    const currentPrice = Number(closed30M[closed30M.length - 1].close);
 
+    if (!Number.isFinite(currentPrice)) {
+      log(`Current price unavailable for ${symbol}`);
+
+      return null;
     }
 
+    //================================================
+    // 30M CUMULATIVE DELTA
+    //================================================
+
+    const delta30MSeries = calculateCumulativeDelta(closed30M);
+
+    delta30M = analyzeDelta(delta30MSeries);
+
+    if (!delta30M) {
+      log(`30M Delta unavailable for ${symbol}`);
+
+      return null;
+    }
+
+    //================================================
+    // 4H DATA
+    //================================================
+
+    const candles4H = await fetchFuturesKlines(symbol, "4h", 120);
+
+    if (candles4H && candles4H.length >= TREND_EMA_LENGTH + 2) {
+      const closed4H = candles4H.slice(0, -1);
+
+      trend4H = calculate4HTrendATR(closed4H);
+
+      trendQuality = analyzeTrendQuality(closed4H, trend4H);
+
+      if (!trend4H) {
+        log(`4H Trend/ATR calculation unavailable for ${symbol}`);
+      }
+    } else {
+      log(`4H data unavailable for ${symbol}. Candles received: ${candles4H ? candles4H.length : 0}`);
+    }
+
+    //================================================
+    // 1H DATA
+    //================================================
+
+    const candles1H = await fetchFuturesKlines(symbol, "1h", 60);
+
+    if (candles1H && candles1H.length >= MOMENTUM_LOOKBACK_1H * 2 + 2) {
+      const closed1H = candles1H.slice(0, -1);
+
+      momentum1H = calculate1HMomentum(closed1H);
+    } else {
+      log(`1H Momentum data unavailable for ${symbol}. Candles received: ${candles1H ? candles1H.length : 0}`);
+    }
+
+    //================================================
+    // TREND HEALTH
+    //================================================
+
+    const trendHealth = analyzeTrendHealth(trend4H, delta30M, momentum1H);
+
+    //================================================
+    // ALIGNMENT SCORE
+    //================================================
+
+    const alignmentScore = calculateAlignmentScore(trend4H, delta30M);
+
+    //================================================
+    // DELTA STRENGTH
+    //================================================
+
+    const orderFlowStrength = Math.abs(delta30M.deltaChange);
+
+    //================================================
+    // RETURN RESULT
+    //================================================
+
+    return {
+      symbol,
+
+      currentPrice,
+
+      delta30M,
+
+      trend4H,
+
+      momentum1H,
+
+      trendHealth,
+
+      trendQuality,
+
+      alignmentScore,
+
+      orderFlowStrength,
+    };
+  } catch (err) {
+    log(`Order Flow Error ${symbol}: ${err.message}`);
+
+    return null;
+  }
 }
 
 //======================================================
@@ -4674,259 +3376,130 @@ async function calculateCoinScore(
 //======================================================
 
 async function generateCoinScoreReport() {
+  try {
+    const results = [];
 
-    try {
+    //================================================
+    // SCAN ALL COINS
+    //================================================
 
-        const results = [];
+    for (const symbol of COIN_LIST) {
+      try {
+        const result = await calculateCoinScore(symbol);
 
+        if (result) {
+          results.push(result);
+        }
+      } catch (err) {
+        log(`Scanner Error ${symbol}: ${err.message}`);
+      }
+    }
 
-        //================================================
-        // SCAN ALL COINS
-        //================================================
+    //================================================
+    // FILTER ELIGIBLE TRENDING COINS
+    //
+    // A coin MUST pass ALL conditions:
+    //
+    // 1. 4H TREND = BULLISH or BEARISH
+    // 2. 1H MOMENTUM agrees with 4H trend
+    // 3. 30M DELTA agrees with 4H trend
+    // 4. TREND = HEALTHY
+    // 5. EXHAUSTION = LOW
+    //
+    // Only coins passing every condition can
+    // enter the TOP 7.
+    //================================================
 
-        for (
-            const symbol of COIN_LIST
-        ) {
+    const eligibleCoins = results.filter((coin) => {
+      if (!coin || !coin.trend4H || !coin.momentum1H || !coin.delta30M || !coin.trendHealth) {
+        return false;
+      }
 
-            try {
+      const trendState = coin.trend4H.trendState;
 
-                const result =
-                    await calculateCoinScore(
-                        symbol
-                    );
+      //================================================
+      // BULLISH TREND
+      //================================================
 
-                if (
-                    result
-                ) {
+      if (trendState === 1) {
+        // 1H momentum must be positive
 
-                    results.push(
-                        result
-                    );
+        const bullishMomentum = coin.momentum1H.direction === "POSITIVE";
 
-                }
+        // 30M delta must be positive
 
-            }
+        const bullishDelta = coin.delta30M.trend === "HIGHER POSITIVE" || coin.delta30M.trend === "LOWER POSITIVE";
 
-            catch (err) {
+        // Trend must be healthy
 
-                log(
-                    `Scanner Error ${symbol}: ${
-                        err.message
-                    }`
-                );
+        const healthy = coin.trendHealth.trend === "HEALTHY";
 
-            }
+        // Exhaustion must be low
 
+        const lowExhaustion = coin.trendHealth.exhaustion === "LOW";
+
+        const strongTrend = coin.trendQuality && coin.trendQuality.status === "STRONG TREND";
+
+        return bullishMomentum && bullishDelta && healthy && lowExhaustion && strongTrend;
+      }
+
+      //================================================
+      // BEARISH TREND
+      //================================================
+
+      if (trendState === -1) {
+        // 1H momentum must be negative
+
+        const bearishMomentum = coin.momentum1H.direction === "NEGATIVE";
+
+        // 30M delta must be negative
+
+        const bearishDelta = coin.delta30M.trend === "LOWER NEGATIVE" || coin.delta30M.trend === "HIGHER NEGATIVE";
+
+        // Trend must be healthy
+
+        const healthy = coin.trendHealth.trend === "HEALTHY";
+
+        // Exhaustion must be low
+
+        const lowExhaustion = coin.trendHealth.exhaustion === "LOW";
+
+        const strongTrend = coin.trendQuality && coin.trendQuality.status === "STRONG TREND";
+
+        return bearishMomentum && bearishDelta && healthy && lowExhaustion && strongTrend;
+      }
+
+      //================================================
+      // NEUTRAL 4H = NOT ELIGIBLE
+      //================================================
+
+      return false;
+    });
+
+    //================================================
+    // TOP 7
+    //
+    // Rank ONLY coins that passed ALL filters.
+    //
+    // 1. Highest alignment score
+    // 2. Strongest 30M delta movement breaks ties
+    //================================================
+
+    const top7 = eligibleCoins
+      .sort((a, b) => {
+        if (b.alignmentScore.score !== a.alignmentScore.score) {
+          return b.alignmentScore.score - a.alignmentScore.score;
         }
 
+        return b.orderFlowStrength - a.orderFlowStrength;
+      })
+      .slice(0, 7);
 
-        //================================================
-        // FILTER ELIGIBLE TRENDING COINS
-        //
-        // A coin MUST pass ALL conditions:
-        //
-        // 1. 4H TREND = BULLISH or BEARISH
-        // 2. 1H MOMENTUM agrees with 4H trend
-        // 3. 30M DELTA agrees with 4H trend
-        // 4. TREND = HEALTHY
-        // 5. EXHAUSTION = LOW
-        //
-        // Only coins passing every condition can
-        // enter the TOP 7.
-        //================================================
+    //================================================
+    // MESSAGE HEADER
+    //================================================
 
-        const eligibleCoins =
-            results.filter(
-                (
-                    coin
-                ) => {
-
-                    if (
-                        !coin ||
-                        !coin.trend4H ||
-                        !coin.momentum1H ||
-                        !coin.delta30M ||
-                        !coin.trendHealth
-                    ) {
-
-                        return false;
-
-                    }
-
-
-                    const trendState =
-                        coin.trend4H.trendState;
-
-
-                    //================================================
-                    // BULLISH TREND
-                    //================================================
-
-                    if (
-                        trendState === 1
-                    ) {
-
-                        // 1H momentum must be positive
-
-                        const bullishMomentum =
-                            coin.momentum1H.direction ===
-                            "POSITIVE";
-
-
-                        // 30M delta must be positive
-
-                        const bullishDelta =
-                            coin.delta30M.trend ===
-                                "HIGHER POSITIVE" ||
-
-                            coin.delta30M.trend ===
-                                "LOWER POSITIVE";
-
-
-                        // Trend must be healthy
-
-                        const healthy =
-                            coin.trendHealth.trend ===
-                            "HEALTHY";
-
-
-                        // Exhaustion must be low
-
-                        const lowExhaustion =
-                            coin.trendHealth.exhaustion ===
-                            "LOW";
-
-                        const strongTrend =
-                            coin.trendQuality &&
-                            coin.trendQuality.status ===
-                            "STRONG TREND";
-
-
-                        return (
-                            bullishMomentum &&
-                            bullishDelta &&
-                            healthy &&
-                            lowExhaustion &&
-                            strongTrend
-                        );
-
-                    }
-
-
-                    //================================================
-                    // BEARISH TREND
-                    //================================================
-
-                    if (
-                        trendState === -1
-                    ) {
-
-                        // 1H momentum must be negative
-
-                        const bearishMomentum =
-                            coin.momentum1H.direction ===
-                            "NEGATIVE";
-
-
-                        // 30M delta must be negative
-
-                        const bearishDelta =
-                            coin.delta30M.trend ===
-                                "LOWER NEGATIVE" ||
-
-                            coin.delta30M.trend ===
-                                "HIGHER NEGATIVE";
-
-
-                        // Trend must be healthy
-
-                        const healthy =
-                            coin.trendHealth.trend ===
-                            "HEALTHY";
-
-
-                        // Exhaustion must be low
-
-                        const lowExhaustion =
-                            coin.trendHealth.exhaustion ===
-                            "LOW";
-
-                        const strongTrend =
-                            coin.trendQuality &&
-                            coin.trendQuality.status ===
-                            "STRONG TREND";
-
-
-                        return (
-                            bearishMomentum &&
-                            bearishDelta &&
-                            healthy &&
-                            lowExhaustion &&
-                            strongTrend
-                        );
-
-                    }
-
-
-                    //================================================
-                    // NEUTRAL 4H = NOT ELIGIBLE
-                    //================================================
-
-                    return false;
-
-                }
-            );
-
-
-        //================================================
-        // TOP 7
-        //
-        // Rank ONLY coins that passed ALL filters.
-        //
-        // 1. Highest alignment score
-        // 2. Strongest 30M delta movement breaks ties
-        //================================================
-
-        const top7 =
-            eligibleCoins
-                .sort(
-                    (
-                        a,
-                        b
-                    ) => {
-
-                        if (
-                            b.alignmentScore.score !==
-                            a.alignmentScore.score
-                        ) {
-
-                            return (
-                                b.alignmentScore.score -
-                                a.alignmentScore.score
-                            );
-
-                        }
-
-
-                        return (
-                            b.orderFlowStrength -
-                            a.orderFlowStrength
-                        );
-
-                    }
-                )
-                .slice(
-                    0,
-                    7
-                );
-
-
-        //================================================
-        // MESSAGE HEADER
-        //================================================
-
-        let msg =
-`⚡ *COIN TREND REPORT*
+    let msg = `⚡ *COIN TREND REPORT*
 🕐 30-MINUTE UPDATE
 
 📊 4H = BROADER TREND
@@ -4938,17 +3511,12 @@ async function generateCoinScoreReport() {
 
 `;
 
+    //================================================
+    // NO ELIGIBLE COINS
+    //================================================
 
-        //================================================
-        // NO ELIGIBLE COINS
-        //================================================
-
-        if (
-            top7.length === 0
-        ) {
-
-            msg +=
-`⚪ *NO QUALIFYING COINS*
+    if (top7.length === 0) {
+      msg += `⚪ *NO QUALIFYING COINS*
 
 No coin currently satisfies all of the following:
 
@@ -4962,224 +3530,110 @@ No coin currently satisfies all of the following:
 The scanner is still monitoring all coins.
 
 `;
+    }
 
+    //================================================
+    // TOP 7 COINS
+    //================================================
+    else {
+      top7.forEach((coin, index) => {
+        const d30 = coin.delta30M;
+
+        const t4 = coin.trend4H;
+
+        const momentum = coin.momentum1H;
+
+        const health = coin.trendHealth;
+
+        //================================================
+        // 4H TREND
+        //================================================
+
+        const trendLabel = t4
+          ? t4.trendState === 1
+            ? "🟢 BULLISH"
+            : t4.trendState === -1
+              ? "🔴 BEARISH"
+              : "⚪ NEUTRAL"
+          : "⚪ UNKNOWN";
+
+        //================================================
+        // ATR ACTIVE SUPPORT / RESISTANCE
+        //================================================
+
+        let atrText = "⚪ N/A";
+
+        let distanceText = "N/A";
+
+        if (t4 && t4.activeLevel !== null) {
+          const distance = Math.abs(coin.currentPrice - Number(t4.activeLevel));
+
+          if (Number.isFinite(distance)) {
+            distanceText = distance.toFixed(6);
+          }
         }
 
+        if (t4) {
+          if (t4.trendState === 1) {
+            atrText = `🟢 SUPPORT @ ${t4.activeLevel !== null ? t4.activeLevel.toFixed(6) : "N/A"}`;
+          } else if (t4.trendState === -1) {
+            atrText = `🔴 RESISTANCE @ ${t4.activeLevel !== null ? t4.activeLevel.toFixed(6) : "N/A"}`;
+          }
+        }
 
         //================================================
-        // TOP 7 COINS
+        // 1H MOMENTUM
         //================================================
 
-        else {
+        let momentumText = "N/A";
 
-            top7.forEach(
-                (
-                    coin,
-                    index
-                ) => {
+        if (momentum) {
+          const momentumIcon = momentum.state === "DECELERATING" ? "🟡" : "🟢";
 
-                    const d30 =
-                        coin.delta30M;
+          const momentumValue = momentum.current >= 0 ? `+${momentum.current.toFixed(3)}` : momentum.current.toFixed(3);
 
-                    const t4 =
-                        coin.trend4H;
+          momentumText = `${momentumValue} ${momentumIcon}`;
+        }
 
-                    const momentum =
-                        coin.momentum1H;
+        //================================================
+        // 30M DELTA
+        //================================================
 
-                    const health =
-                        coin.trendHealth;
+        const flowText = d30 ? d30.trend : "N/A";
 
+        //================================================
+        // TREND QUALITY
+        //================================================
 
-                    //================================================
-                    // 4H TREND
-                    //================================================
+        const quality = coin.trendQuality || {
+          status: "UNKNOWN",
+          efficiency: 0,
+          atrRatio: 0,
+          emaSlopePct: 0,
+          structure: "UNKNOWN",
+        };
 
-                    const trendLabel =
-                        t4
-                            ? (
-                                t4.trendState === 1
-                                    ? "🟢 BULLISH"
-                                    : t4.trendState === -1
-                                        ? "🔴 BEARISH"
-                                        : "⚪ NEUTRAL"
-                            )
-                            : "⚪ UNKNOWN";
+        const qualityIcon = quality.status === "STRONG TREND" ? "🟢" : quality.status === "TRANSITION" ? "🟡" : "🔴";
 
+        const qualityText = `${qualityIcon} ${quality.status}`;
 
-                    //================================================
-                    // ATR ACTIVE SUPPORT / RESISTANCE
-                    //================================================
+        //================================================
+        // TREND HEALTH
+        //================================================
 
-                    let atrText =
-                        "⚪ N/A";
+        const trendIcon = health.trend === "HEALTHY" ? "🟢" : health.trend === "WEAKENING" ? "🟡" : "🔴";
 
-                    let distanceText =
-                        "N/A";
+        //================================================
+        // EXHAUSTION
+        //================================================
 
+        const exhaustionIcon = health.exhaustion === "LOW" ? "🟢" : health.exhaustion === "MODERATE" ? "🟡" : "🔴";
 
-                    if (
-                        t4 &&
-                        t4.activeLevel !== null
-                    ) {
+        //================================================
+        // REPORT ENTRY
+        //================================================
 
-                        const distance =
-                            Math.abs(
-                                coin.currentPrice -
-                                Number(
-                                    t4.activeLevel
-                                )
-                            );
-
-
-                        if (
-                            Number.isFinite(
-                                distance
-                            )
-                        ) {
-
-                            distanceText =
-                                distance.toFixed(
-                                    6
-                                );
-
-                        }
-
-                    }
-
-
-                    if (
-                        t4
-                    ) {
-
-                        if (
-                            t4.trendState === 1
-                        ) {
-
-                            atrText =
-                                `🟢 SUPPORT @ ${
-                                    t4.activeLevel !== null
-                                        ? t4.activeLevel.toFixed(6)
-                                        : "N/A"
-                                }`;
-
-                        }
-
-                        else if (
-                            t4.trendState === -1
-                        ) {
-
-                            atrText =
-                                `🔴 RESISTANCE @ ${
-                                    t4.activeLevel !== null
-                                        ? t4.activeLevel.toFixed(6)
-                                        : "N/A"
-                                }`;
-
-                        }
-
-                    }
-
-
-                    //================================================
-                    // 1H MOMENTUM
-                    //================================================
-
-                    let momentumText =
-                        "N/A";
-
-
-                    if (
-                        momentum
-                    ) {
-
-                        const momentumIcon =
-                            momentum.state ===
-                            "DECELERATING"
-                                ? "🟡"
-                                : "🟢";
-
-
-                        const momentumValue =
-                            momentum.current >= 0
-                                ? `+${momentum.current.toFixed(3)}`
-                                : momentum.current.toFixed(3);
-
-
-                        momentumText =
-                            `${momentumValue} ${momentumIcon}`;
-
-                    }
-
-
-                    //================================================
-                    // 30M DELTA
-                    //================================================
-
-                    const flowText =
-                        d30
-                            ? d30.trend
-                            : "N/A";
-
-
-                    //================================================
-                    // TREND QUALITY
-                    //================================================
-
-                    const quality =
-                        coin.trendQuality || {
-                            status: "UNKNOWN",
-                            efficiency: 0,
-                            atrRatio: 0,
-                            emaSlopePct: 0,
-                            structure: "UNKNOWN"
-                        };
-
-                    const qualityIcon =
-                        quality.status === "STRONG TREND"
-                            ? "🟢"
-                            : quality.status === "TRANSITION"
-                                ? "🟡"
-                                : "🔴";
-
-                    const qualityText =
-                        `${qualityIcon} ${quality.status}`;
-
-
-                    //================================================
-                    // TREND HEALTH
-                    //================================================
-
-                    const trendIcon =
-                        health.trend ===
-                        "HEALTHY"
-                            ? "🟢"
-                            : health.trend ===
-                              "WEAKENING"
-                                ? "🟡"
-                                : "🔴";
-
-
-                    //================================================
-                    // EXHAUSTION
-                    //================================================
-
-                    const exhaustionIcon =
-                        health.exhaustion ===
-                        "LOW"
-                            ? "🟢"
-                            : health.exhaustion ===
-                              "MODERATE"
-                                ? "🟡"
-                                : "🔴";
-
-
-                    //================================================
-                    // REPORT ENTRY
-                    //================================================
-
-                    msg +=
-`${index + 1}. *${coin.symbol}*
+        msg += `${index + 1}. *${coin.symbol}*
 
 📊 4H: ${trendLabel}
 🎯 ATR: ${atrText}
@@ -5194,35 +3648,23 @@ The scanner is still monitoring all coins.
 
 `;
 
+        //================================================
+        // SEPARATOR
+        //================================================
 
-                    //================================================
-                    // SEPARATOR
-                    //================================================
-
-                    if (
-                        index <
-                        top7.length - 1
-                    ) {
-
-                        msg +=
-`━━━━━━━━━━━━━━━━━━━━
+        if (index < top7.length - 1) {
+          msg += `━━━━━━━━━━━━━━━━━━━━
 
 `;
-
-                    }
-
-                }
-            );
-
         }
+      });
+    }
 
+    //================================================
+    // GUIDE
+    //================================================
 
-        //================================================
-        // GUIDE
-        //================================================
-
-        msg +=
-`━━━━━━━━━━━━━━━━━━━━
+    msg += `━━━━━━━━━━━━━━━━━━━━
 
 📌 *FILTER*
 4H trend must be established
@@ -5245,29 +3687,15 @@ Exhaustion must be LOW
 ⚠️ *INFORMATIONAL ONLY*
 `;
 
+    //================================================
+    // SEND TELEGRAM
+    //================================================
 
-        //================================================
-        // SEND TELEGRAM
-        //================================================
-
-        await sendMessage(
-            msg
-        );
-
-    }
-
-    catch (err) {
-
-        log(
-            `Order Flow Report Error: ${
-                err.message
-            }`
-        );
-
-    }
-
+    await sendMessage(msg);
+  } catch (err) {
+    log(`Order Flow Report Error: ${err.message}`);
+  }
 }
-
 
 //======================================================
 // INITIAL REPORT
@@ -5275,17 +3703,14 @@ Exhaustion must be LOW
 
 generateCoinScoreReport();
 
-
 //======================================================
 // RUN EVERY 30 MINUTES
 //======================================================
 
 setInterval(
+  generateCoinScoreReport,
 
-    generateCoinScoreReport,
-
-    30 * 60 * 1000
-
+  30 * 60 * 1000,
 );
 
 const ADMIN_CHAT_ID = 1718404728; // <-- Replace with your Telegram chat ID
@@ -5399,7 +3824,6 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
     return;
   }
   symbolActive[symbol] = false;
-  deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
 });
 
@@ -5411,15 +3835,15 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
     return;
   }
   symbolActive[symbol] = true;
-  deltaDivergenceState[symbol] = { BUY: null, SELL: null };
-  await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M delta divergence is required before entry.`);
+  await sendMessage(
+    `✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M OBV/50 EMA cross is required before entry.`,
+  );
 });
 
 bot.onText(/\/deactivateall/, async (msg) => {
   if (!isAdmin(msg)) return;
   COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
-    deltaDivergenceState[symbol] = { BUY: null, SELL: null };
   });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
@@ -5451,10 +3875,10 @@ bot.onText(/^\/price\s+(\w+)\s+([\d.]+)$/i, async (msg, match) => {
 
   await sendMessage(
     `🎯 *PRICE ACTIVATION SET*\n\n` +
-    `🪙 Coin: *${symbol}*\n` +
-    `💰 Activation Price: *${activationPrice}*\n\n` +
-    `🔒 ${symbol} is now locked until price crosses the activation level.\n` +
-    `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`
+      `🪙 Coin: *${symbol}*\n` +
+      `💰 Activation Price: *${activationPrice}*\n\n` +
+      `🔒 ${symbol} is now locked until price crosses the activation level.\n` +
+      `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`,
   );
 });
 
@@ -5475,8 +3899,8 @@ bot.onText(/^\/priceoff\s+(\w+)$/i, async (msg, match) => {
 
   await sendMessage(
     `🔓 *PRICE ACTIVATION REMOVED*\n\n` +
-    `🪙 *${symbol}* no longer has a price activation gate.\n` +
-    `Its normal /activate and /deactivate status remains unchanged.`
+      `🪙 *${symbol}* no longer has a price activation gate.\n` +
+      `Its normal /activate and /deactivate status remains unchanged.`,
   );
 });
 
@@ -5487,9 +3911,7 @@ bot.onText(/^\/pricestatus$/i, async (msg) => {
   const symbols = Object.keys(priceActivationLevels);
 
   if (!symbols.length) {
-    await sendMessage(
-      `🎯 *PRICE ACTIVATION STATUS*\n\nNo price activation levels are configured.`
-    );
+    await sendMessage(`🎯 *PRICE ACTIVATION STATUS*\n\nNo price activation levels are configured.`);
     return;
   }
 
@@ -5642,15 +4064,10 @@ bot.onText(/\/monthlyreport/, async (msg) => {
 
 bot.onText(/^\/activecoins$/, async (msg) => {
   try {
-    const activeCoins = COIN_LIST.filter(
-      symbol => symbolActive[symbol] !== false
-    );
+    const activeCoins = COIN_LIST.filter((symbol) => symbolActive[symbol] !== false);
 
     if (!activeCoins.length) {
-      await sendMessage(
-        "⚪ *ACTIVE COINS*\n\n" +
-        "No coins are currently active for trading."
-      );
+      await sendMessage("⚪ *ACTIVE COINS*\n\n" + "No coins are currently active for trading.");
       return;
     }
 
@@ -5680,13 +4097,10 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
 
     // Keep only today's trades. Older entries naturally fall
     // out of the displayed history when the date changes.
-    tradeHistory = tradeHistory.filter(trade => trade.date === today);
+    tradeHistory = tradeHistory.filter((trade) => trade.date === today);
 
     if (!tradeHistory.length) {
-      await sendMessage(
-        `📜 *TRADE HISTORY — ${today}*\n\n` +
-        "No trades have been placed today."
-      );
+      await sendMessage(`📜 *TRADE HISTORY — ${today}*\n\n` + "No trades have been placed today.");
       return;
     }
 
@@ -5698,7 +4112,7 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
-        hour12: false
+        hour12: false,
       }).format(new Date(trade.timestamp));
 
       message +=
