@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.8;
+const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -576,7 +576,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.1;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
@@ -937,13 +937,13 @@ function calculateOBVSeries(candles) {
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
-  if (!candles || candles.length < 2) return false;
+  if (!candles || candles.length < 3) return false;
 
-  // Measure directional volume across the latest 2 CLOSED 5M candles,
+  // Measure directional volume across the latest 3 CLOSED 5M candles,
   // while requiring the latest closed candle itself to agree with the entry.
   // This uses the same candle-direction volume classification as the bot's
   // existing Volume Imbalance Report.
-  const recentCandles = candles.slice(-2);
+  const recentCandles = candles.slice(-3);
   let buyVol = 0;
   let sellVol = 0;
 
@@ -2146,16 +2146,32 @@ setInterval(async () => {
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
-      // 1H STC CYCLE LOCK (if not manual)
+      // 1H STC CYCLE
       // =====================================================
-      if (!currentCycle[symbol]) {
-        if (MANUAL_CYCLE_BY_SYMBOL[symbol]) currentCycle[symbol] = MANUAL_CYCLE_BY_SYMBOL[symbol];
-        else if (MANUAL_CYCLE) currentCycle[symbol] = MANUAL_CYCLE;
-        else currentCycle[symbol] = stcRising ? "BULL" : stcFalling ? "BEAR" : null;
+      // In AUTO mode (MANUAL_CYCLE === null), the cycle is
+      // continuously synchronized with the latest CLOSED 1H
+      // STC direction. When STC changes from rising to falling
+      // or falling to rising, the trading cycle changes
+      // automatically without requiring /setbull or /setbear.
+      //
+      // In MANUAL mode, the manually selected cycle remains
+      // unchanged.
+      // =====================================================
+      if (MANUAL_CYCLE === null) {
+        const autoCycle = stcRising ? "BULL" : stcFalling ? "BEAR" : null;
 
-        if (currentCycle[symbol]) {
-          await sendMessage(`🔁 1H STC Cycle Locked for *${symbol}*: *${currentCycle[symbol]}*`);
+        if (autoCycle && autoCycle !== currentCycle[symbol]) {
+          const previousCycle = currentCycle[symbol];
+          currentCycle[symbol] = autoCycle;
+
+          if (previousCycle) {
+            await sendMessage(`🔄 1H STC Cycle Flipped for *${symbol}*: *${previousCycle} → ${autoCycle}*`);
+          } else {
+            await sendMessage(`🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`);
+          }
         }
+      } else if (!currentCycle[symbol]) {
+        currentCycle[symbol] = MANUAL_CYCLE;
       }
 
       const trendCycle = currentCycle[symbol];
