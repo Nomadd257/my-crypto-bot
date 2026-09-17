@@ -16,7 +16,7 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8712861439:AAH7xOydNxOi05zBA3DvEWzxoLVL3cMhu6U";
+const TELEGRAM_BOT_TOKEN = "8877150040:AAGa1plgO8zNUhRd-FNNoKyaUuHEROAxKe0";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "1718404728";
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -576,7 +576,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.1;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
