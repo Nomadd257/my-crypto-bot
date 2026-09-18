@@ -16,7 +16,7 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8877150040:AAGa1plgO8zNUhRd-FNNoKyaUuHEROAxKe0";
+const TELEGRAM_BOT_TOKEN = "8712861439:AAH7xOydNxOi05zBA3DvEWzxoLVL3cMhu6U";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_ID = "1718404728";
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -576,7 +576,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.1;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
@@ -2241,7 +2241,58 @@ setInterval(async () => {
           currentCycle[symbol] = autoCycle;
 
           if (previousCycle) {
-            await sendMessage(`🔄 1H STC Cycle Flipped for *${symbol}*: *${previousCycle} → ${autoCycle}*`);
+            // Immediately measure the opposing 5M pressure after every real
+            // 1H STC cycle flip. This is informational only and does not
+            // change entry, exit, or trade-management behavior.
+            let opposingDirection = autoCycle === "BULL" ? "SELL" : "BUY";
+            let opposingDelta = "N/A";
+            let opposingVolume = "N/A";
+
+            try {
+              const flipCandles5 = await fetchFuturesKlines(symbol, "5m", 150);
+              if (flipCandles5 && flipCandles5.length >= 40) {
+                const flipClosedCandles5 = flipCandles5.slice(0, -1);
+                const flipDelta = calculateTrendResetCumulativeDelta(flipClosedCandles5);
+
+                if (flipDelta && Number.isFinite(flipDelta.deltaStrength)) {
+                  const pressureStrength =
+                    autoCycle === "BULL" ? Math.max(0, -flipDelta.deltaStrength) : Math.max(0, flipDelta.deltaStrength);
+                  opposingDelta = pressureStrength.toFixed(2);
+                }
+
+                const recentPressureCandles = flipClosedCandles5.slice(-2);
+                let buyVol = 0;
+                let sellVol = 0;
+
+                for (const candle of recentPressureCandles) {
+                  const open = Number(candle.open);
+                  const close = Number(candle.close);
+                  const volume = Number(candle.volume);
+
+                  if (Number.isFinite(open) && Number.isFinite(close) && Number.isFinite(volume) && volume > 0) {
+                    if (close > open) buyVol += volume;
+                    else if (close < open) sellVol += volume;
+                  }
+                }
+
+                const totalPressureVol = buyVol + sellVol;
+                if (totalPressureVol > 0) {
+                  const pct =
+                    autoCycle === "BULL" ? (sellVol / totalPressureVol) * 100 : (buyVol / totalPressureVol) * 100;
+                  opposingVolume = `${pct.toFixed(1)}%`;
+                }
+              }
+            } catch (pressureErr) {
+              log(`⚠️ STC flip pressure measurement failed for ${symbol}: ${pressureErr?.message || pressureErr}`);
+            }
+
+            const pressureEmoji = opposingDelta !== "N/A" && Number(opposingDelta) >= 0.8 ? "⚠️" : "✅";
+
+            await sendMessage(
+              `🔄 1H STC FLIP — *${symbol}*\n` +
+                `${previousCycle === "BULL" ? "🟢" : "🔴"}→${autoCycle === "BULL" ? "🟢" : "🔴"} *${autoCycle}*\n` +
+                `${pressureEmoji} Opposing ${opposingDirection}: ${opposingDelta} Delta | ${opposingVolume} Vol`,
+            );
           } else {
             await sendMessage(`🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`);
           }
