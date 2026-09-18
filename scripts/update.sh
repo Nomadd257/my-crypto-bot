@@ -3,6 +3,7 @@ set -e
 
 # mise's rc-file activation doesn't run in non-interactive SSH sessions,
 # so load it explicitly here.
+#
 export PATH="$HOME/.local/bin:$PATH"
 eval "$(mise activate bash)"
 
