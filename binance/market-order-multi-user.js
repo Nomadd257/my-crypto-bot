@@ -576,7 +576,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.1;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
@@ -979,6 +979,82 @@ function hasEntryVolumeImbalance(candles, direction) {
 
   if (direction === "SELL") {
     return latestBearish && sellPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+  }
+
+  return false;
+}
+
+// =====================================================
+// 5M STC DIVERGENCE — 1H STC TRANSITION WARNING
+// =====================================================
+// This is NOT an entry trigger. It is a protective filter.
+// When the 1H cycle is BULL, bearish 5M STC divergence blocks
+// new BUYs. When the 1H cycle is BEAR, bullish 5M STC divergence
+// blocks new SELLs. The 1H STC cycle must still actually flip
+// before the opposite-direction entries are allowed.
+// =====================================================
+const STC_DIVERGENCE_LOOKBACK = 36;
+const STC_DIVERGENCE_PIVOT_STRENGTH = 2;
+const STC_DIVERGENCE_MAX_AGE_CANDLES = 8;
+
+function has5MSTCDivergence(candles, divergenceType) {
+  if (!candles || candles.length < 30) return false;
+
+  const start = Math.max(0, candles.length - STC_DIVERGENCE_LOOKBACK);
+  const recentCandles = candles.slice(start);
+  const closes = recentCandles.map((c) => Number(c.close));
+
+  if (closes.some((v) => !Number.isFinite(v))) return false;
+
+  const stcSeries = [];
+  for (let i = 0; i < closes.length; i++) {
+    const value = calculateSTC(closes.slice(0, i + 1), {
+      cycle: 4,
+      fast: 10,
+      slow: 20,
+      signal: 3,
+    });
+    stcSeries.push(value);
+  }
+
+  const strength = STC_DIVERGENCE_PIVOT_STRENGTH;
+  const pivotLows = [];
+  const pivotHighs = [];
+
+  for (let i = strength; i < recentCandles.length - strength; i++) {
+    const price = closes[i];
+    const stc = stcSeries[i];
+    if (!Number.isFinite(stc)) continue;
+
+    let isLow = true;
+    let isHigh = true;
+
+    for (let j = 1; j <= strength; j++) {
+      if (price >= closes[i - j] || price >= closes[i + j]) isLow = false;
+      if (price <= closes[i - j] || price <= closes[i + j]) isHigh = false;
+    }
+
+    if (isLow) pivotLows.push({ index: i, price, stc });
+    if (isHigh) pivotHighs.push({ index: i, price, stc });
+  }
+
+  const pivots = divergenceType === "BULLISH" ? pivotLows : pivotHighs;
+  if (pivots.length < 2) return false;
+
+  const latest = pivots[pivots.length - 1];
+  const previous = pivots[pivots.length - 2];
+  const latestAge = recentCandles.length - 1 - latest.index;
+
+  // Only use a recently confirmed divergence so an old divergence
+  // cannot block an otherwise valid new entry indefinitely.
+  if (latestAge > STC_DIVERGENCE_MAX_AGE_CANDLES) return false;
+
+  if (divergenceType === "BULLISH") {
+    return latest.price < previous.price && latest.stc > previous.stc;
+  }
+
+  if (divergenceType === "BEARISH") {
+    return latest.price > previous.price && latest.stc < previous.stc;
   }
 
   return false;
@@ -2217,6 +2293,21 @@ setInterval(async () => {
       }
 
       // =====================================================
+      // 5M STC DIVERGENCE TRANSITION FILTER
+      // =====================================================
+      // 1H BULL + bearish 5M STC divergence = block BUY
+      // 1H BEAR + bullish 5M STC divergence = block SELL
+      // The divergence is only an early warning; the 1H STC cycle
+      // must still flip before the opposite direction becomes valid.
+      // =====================================================
+      const stcTransitionWarning =
+        trendCycle === "BULL"
+          ? has5MSTCDivergence(closedCandles5, "BEARISH")
+          : trendCycle === "BEAR"
+            ? has5MSTCDivergence(closedCandles5, "BULLISH")
+            : false;
+
+      // =====================================================
       // ENTRY DIRECTION
       // =====================================================
 
@@ -2228,6 +2319,7 @@ setInterval(async () => {
 
       if (
         trendCycle === "BULL" &&
+        !stcTransitionWarning &&
         calculateOBVConfirmation(closedCandles5, "BUY") &&
         hasEntryVolumeImbalance(closedCandles5, "BUY") &&
         trDelta5.cumDelta > 0 &&
@@ -2243,6 +2335,7 @@ setInterval(async () => {
 
       if (
         trendCycle === "BEAR" &&
+        !stcTransitionWarning &&
         calculateOBVConfirmation(closedCandles5, "SELL") &&
         hasEntryVolumeImbalance(closedCandles5, "SELL") &&
         trDelta5.cumDelta < 0 &&
