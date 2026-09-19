@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.5;
+const SL_PCT = 1.8;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -41,6 +41,19 @@ const LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT = 5_000_000;
 const LIQUIDITY_MAX_SPREAD_PCT = 0.15;
 const LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE = 10;
 const LIQUIDITY_MIN_BOOK_DEPTH_USDT = 25_000;
+
+// --- Stop-loss liquidity diagnostic (informational only) ---
+const SL_LIQUIDITY_LOOKBACK_CANDLES = 48;
+const SL_LIQUIDITY_SWING_STRENGTH = 2;
+const SL_LIQUIDITY_NEAR_PERCENT = 0.25;
+const SL_LIQUIDITY_INSIDE_PERCENT = 0.10;
+const SL_LIQUIDITY_EQUAL_LEVEL_PERCENT = 0.10;
+const SL_LIQUIDITY_ORDER_BOOK_LEVELS = 20;
+const SL_LIQUIDITY_ORDER_BOOK_NEAR_PERCENT = 0.20;
+const SL_ORDER_BLOCK_LOOKBACK_CANDLES = 36;
+const SL_ORDER_BLOCK_DISPLACEMENT_MULTIPLIER = 1.5;
+const SL_ORDER_BLOCK_NEAR_PERCENT = 0.25;
+const SL_ORDER_BLOCK_INSIDE_PERCENT = 0.10;
 
 // --- Absorption warnings ---
 // Absorption is informational only for now. It NEVER blocks an entry.
@@ -114,6 +127,7 @@ let symbolCooldowns = {}; // { symbol: timestamp }
 let tradeHistory = []; // Successful trades placed by the bot
 let absorptionWarningState = {}; // { symbol: { BUY/SELL: candleKey } }
 let liquidityWarningState = {}; // { symbol: lastWarningTimestamp }
+let slLiquidityReportSent = {}; // { symbol: true }
 
 function getTradeHistoryDate() {
   return new Intl.DateTimeFormat("en-CA", {
@@ -1574,6 +1588,271 @@ function floorToStep(qty, step) {
   return Number((Math.floor(qty * factor) / factor).toFixed((s.toString().split(".")[1] || "").length));
 }
 
+// =====================================================
+// STOP-LOSS LIQUIDITY DIAGNOSTIC — INFORMATIONAL ONLY
+// =====================================================
+// Checks the bot's existing SL against observable potential
+// liquidity: recent 5M swing highs/lows, clustered highs/lows,
+// and nearby visible Binance Futures order-book levels.
+//
+// Hidden stop orders cannot be directly observed. This is a
+// precautionary diagnostic only and NEVER changes the trade,
+// SL, trailing stop, runner, or entry logic.
+// =====================================================
+
+function getStopLossPrice(entryPrice, direction) {
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) return null;
+
+  return direction === "BUY"
+    ? entryPrice * (1 - SL_PCT / 100)
+    : entryPrice * (1 + SL_PCT / 100);
+}
+
+function percentDistance(priceA, priceB) {
+  if (!Number.isFinite(priceA) || !Number.isFinite(priceB) || priceA <= 0) return Infinity;
+  return Math.abs(priceA - priceB) / priceA * 100;
+}
+
+function detectPotentialLiquidityLevels(candles) {
+  if (!Array.isArray(candles) || candles.length < 7) return [];
+
+  const levels = [];
+  const strength = SL_LIQUIDITY_SWING_STRENGTH;
+
+  for (let i = strength; i < candles.length - strength; i++) {
+    const high = Number(candles[i].high);
+    const low = Number(candles[i].low);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+
+    let swingHigh = true;
+    let swingLow = true;
+
+    for (let j = 1; j <= strength; j++) {
+      const lh = Number(candles[i - j].high);
+      const rh = Number(candles[i + j].high);
+      const ll = Number(candles[i - j].low);
+      const rl = Number(candles[i + j].low);
+
+      if (![lh, rh, ll, rl].every(Number.isFinite)) {
+        swingHigh = false;
+        swingLow = false;
+        break;
+      }
+
+      if (high < lh || high < rh) swingHigh = false;
+      if (low > ll || low > rl) swingLow = false;
+    }
+
+    if (swingHigh) levels.push({ price: high, type: "SWING HIGH" });
+    if (swingLow) levels.push({ price: low, type: "SWING LOW" });
+  }
+
+  // Repeated/equal highs and lows are treated as clustered potential liquidity.
+  for (let i = 0; i < candles.length; i++) {
+    const high = Number(candles[i].high);
+    const low = Number(candles[i].low);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+
+    for (let j = i + 1; j < candles.length; j++) {
+      const high2 = Number(candles[j].high);
+      const low2 = Number(candles[j].low);
+      if (!Number.isFinite(high2) || !Number.isFinite(low2)) continue;
+
+      if (percentDistance(high, high2) <= SL_LIQUIDITY_EQUAL_LEVEL_PERCENT) {
+        levels.push({ price: (high + high2) / 2, type: "EQUAL HIGH CLUSTER" });
+      }
+      if (percentDistance(low, low2) <= SL_LIQUIDITY_EQUAL_LEVEL_PERCENT) {
+        levels.push({ price: (low + low2) / 2, type: "EQUAL LOW CLUSTER" });
+      }
+    }
+  }
+
+  levels.sort((a, b) => a.price - b.price);
+
+  // Merge nearby observations into one liquidity area.
+  const merged = [];
+  for (const level of levels) {
+    const previous = merged[merged.length - 1];
+
+    if (
+      previous &&
+      percentDistance(previous.price, level.price) <= SL_LIQUIDITY_EQUAL_LEVEL_PERCENT
+    ) {
+      previous.price = (previous.price + level.price) / 2;
+      if (!previous.type.includes(level.type)) {
+        previous.type += ` + ${level.type}`;
+      }
+    } else {
+      merged.push({ ...level });
+    }
+  }
+
+  return merged;
+}
+
+function detectPotentialOrderBlocks(candles) {
+  if (!Array.isArray(candles) || candles.length < 8) return [];
+
+  const blocks = [];
+  const recent = candles.slice(-SL_ORDER_BLOCK_LOOKBACK_CANDLES);
+
+  for (let i = 2; i < recent.length - 2; i++) {
+    const base = recent[i];
+    const o = Number(base.open), h = Number(base.high), l = Number(base.low), c = Number(base.close);
+    if (![o, h, l, c].every(Number.isFinite) || h <= l) continue;
+
+    const baseBull = c > o;
+    const baseBear = c < o;
+    if (!baseBull && !baseBear) continue;
+
+    const baseRange = h - l;
+    const f1 = recent[i + 1];
+    const f2 = recent[i + 2];
+    const f1o = Number(f1.open), f1h = Number(f1.high), f1l = Number(f1.low), f1c = Number(f1.close);
+    const f2o = Number(f2.open), f2h = Number(f2.high), f2l = Number(f2.low), f2c = Number(f2.close);
+    if (![f1o, f1h, f1l, f1c, f2o, f2h, f2l, f2c].every(Number.isFinite)) continue;
+
+    const displacementRange = Math.max(f1h - f1l, f2h - f2l);
+    if (displacementRange < baseRange * SL_ORDER_BLOCK_DISPLACEMENT_MULTIPLIER) continue;
+
+    if (baseBear && f1c > f1o && f2c > f2o && f2c > h) {
+      blocks.push({ type: "BULLISH ORDER BLOCK", low: l, high: h });
+    }
+    if (baseBull && f1c < f1o && f2c < f2o && f2c < l) {
+      blocks.push({ type: "BEARISH ORDER BLOCK", low: l, high: h });
+    }
+  }
+
+  return blocks;
+}
+
+async function checkStopLossLiquidity(symbol, direction, entryPrice) {
+  try {
+    const slPrice = getStopLossPrice(entryPrice, direction);
+    if (!Number.isFinite(slPrice) || slPrice <= 0) {
+      return { status: "UNAVAILABLE", reason: "Invalid SL price." };
+    }
+
+    const [candles, depthRes] = await Promise.all([
+      fetchFuturesKlines(symbol, "5m", SL_LIQUIDITY_LOOKBACK_CANDLES + 10),
+      fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${SL_LIQUIDITY_ORDER_BOOK_LEVELS}`)
+    ]);
+
+    if (!Array.isArray(candles) || candles.length < 10) {
+      return {
+        status: "UNAVAILABLE",
+        entryPrice,
+        slPrice,
+        reason: "Not enough 5M candles available."
+      };
+    }
+
+    // Only closed candles are used.
+    const closedCandles = candles.slice(0, -1).slice(-SL_LIQUIDITY_LOOKBACK_CANDLES);
+    const levels = detectPotentialLiquidityLevels(closedCandles);
+    const orderBlocks = detectPotentialOrderBlocks(closedCandles);
+
+    let nearest = null;
+    for (const level of levels) {
+      const distance = percentDistance(slPrice, level.price);
+      if (!nearest || distance < nearest.distancePercent) {
+        nearest = { ...level, distancePercent: distance };
+      }
+    }
+
+    // Visible resting orders near the SL are reported separately.
+    let nearestBook = null;
+    if (depthRes.ok) {
+      const depth = await depthRes.json();
+      const book = [
+        ...(Array.isArray(depth?.bids) ? depth.bids : []),
+        ...(Array.isArray(depth?.asks) ? depth.asks : [])
+      ]
+        .map(x => ({ price: Number(x[0]), qty: Number(x[1]) }))
+        .filter(x => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.qty));
+
+      for (const level of book) {
+        const distance = percentDistance(slPrice, level.price);
+        if (distance <= SL_LIQUIDITY_ORDER_BOOK_NEAR_PERCENT) {
+          if (!nearestBook || distance < nearestBook.distancePercent) {
+            nearestBook = {
+              price: level.price,
+              qty: level.qty,
+              distancePercent: distance
+            };
+          }
+        }
+      }
+    }
+
+    let status = "CLEAR";
+    let reason = "No nearby potential liquidity area detected.";
+
+    if (nearest && nearest.distancePercent <= SL_LIQUIDITY_INSIDE_PERCENT) {
+      status = "INSIDE";
+      reason = `SL overlaps a detected ${nearest.type} potential liquidity area.`;
+    } else if (nearest && nearest.distancePercent <= SL_LIQUIDITY_NEAR_PERCENT) {
+      status = "NEAR";
+      reason = `SL is close to a detected ${nearest.type} potential liquidity area.`;
+    }
+
+    let nearestOrderBlock = null;
+    for (const block of orderBlocks) {
+      const inside = slPrice >= block.low && slPrice <= block.high;
+      const distancePercent = inside
+        ? 0
+        : Math.min(percentDistance(slPrice, block.low), percentDistance(slPrice, block.high));
+      if (!nearestOrderBlock || distancePercent < nearestOrderBlock.distancePercent) {
+        nearestOrderBlock = { ...block, distancePercent, inside };
+      }
+    }
+
+    return { status, entryPrice, slPrice, nearest, nearestBook, nearestOrderBlock, reason };
+  } catch (err) {
+    log(`⚠️ SL liquidity diagnostic error ${symbol}: ${err?.message || err}`);
+    return {
+      status: "UNAVAILABLE",
+      entryPrice,
+      slPrice: getStopLossPrice(entryPrice, direction),
+      reason: `Diagnostic error: ${err?.message || err}`
+    };
+  }
+}
+
+async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
+  const result = await checkStopLossLiquidity(symbol, direction, entryPrice);
+
+  const directionText = direction === "BUY" ? "BUY 🟢" : "SELL 🔴";
+  const ob = result.nearestOrderBlock;
+  const obStatus = ob
+    ? (ob.inside || ob.distancePercent <= SL_ORDER_BLOCK_INSIDE_PERCENT ? "🔴 INSIDE" :
+       ob.distancePercent <= SL_ORDER_BLOCK_NEAR_PERCENT ? "🟡 NEAR" : "🟢 CLEAR")
+    : "🟢 CLEAR";
+  const liqStatus = result.status === "INSIDE" ? "🔴 INSIDE" :
+    result.status === "NEAR" ? "🟡 NEAR" :
+    result.status === "CLEAR" ? "🟢 CLEAR" : "⚪ N/A";
+
+  let message =
+    `🔍 *SL DIAGNOSTIC — ${symbol}*\n\n` +
+    `📊 *${directionText}* | Entry: *${Number(result.entryPrice || 0).toPrecision(8)}* | SL: *${Number(result.slPrice || 0).toPrecision(8)}*\n\n` +
+    `📦 Order Block: *${obStatus}*`;
+
+  if (ob && obStatus !== "🟢 CLEAR") {
+    message += `\nZone: *${Number(ob.low).toPrecision(8)}–${Number(ob.high).toPrecision(8)}*`;
+  }
+
+  message += `\n💧 Liquidity: *${liqStatus}*`;
+  if (result.nearest) {
+    message += `\nNearest: *${Number(result.nearest.price).toPrecision(8)}* (${result.nearest.distancePercent.toFixed(2)}%)`;
+  }
+
+  if (result.nearestBook) {
+    message += `\n📚 Order Book: *${Number(result.nearestBook.price).toPrecision(8)}* (${result.nearestBook.distancePercent.toFixed(2)}%)`;
+  }
+
+  await sendMessage(message);
+}
+
 // --- Execute market orders for all users ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
   const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
@@ -1660,6 +1939,12 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         });
 
         await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+
+        // Informational only: inspect the existing SL after the trade is placed.
+        if (!slLiquidityReportSent[symbol]) {
+          slLiquidityReportSent[symbol] = true;
+          await sendStopLossLiquidityReport(symbol, direction, markPrice);
+        }
       } catch (err) {
         log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
       }
@@ -2259,6 +2544,7 @@ async function monitorPositions() {
       Object.keys(activePositions[symbol]).length === 0
     ) {
       delete runnerActivationNotified[symbol];
+      delete slLiquidityReportSent[symbol];
       delete activePositions[symbol];
     }
   }
