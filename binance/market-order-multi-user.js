@@ -28,7 +28,7 @@ const USERS_FILE = "./users.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
-const SL_PCT = 1.8;
+const SL_PCT = 1.5;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
 const SIGNAL_CHECK_INTERVAL_MS = 60 * 1000;
@@ -151,6 +151,7 @@ let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 
 // --- STC cycle trackers ---
 let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
+let script2PendingSetups = {}; // { symbol: { direction, zone, detectedAt, volumeImbalance } }
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -590,7 +591,12 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
+
+// Script 2 entry-zone settings. Price must interact with a detected
+// liquidity level or order block before the 2-candle imbalance is evaluated.
+const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.10;
+const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
@@ -1133,6 +1139,157 @@ function calculateOBVSeries(candles) {
   }
 
   return obv;
+}
+
+
+// =====================================================
+// SCRIPT 2 — ZONE + 2-CANDLE VOLUME IMBALANCE
+// =====================================================
+// Entry begins only after price reaches a detected liquidity
+// level or potential order block. The last 2 CLOSED 5M candles
+// are then measured together for directional volume imbalance.
+// =====================================================
+
+function calculateTwoCandleVolumeImbalance(candles) {
+  if (!Array.isArray(candles) || candles.length < 2) return null;
+
+  const recentCandles = candles.slice(-2);
+  let buyVol = 0;
+  let sellVol = 0;
+
+  for (const candle of recentCandles) {
+    const open = Number(candle.open);
+    const close = Number(candle.close);
+    const volume = Number(candle.volume);
+
+    if (
+      !Number.isFinite(open) ||
+      !Number.isFinite(close) ||
+      !Number.isFinite(volume) ||
+      volume <= 0
+    ) {
+      return null;
+    }
+
+    if (close > open) buyVol += volume;
+    else if (close < open) sellVol += volume;
+  }
+
+  const totalVol = buyVol + sellVol;
+  if (totalVol <= 0) return null;
+
+  const buyPct = (buyVol / totalVol) * 100;
+  const sellPct = (sellVol / totalVol) * 100;
+
+  if (buyPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT) {
+    return {
+      direction: "BUY",
+      buyVol,
+      sellVol,
+      buyPct,
+      sellPct,
+      candles: 2
+    };
+  }
+
+  if (sellPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT) {
+    return {
+      direction: "SELL",
+      buyVol,
+      sellVol,
+      buyPct,
+      sellPct,
+      candles: 2
+    };
+  }
+
+  return {
+    direction: null,
+    buyVol,
+    sellVol,
+    buyPct,
+    sellPct,
+    candles: 2
+  };
+}
+
+function priceInteractsWithZone(price, zone) {
+  if (!Number.isFinite(price) || !zone) return false;
+
+  if (zone.kind === "ORDER_BLOCK") {
+    return price >= zone.low && price <= zone.high;
+  }
+
+  return percentDistance(price, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT;
+}
+
+function findScript2Zone(candles, currentPrice) {
+  if (!Array.isArray(candles) || candles.length < 10 || !Number.isFinite(currentPrice)) {
+    return null;
+  }
+
+  const closed = candles.slice(-SCRIPT2_ZONE_LOOKBACK_CANDLES);
+  const orderBlocks = detectPotentialOrderBlocks(closed);
+  const liquidityLevels = detectPotentialLiquidityLevels(closed);
+  const candidates = [];
+
+  for (const block of orderBlocks) {
+    const zone = {
+      kind: "ORDER_BLOCK",
+      type: block.type,
+      low: Number(block.low),
+      high: Number(block.high)
+    };
+    if (
+      Number.isFinite(zone.low) &&
+      Number.isFinite(zone.high) &&
+      zone.high >= zone.low &&
+      priceInteractsWithZone(currentPrice, zone)
+    ) {
+      const center = (zone.low + zone.high) / 2;
+      candidates.push({
+        ...zone,
+        distancePercent: percentDistance(currentPrice, center)
+      });
+    }
+  }
+
+  for (const level of liquidityLevels) {
+    const price = Number(level.price);
+    if (!Number.isFinite(price)) continue;
+
+    const zone = {
+      kind: "LIQUIDITY",
+      type: level.type,
+      price
+    };
+
+    if (priceInteractsWithZone(currentPrice, zone)) {
+      candidates.push({
+        ...zone,
+        distancePercent: percentDistance(currentPrice, price)
+      });
+    }
+  }
+
+  if (!candidates.length) return null;
+
+  // Prefer an order block when price is inside one; otherwise use the
+  // closest detected liquidity level/zone.
+  candidates.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "ORDER_BLOCK" ? -1 : 1;
+    return a.distancePercent - b.distancePercent;
+  });
+
+  return candidates[0];
+}
+
+function formatScript2Zone(zone) {
+  if (!zone) return "N/A";
+  if (zone.kind === "ORDER_BLOCK") {
+    return `${zone.type}: ${Number(zone.low).toPrecision(8)}–${Number(zone.high).toPrecision(8)}`;
+  }
+  return `${zone.type}: ${Number(zone.price).toPrecision(8)}`;
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
@@ -2850,46 +3007,44 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// 5M OBV + TREND-RESET CUMULATIVE DELTA ENTRY
+// SCRIPT 2 ENTRY LOGIC — ZONE → 2-CANDLE VOLUME IMBALANCE → 1H STC
 // =====================================================
+// 1) Price must first interact with a potential liquidity level
+//    or order block.
+// 2) The last 2 CLOSED 5M candles are measured together.
+// 3) Directional volume imbalance must be >= 85%.
+// 4) If 1H STC already agrees with that direction, enter.
+// 5) If 1H STC is opposite, store the setup and wait for the
+//    1H STC to flip into the imbalance direction.
 //
-// 1H STC = TREND
-// 5M OBV 50 EMA cross = ENTRY SETUP
-// 5M Delta direction + SMA(10) + strength = FINAL ENTRY
-//
-// A coin can be activated without entering immediately.
-// A fresh 5M OBV/50 EMA cross must first confirm the direction.
-// Delta confirmation then determines whether an entry is allowed.
-//
-// Only CLOSED 5M candles are used.
+// Existing STC flip, pressure, absorption, liquidity, SL and
+// trade-management messages remain unchanged.
 // =====================================================
 
-const candles5 =
-  await fetchFuturesKlines(
-    symbol,
-    "5m",
-    150
-  );
+const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
+if (!candles5 || candles5.length < 40) continue;
 
-if (
-  !candles5 ||
-  candles5.length < 40
-) continue;
-
-// Remove currently forming 5M candle.
+// Only CLOSED 5M candles are used for the volume imbalance.
 const closedCandles5 = candles5.slice(0, -1);
 
-// Calculate ChartPrime-style Trend-Reset Cumulative Delta.
-const trDelta5 = calculateTrendResetCumulativeDelta(closedCandles5);
+// Current market price is used only to determine whether price has
+// reached/interacted with a detected zone.
+let script2CurrentPrice = null;
+try {
+  const priceRes = await fetch(
+    `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+  );
+  if (priceRes.ok) {
+    const priceData = await priceRes.json();
+    script2CurrentPrice = Number(priceData?.price);
+  }
+} catch (priceErr) {
+  log(`⚠️ Script 2 price check failed for ${symbol}: ${priceErr?.message || priceErr}`);
+}
 
-if (!trDelta5) continue;
+if (!Number.isFinite(script2CurrentPrice)) continue;
 
-// Require 5M OBV to cross its 50 EMA and hold on the correct side
-// for 2 consecutive CLOSED 5M candles with meaningful separation
-// before the Delta entry confirmation.
-
-// Absorption remains a 15M informational warning.
-// It is deliberately NOT changed to the 5M entry timeframe.
+// Keep the existing 15M absorption warning informational only.
 const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
 if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
   const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
@@ -2900,70 +3055,44 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
   );
 }
 
-// =====================================================
-// 5M STC DIVERGENCE TRANSITION FILTER
-// =====================================================
-// 1H BULL + bearish 5M STC divergence = block BUY
-// 1H BEAR + bullish 5M STC divergence = block SELL
-// The divergence is only an early warning; the 1H STC cycle
-// must still flip before the opposite direction becomes valid.
-// =====================================================
-const stcTransitionWarning =
-  trendCycle === "BULL"
-    ? has5MSTCDivergence(closedCandles5, "BEARISH")
-    : trendCycle === "BEAR"
-      ? has5MSTCDivergence(closedCandles5, "BULLISH")
-      : false;
+// -----------------------------------------------------
+// STEP 1 + 2 — ZONE REACH + 2-CANDLE IMBALANCE
+// -----------------------------------------------------
 
-// =====================================================
-// ENTRY DIRECTION
-// =====================================================
+const script2Zone = findScript2Zone(closedCandles5, script2CurrentPrice);
+
+if (script2Zone) {
+  const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+
+  if (volumeImbalance?.direction) {
+    script2PendingSetups[symbol] = {
+      direction: volumeImbalance.direction,
+      zone: script2Zone,
+      detectedAt: Date.now(),
+      volumeImbalance
+    };
+  }
+}
+
+// -----------------------------------------------------
+// STEP 3 — CURRENT 1H STC OR WAIT FOR A FLIP
+// -----------------------------------------------------
 
 let direction = null;
+const pendingSetup = script2PendingSetups[symbol];
 
+if (pendingSetup) {
+  const requiredCycle = pendingSetup.direction === "BUY" ? "BULL" : "BEAR";
 
-// -----------------------------------------------------
-// BULLISH 1H + BULLISH 15M DELTA
-// -----------------------------------------------------
-
-if (
-  trendCycle === "BULL" &&
-  !stcTransitionWarning &&
-  calculateOBVConfirmation(
-    closedCandles5,
-    "BUY"
-  ) &&
-  hasEntryVolumeImbalance(closedCandles5, "BUY") &&
-  trDelta5.cumDelta > 0 &&
-  trDelta5.cumDelta > trDelta5.deltaMA &&
-  trDelta5.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-) {
-
-  direction = "BUY";
-
+  if (trendCycle === requiredCycle) {
+    // STC is already aligned with the 85% volume imbalance.
+    direction = pendingSetup.direction;
+  }
 }
 
-
-// -----------------------------------------------------
-// BEARISH 1H + BEARISH 15M DELTA
-// -----------------------------------------------------
-
-if (
-  trendCycle === "BEAR" &&
-  !stcTransitionWarning &&
-  calculateOBVConfirmation(
-    closedCandles5,
-    "SELL"
-  ) &&
-  hasEntryVolumeImbalance(closedCandles5, "SELL") &&
-  trDelta5.cumDelta < 0 &&
-  trDelta5.cumDelta < trDelta5.deltaMA &&
-  trDelta5.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
-) {
-
-  direction = "SELL";
-
-}
+// If the 1H STC was opposite when the setup was detected, the normal
+// STC cycle update above will change trendCycle when the real closed-1H
+// flip occurs. At that point the pending setup becomes executable.
 
       // =====================================================
       // LIQUIDITY GATE + EXECUTION
@@ -2990,6 +3119,7 @@ if (
         }
 
         await executeMarketOrderForAllUsers(symbol, direction);
+        delete script2PendingSetups[symbol];
 
         const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
         const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
