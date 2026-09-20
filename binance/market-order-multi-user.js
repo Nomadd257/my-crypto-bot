@@ -598,6 +598,11 @@ const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 90;
 const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.10;
 const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 
+// Script 2 location filter. A liquidity/order-block zone qualifies only
+// when it is located at/near an ATR high or ATR low area. The ATR location
+// is measured against either the current-day or previous-day high/low.
+const SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR = 0.20;
+
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
 const ATR_BAND_EMA_LENGTH = 20;
@@ -1306,7 +1311,48 @@ function priceInteractsWithZone(price, zone) {
   return percentDistance(price, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT;
 }
 
-function findScript2Zone(candles, currentPrice) {
+function getScript2AtrLocation(zone, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow) {
+  if (!zone || !Number.isFinite(atr) || atr <= 0) return null;
+
+  const levels = [
+    { name: "CURRENT DAY HIGH", price: Number(currentDayHigh), side: "HIGH" },
+    { name: "CURRENT DAY LOW", price: Number(currentDayLow), side: "LOW" },
+    { name: "PREVIOUS DAY HIGH", price: Number(previousDayHigh), side: "HIGH" },
+    { name: "PREVIOUS DAY LOW", price: Number(previousDayLow), side: "LOW" }
+  ].filter((level) => Number.isFinite(level.price) && level.price > 0);
+
+  if (!levels.length) return null;
+
+  const zoneLow = zone.kind === "ORDER_BLOCK" ? Number(zone.low) : Number(zone.price);
+  const zoneHigh = zone.kind === "ORDER_BLOCK" ? Number(zone.high) : Number(zone.price);
+
+  if (!Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh)) return null;
+
+  let nearest = null;
+
+  for (const level of levels) {
+    const distance = level.price < zoneLow
+      ? zoneLow - level.price
+      : level.price > zoneHigh
+        ? level.price - zoneHigh
+        : 0;
+
+    const distanceATR = distance / atr;
+
+    if (distanceATR <= SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR &&
+        (!nearest || distanceATR < nearest.distanceATR)) {
+      nearest = {
+        ...level,
+        distance,
+        distanceATR
+      };
+    }
+  }
+
+  return nearest;
+}
+
+function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow) {
   if (!Array.isArray(candles) || candles.length < 10 || !Number.isFinite(currentPrice)) {
     return null;
   }
@@ -1329,10 +1375,19 @@ function findScript2Zone(candles, currentPrice) {
       zone.high >= zone.low &&
       priceInteractsWithZone(currentPrice, zone)
     ) {
+      const atrLocation = getScript2AtrLocation(
+        zone, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow
+      );
+
+      // Script 2 only accepts zones located at/near an ATR high/low area
+      // associated with either the current or previous trading day.
+      if (!atrLocation) continue;
+
       const center = (zone.low + zone.high) / 2;
       candidates.push({
         ...zone,
-        distancePercent: percentDistance(currentPrice, center)
+        distancePercent: percentDistance(currentPrice, center),
+        atrLocation
       });
     }
   }
@@ -1348,9 +1403,16 @@ function findScript2Zone(candles, currentPrice) {
     };
 
     if (priceInteractsWithZone(currentPrice, zone)) {
+      const atrLocation = getScript2AtrLocation(
+        zone, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow
+      );
+
+      if (!atrLocation) continue;
+
       candidates.push({
         ...zone,
-        distancePercent: percentDistance(currentPrice, price)
+        distancePercent: percentDistance(currentPrice, price),
+        atrLocation
       });
     }
   }
@@ -1358,7 +1420,7 @@ function findScript2Zone(candles, currentPrice) {
   if (!candidates.length) return null;
 
   // Prefer an order block when price is inside one; otherwise use the
-  // closest detected liquidity level/zone.
+  // closest qualifying liquidity level/zone.
   candidates.sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "ORDER_BLOCK" ? -1 : 1;
     return a.distancePercent - b.distancePercent;
@@ -3093,7 +3155,8 @@ setInterval(async () => {
 // SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 1H STC
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
-//    or order block.
+//    or order block that is located at/near an ATR high/low area
+//    associated with the current-day or previous-day high/low.
 // 2) The bot determines bullish/bearish absorption at that zone.
 // 3) Only after absorption is established, the last 2 CLOSED 5M
 //    candles are measured together for directional volume imbalance.
@@ -3144,7 +3207,21 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 // STEP 1 — ZONE REACH
 // -----------------------------------------------------
 
-const script2Zone = findScript2Zone(closedCandles5, script2CurrentPrice);
+const currentDayCandle = dailyCandles[dailyCandles.length - 1];
+const currentDayHigh = Number(currentDayCandle?.high);
+const currentDayLow = Number(currentDayCandle?.low);
+const previousDayHigh = Number(lastClosedDaily?.high);
+const previousDayLow = Number(lastClosedDaily?.low);
+
+const script2Zone = findScript2Zone(
+  closedCandles5,
+  script2CurrentPrice,
+  atr,
+  currentDayHigh,
+  currentDayLow,
+  previousDayHigh,
+  previousDayLow
+);
 
 if (script2Zone) {
   // ---------------------------------------------------
