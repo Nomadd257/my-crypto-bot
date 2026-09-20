@@ -3157,13 +3157,15 @@ setInterval(async () => {
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
-// 2) The bot determines bullish/bearish absorption at that zone.
-// 3) Only after absorption is established, the last 2 CLOSED 5M
-//    candles are measured together for directional volume imbalance.
-// 4) The imbalance must confirm the absorption direction at >= 90%.
-// 5) If 1H STC already agrees with the absorption direction, enter.
-// 6) If 1H STC is opposite, store the setup and wait for the real
-//    closed-1H STC flip into the absorption direction.
+// 2) The bot first checks for bullish/bearish absorption at that zone.
+// 3) If absorption is detected, the last 2 CLOSED 5M candles must show
+//    >=90% directional volume imbalance confirming the absorption.
+// 4) If no absorption is detected, the zone can still qualify as a
+//    TREND CONTINUATION setup when: ATR HIGH + 1H BULL, or ATR LOW + 1H BEAR.
+// 5) Continuation also requires >=90% directional volume imbalance in
+//    the 1H trend direction.
+// 6) If 1H STC is opposite the valid setup direction, store the setup
+//    and wait for the real closed-1H STC flip into that direction.
 //
 // Existing STC flip, pressure, absorption, liquidity, SL and
 // trade-management messages remain unchanged.
@@ -3225,22 +3227,42 @@ const script2Zone = findScript2Zone(
 
 if (script2Zone) {
   // ---------------------------------------------------
-  // STEP 2 — DETERMINE ABSORPTION AT THE ZONE
+  // STEP 2 — DETERMINE ABSORPTION OR CONTINUATION
   // ---------------------------------------------------
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
+  const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
 
   if (absorption?.direction) {
-    // -------------------------------------------------
-    // STEP 3 — CALCULATE 2-CANDLE IMBALANCE AFTER
-    // ABSORPTION HAS BEEN DETERMINED
-    // -------------------------------------------------
-    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
-
-    // The imbalance must confirm the absorption direction.
+    // REVERSAL BRANCH:
+    // Absorption determines direction, and the 2-candle imbalance
+    // must confirm that same direction at the configured >=90% level.
     if (volumeImbalance?.direction === absorption.direction) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
+        setupType: "REVERSAL",
         absorption: absorption.type,
+        zone: script2Zone,
+        detectedAt: Date.now(),
+        volumeImbalance
+      };
+    }
+  } else if (volumeImbalance?.direction) {
+    // CONTINUATION BRANCH:
+    // Absence of absorption alone is NOT enough. The 1H STC must
+    // already show the continuation direction at the ATR extreme:
+    // ATR HIGH + BULL = bullish continuation
+    // ATR LOW  + BEAR = bearish continuation
+    const atrSide = script2Zone.atrLocation?.side;
+    const continuationDirection =
+      atrSide === "HIGH" && trendCycle === "BULL" ? "BUY" :
+      atrSide === "LOW" && trendCycle === "BEAR" ? "SELL" :
+      null;
+
+    if (continuationDirection && volumeImbalance.direction === continuationDirection) {
+      script2PendingSetups[symbol] = {
+        direction: continuationDirection,
+        setupType: "CONTINUATION",
+        absorption: null,
         zone: script2Zone,
         detectedAt: Date.now(),
         volumeImbalance
