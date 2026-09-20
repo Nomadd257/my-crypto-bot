@@ -1150,6 +1150,89 @@ function calculateOBVSeries(candles) {
 // are then measured together for directional volume imbalance.
 // =====================================================
 
+function detectScript2Absorption(candles, zone) {
+  if (!Array.isArray(candles) || candles.length < 22 || !zone) return null;
+
+  const recent = candles.slice(-21, -1);
+  const latest = candles[candles.length - 1];
+
+  const open = Number(latest.open);
+  const high = Number(latest.high);
+  const low = Number(latest.low);
+  const close = Number(latest.close);
+  const volume = Number(latest.volume);
+
+  if (![open, high, low, close, volume].every(Number.isFinite) || volume <= 0) {
+    return null;
+  }
+
+  // The absorption candle must actually interact with the detected
+  // liquidity/order-block zone.
+  const candleTouchesZone = zone.kind === "ORDER_BLOCK"
+    ? high >= zone.low && low <= zone.high
+    : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+      percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+      (low <= zone.price && high >= zone.price);
+
+  if (!candleTouchesZone) return null;
+
+  const avgVolume = recent.reduce((sum, candle) => {
+    const v = Number(candle.volume);
+    return sum + (Number.isFinite(v) && v > 0 ? v : 0);
+  }, 0) / recent.length;
+
+  if (!Number.isFinite(avgVolume) || avgVolume <= 0) return null;
+
+  const range = high - low;
+  if (range <= 0) return null;
+
+  const body = Math.abs(close - open);
+  const upperWick = high - Math.max(open, close);
+  const lowerWick = Math.min(open, close) - low;
+  const effortRatio = volume / avgVolume;
+  const bodyRatio = body / range;
+  const upperWickRatio = upperWick / range;
+  const lowerWickRatio = lowerWick / range;
+
+  // Bullish absorption: aggressive selling is absorbed by buyers.
+  // A bearish candle with elevated volume is rejected from its lows.
+  if (
+    close < open &&
+    effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    lowerWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+  ) {
+    return {
+      direction: "BUY",
+      type: "BULLISH ABSORPTION",
+      effortRatio,
+      bodyRatio,
+      wickRatio: lowerWickRatio,
+      candle: latest
+    };
+  }
+
+  // Bearish absorption: aggressive buying is absorbed by sellers.
+  // A bullish candle with elevated volume is rejected from its highs.
+  if (
+    close > open &&
+    effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    upperWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+  ) {
+    return {
+      direction: "SELL",
+      type: "BEARISH ABSORPTION",
+      effortRatio,
+      bodyRatio,
+      wickRatio: upperWickRatio,
+      candle: latest
+    };
+  }
+
+  return null;
+}
+
 function calculateTwoCandleVolumeImbalance(candles) {
   if (!Array.isArray(candles) || candles.length < 2) return null;
 
@@ -3007,15 +3090,17 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → 2-CANDLE VOLUME IMBALANCE → 1H STC
+// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 1H STC
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block.
-// 2) The last 2 CLOSED 5M candles are measured together.
-// 3) Directional volume imbalance must be >= 85%.
-// 4) If 1H STC already agrees with that direction, enter.
-// 5) If 1H STC is opposite, store the setup and wait for the
-//    1H STC to flip into the imbalance direction.
+// 2) The bot determines bullish/bearish absorption at that zone.
+// 3) Only after absorption is established, the last 2 CLOSED 5M
+//    candles are measured together for directional volume imbalance.
+// 4) The imbalance must confirm the absorption direction at >= 90%.
+// 5) If 1H STC already agrees with the absorption direction, enter.
+// 6) If 1H STC is opposite, store the setup and wait for the real
+//    closed-1H STC flip into the absorption direction.
 //
 // Existing STC flip, pressure, absorption, liquidity, SL and
 // trade-management messages remain unchanged.
@@ -3056,26 +3141,39 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 }
 
 // -----------------------------------------------------
-// STEP 1 + 2 — ZONE REACH + 2-CANDLE IMBALANCE
+// STEP 1 — ZONE REACH
 // -----------------------------------------------------
 
 const script2Zone = findScript2Zone(closedCandles5, script2CurrentPrice);
 
 if (script2Zone) {
-  const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+  // ---------------------------------------------------
+  // STEP 2 — DETERMINE ABSORPTION AT THE ZONE
+  // ---------------------------------------------------
+  const absorption = detectScript2Absorption(closedCandles5, script2Zone);
 
-  if (volumeImbalance?.direction) {
-    script2PendingSetups[symbol] = {
-      direction: volumeImbalance.direction,
-      zone: script2Zone,
-      detectedAt: Date.now(),
-      volumeImbalance
-    };
+  if (absorption?.direction) {
+    // -------------------------------------------------
+    // STEP 3 — CALCULATE 2-CANDLE IMBALANCE AFTER
+    // ABSORPTION HAS BEEN DETERMINED
+    // -------------------------------------------------
+    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+
+    // The imbalance must confirm the absorption direction.
+    if (volumeImbalance?.direction === absorption.direction) {
+      script2PendingSetups[symbol] = {
+        direction: absorption.direction,
+        absorption: absorption.type,
+        zone: script2Zone,
+        detectedAt: Date.now(),
+        volumeImbalance
+      };
+    }
   }
 }
 
 // -----------------------------------------------------
-// STEP 3 — CURRENT 1H STC OR WAIT FOR A FLIP
+// STEP 4 — CURRENT 1H STC OR WAIT FOR A FLIP
 // -----------------------------------------------------
 
 let direction = null;
@@ -3085,7 +3183,7 @@ if (pendingSetup) {
   const requiredCycle = pendingSetup.direction === "BUY" ? "BULL" : "BEAR";
 
   if (trendCycle === requiredCycle) {
-    // STC is already aligned with the 85% volume imbalance.
+    // STC is already aligned with the absorption direction and confirmed imbalance.
     direction = pendingSetup.direction;
   }
 }
@@ -3134,7 +3232,7 @@ if (pendingSetup) {
         symbolCooldowns[symbol] = now;
       }
     } catch (err) {
-      log(`❌ STC + ATR scan error ${symbol}: ${err?.message || err}`);
+      log(`❌ Script 2 scan error ${symbol}: ${err?.message || err}`);
     }
   }
 
