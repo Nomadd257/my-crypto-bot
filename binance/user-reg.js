@@ -13,7 +13,7 @@ const fs = require("fs");
 // Replace this with your NEW token generated
 // from @BotFather.
 // Do NOT use the token previously posted.
-const bot = new TelegramBot("8550347456:AAHrlgXFP44IEJ_D2TihkfS6aH9aTIn9XW0", {
+const bot = new TelegramBot("8811395311:AAHMqxvTS7J3x5IJIZrrjeS9CnAMojWxfrI", {
   polling: true,
 });
 

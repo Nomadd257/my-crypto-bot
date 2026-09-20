@@ -591,7 +591,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 90;
 
 // Script 2 entry-zone settings. Price must interact with a detected
 // liquidity level or order block before the 2-candle imbalance is evaluated.
