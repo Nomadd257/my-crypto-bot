@@ -591,7 +591,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 90;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 85;
 
 // Script 2 entry-zone settings. Price must interact with a detected
 // liquidity level or order block before the 2-candle imbalance is evaluated.
@@ -1992,6 +1992,99 @@ function detectPotentialLiquidityLevels(candles) {
   return merged;
 }
 
+// Approximate Volume Profile POC. Used for both the SL diagnostic and Script 2 entry confirmation.
+// Uses recent closed 1M candles, groups traded volume into price bins,
+// and returns the price bin with the greatest accumulated volume.
+function calculateVolumeProfilePOC(candles, binCount = 50) {
+  if (!Array.isArray(candles) || candles.length < 20) return null;
+
+  const valid = candles.filter(c => {
+    const h = Number(c.high), l = Number(c.low), v = Number(c.volume);
+    return Number.isFinite(h) && Number.isFinite(l) && Number.isFinite(v) && h >= l && v > 0;
+  });
+  if (valid.length < 20) return null;
+
+  const rangeHigh = Math.max(...valid.map(c => Number(c.high)));
+  const rangeLow = Math.min(...valid.map(c => Number(c.low)));
+  const range = rangeHigh - rangeLow;
+  if (!Number.isFinite(range) || range <= 0) return rangeLow;
+
+  const bins = Math.max(20, Math.min(100, Math.floor(binCount)));
+  const binSize = range / bins;
+  const volumeByBin = new Array(bins).fill(0);
+
+  // Allocate each 1M candle's volume to the price bin containing its
+  // volume-weighted typical price. This is an approximation of a
+  // lower-timeframe Volume Profile suitable for an informational report.
+  for (const candle of valid) {
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const close = Number(candle.close);
+    const price = Number.isFinite(close) ? (high + low + close) / 3 : (high + low) / 2;
+    let index = Math.floor((price - rangeLow) / binSize);
+    if (index < 0) index = 0;
+    if (index >= bins) index = bins - 1;
+    volumeByBin[index] += Number(candle.volume);
+  }
+
+  let pocIndex = 0;
+  for (let i = 1; i < volumeByBin.length; i++) {
+    if (volumeByBin[i] > volumeByBin[pocIndex]) pocIndex = i;
+  }
+
+  return rangeLow + (pocIndex + 0.5) * binSize;
+}
+
+function getPOCHoldStatus(candles, poc) {
+  if (!Array.isArray(candles) || candles.length < 2 || !Number.isFinite(poc)) {
+    return { status: "UNAVAILABLE", closes: [] };
+  }
+
+  const lastTwo = candles.slice(-2);
+  const closes = lastTwo.map(c => Number(c.close));
+  if (!closes.every(Number.isFinite)) return { status: "UNAVAILABLE", closes };
+
+  const above = closes.every(close => close > poc);
+  const below = closes.every(close => close < poc);
+
+  if (above) return { status: "ABOVE", closes };
+  if (below) return { status: "BELOW", closes };
+  return { status: "NO CLEAR HOLD", closes };
+}
+
+
+// Script 2 POC execution confirmation.
+// BUY requires both of the latest 2 CLOSED 5M candle closes to remain ABOVE
+// the current POC. SELL requires both to remain BELOW the current POC.
+// The POC itself is calculated from recent CLOSED 1M candles using the same
+// Volume Profile approximation already used by the diagnostic.
+async function getScript2POCConfirmation(symbol, closedCandles5) {
+  try {
+    if (!Array.isArray(closedCandles5) || closedCandles5.length < 2) {
+      return { confirmed: false, status: "UNAVAILABLE", poc: null };
+    }
+
+    const pocCandles = await fetchFuturesKlines(symbol, "1m", 300);
+    if (!Array.isArray(pocCandles) || pocCandles.length < 21) {
+      return { confirmed: false, status: "UNAVAILABLE", poc: null };
+    }
+
+    const closedPOCCandles = pocCandles.slice(0, -1);
+    const poc = calculateVolumeProfilePOC(closedPOCCandles);
+    const pocHold = getPOCHoldStatus(closedCandles5, poc);
+
+    return {
+      confirmed: pocHold.status === "ABOVE" || pocHold.status === "BELOW",
+      status: pocHold.status,
+      poc,
+      closes: pocHold.closes
+    };
+  } catch (err) {
+    log(`⚠️ Script 2 POC confirmation failed for ${symbol}: ${err?.message || err}`);
+    return { confirmed: false, status: "UNAVAILABLE", poc: null };
+  }
+}
+
 function detectPotentialOrderBlocks(candles) {
   if (!Array.isArray(candles) || candles.length < 8) return [];
 
@@ -2035,8 +2128,9 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
       return { status: "UNAVAILABLE", reason: "Invalid SL price." };
     }
 
-    const [candles, depthRes] = await Promise.all([
+    const [candles, pocCandles, depthRes] = await Promise.all([
       fetchFuturesKlines(symbol, "5m", SL_LIQUIDITY_LOOKBACK_CANDLES + 10),
+      fetchFuturesKlines(symbol, "1m", 300),
       fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${SL_LIQUIDITY_ORDER_BOOK_LEVELS}`)
     ]);
 
@@ -2053,6 +2147,12 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
     const closedCandles = candles.slice(0, -1).slice(-SL_LIQUIDITY_LOOKBACK_CANDLES);
     const levels = detectPotentialLiquidityLevels(closedCandles);
     const orderBlocks = detectPotentialOrderBlocks(closedCandles);
+
+    // POC is informational for the SL diagnostic; Script 2 separately
+    // uses POC as an entry confirmation before execution.
+    const closedPOCCandles = Array.isArray(pocCandles) ? pocCandles.slice(0, -1) : [];
+    const poc = calculateVolumeProfilePOC(closedPOCCandles);
+    const pocHold = getPOCHoldStatus(closedCandles, poc);
 
     let nearest = null;
     for (const level of levels) {
@@ -2109,7 +2209,7 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
       }
     }
 
-    return { status, entryPrice, slPrice, nearest, nearestBook, nearestOrderBlock, reason };
+    return { status, entryPrice, slPrice, nearest, nearestBook, nearestOrderBlock, poc, pocHold, reason };
   } catch (err) {
     log(`⚠️ SL liquidity diagnostic error ${symbol}: ${err?.message || err}`);
     return {
@@ -2150,6 +2250,20 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
 
   if (result.nearestBook) {
     message += `\n📚 Order Book: *${Number(result.nearestBook.price).toPrecision(8)}* (${result.nearestBook.distancePercent.toFixed(2)}%)`;
+  }
+
+  if (Number.isFinite(result.poc)) {
+    const pocStatus = result.pocHold?.status === "ABOVE"
+      ? "🟢 Price holding above POC"
+      : result.pocHold?.status === "BELOW"
+        ? "🔴 Price holding below POC"
+        : result.pocHold?.status === "NO CLEAR HOLD"
+          ? "⚪ No clear hold"
+          : "⚪ N/A";
+    message += `\n\n📍 POC: *${Number(result.poc).toPrecision(8)}*`;
+    message += `\nPOC: *${pocStatus}*`;
+  } else {
+    message += `\n\n📍 POC: *N/A*`;
   }
 
   await sendMessage(message);
@@ -3152,19 +3266,21 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 1H STC
+// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION/CONTINUATION → 85% IMBALANCE → POC → 1H STC
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
 // 2) The bot first checks for bullish/bearish absorption at that zone.
 // 3) If absorption is detected, the last 2 CLOSED 5M candles must show
-//    >=90% directional volume imbalance confirming the absorption.
+//    >=85% directional volume imbalance confirming the absorption.
 // 4) If no absorption is detected, the zone can still qualify as a
 //    TREND CONTINUATION setup when: ATR HIGH + 1H BULL, or ATR LOW + 1H BEAR.
-// 5) Continuation also requires >=90% directional volume imbalance in
+// 5) Continuation also requires >=85% directional volume imbalance in
 //    the 1H trend direction.
-// 6) If 1H STC is opposite the valid setup direction, store the setup
+// 6) POC confirmation requires the last 2 CLOSED 5M closes to hold on the
+//    correct side of the POC: above for BUY, below for SELL.
+// 7) If 1H STC is opposite the valid setup direction, store the setup
 //    and wait for the real closed-1H STC flip into that direction.
 //
 // Existing STC flip, pressure, absorption, liquidity, SL and
@@ -3232,18 +3348,29 @@ if (script2Zone) {
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
   const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
 
+  // POC is now a mandatory execution confirmation.
+  // It uses the same 2 CLOSED 5M candle hold rule as the diagnostic:
+  // BUY = both closes above POC; SELL = both closes below POC.
+  const pocConfirmation = await getScript2POCConfirmation(symbol, closedCandles5);
+
   if (absorption?.direction) {
     // REVERSAL BRANCH:
-    // Absorption determines direction, and the 2-candle imbalance
-    // must confirm that same direction at the configured >=90% level.
-    if (volumeImbalance?.direction === absorption.direction) {
+    // Absorption determines direction, the 2-candle imbalance must confirm
+    // that direction at >=85%, and POC must confirm the same direction.
+    const pocAligned =
+      (absorption.direction === "BUY" && pocConfirmation.status === "ABOVE") ||
+      (absorption.direction === "SELL" && pocConfirmation.status === "BELOW");
+
+    if (volumeImbalance?.direction === absorption.direction && pocAligned) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
         setupType: "REVERSAL",
         absorption: absorption.type,
         zone: script2Zone,
         detectedAt: Date.now(),
-        volumeImbalance
+        volumeImbalance,
+        poc: pocConfirmation.poc,
+        pocStatus: pocConfirmation.status
       };
     }
   } else if (volumeImbalance?.direction) {
@@ -3258,14 +3385,20 @@ if (script2Zone) {
       atrSide === "LOW" && trendCycle === "BEAR" ? "SELL" :
       null;
 
-    if (continuationDirection && volumeImbalance.direction === continuationDirection) {
+    const pocAligned =
+      (continuationDirection === "BUY" && pocConfirmation.status === "ABOVE") ||
+      (continuationDirection === "SELL" && pocConfirmation.status === "BELOW");
+
+    if (continuationDirection && volumeImbalance.direction === continuationDirection && pocAligned) {
       script2PendingSetups[symbol] = {
         direction: continuationDirection,
         setupType: "CONTINUATION",
         absorption: null,
         zone: script2Zone,
         detectedAt: Date.now(),
-        volumeImbalance
+        volumeImbalance,
+        poc: pocConfirmation.poc,
+        pocStatus: pocConfirmation.status
       };
     }
   }
@@ -3282,8 +3415,18 @@ if (pendingSetup) {
   const requiredCycle = pendingSetup.direction === "BUY" ? "BULL" : "BEAR";
 
   if (trendCycle === requiredCycle) {
-    // STC is already aligned with the absorption direction and confirmed imbalance.
-    direction = pendingSetup.direction;
+    // Re-check POC immediately before execution so a setup cannot execute
+    // after price has lost the required 2-candle POC hold while waiting for STC.
+    const executionPOC = await getScript2POCConfirmation(symbol, closedCandles5);
+    const pocAligned =
+      (pendingSetup.direction === "BUY" && executionPOC.status === "ABOVE") ||
+      (pendingSetup.direction === "SELL" && executionPOC.status === "BELOW");
+
+    if (pocAligned) {
+      direction = pendingSetup.direction;
+    } else {
+      log(`⏸️ Script 2 POC confirmation failed for ${symbol}: ${executionPOC.status}`);
+    }
   }
 }
 
@@ -3327,6 +3470,12 @@ if (pendingSetup) {
         await sendMessage(
           `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`,
         );
+
+        if (pendingSetup?.poc !== undefined) {
+          await sendMessage(
+            `📍 Script 2 POC Confirmation — *${symbol}*\nPOC: ${Number(pendingSetup.poc).toPrecision(8)}\n${direction === "BUY" ? "🟢 Price held ABOVE POC" : "🔴 Price held BELOW POC"}`,
+          );
+        }
 
         symbolCooldowns[symbol] = now;
       }
