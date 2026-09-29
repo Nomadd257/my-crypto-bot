@@ -1,6 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// STC STRATEGY: 1H STC = direction, 5M Trend-Reset Delta = entry
+// STC STRATEGY: 30M STC = direction, 5M Trend-Reset Delta = entry
 // TP/SL/TRAILING STOP INTACT
 // Volume imbalance report uses 5M closed candles
 // MAX TRADES = 7 per user
@@ -490,7 +490,17 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    return data.map((c) => ({ time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], volume: +c[5] }));
+    return data.map((c) => ({
+      time: c[0],
+      open: +c[1],
+      high: +c[2],
+      low: +c[3],
+      close: +c[4],
+      volume: +c[5],
+      quoteVolume: +c[7],
+      takerBuyVolume: +c[9],
+      takerBuyQuoteVolume: +c[10]
+    }));
   } catch (err) {
     log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message || err}`);
     return null;
@@ -1244,38 +1254,48 @@ function calculateTwoCandleVolumeImbalance(candles) {
   const recentCandles = candles.slice(-2);
   let buyVol = 0;
   let sellVol = 0;
+  let delta = 0;
 
   for (const candle of recentCandles) {
-    const open = Number(candle.open);
-    const close = Number(candle.close);
     const volume = Number(candle.volume);
+    const takerBuyVolume = Number(candle.takerBuyVolume);
 
     if (
-      !Number.isFinite(open) ||
-      !Number.isFinite(close) ||
       !Number.isFinite(volume) ||
-      volume <= 0
+      volume <= 0 ||
+      !Number.isFinite(takerBuyVolume) ||
+      takerBuyVolume < 0 ||
+      takerBuyVolume > volume
     ) {
       return null;
     }
 
-    if (close > open) buyVol += volume;
-    else if (close < open) sellVol += volume;
+    // Binance kline data provides taker-buy base volume. This gives us
+    // directional traded volume without using candle body/color as a proxy.
+    const candleBuyVol = takerBuyVolume;
+    const candleSellVol = volume - takerBuyVolume;
+
+    buyVol += candleBuyVol;
+    sellVol += candleSellVol;
   }
 
   const totalVol = buyVol + sellVol;
   if (totalVol <= 0) return null;
 
+  delta = buyVol - sellVol;
   const buyPct = (buyVol / totalVol) * 100;
   const sellPct = (sellVol / totalVol) * 100;
+  const deltaPct = (Math.abs(delta) / totalVol) * 100;
 
   if (buyPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT) {
     return {
       direction: "BUY",
       buyVol,
       sellVol,
+      delta,
       buyPct,
       sellPct,
+      deltaPct,
       candles: 2
     };
   }
@@ -1285,8 +1305,10 @@ function calculateTwoCandleVolumeImbalance(candles) {
       direction: "SELL",
       buyVol,
       sellVol,
+      delta,
       buyPct,
       sellPct,
+      deltaPct,
       candles: 2
     };
   }
@@ -1295,12 +1317,13 @@ function calculateTwoCandleVolumeImbalance(candles) {
     direction: null,
     buyVol,
     sellVol,
+    delta,
     buyPct,
     sellPct,
+    deltaPct,
     candles: 2
   };
 }
-
 function priceInteractsWithZone(price, zone) {
   if (!Number.isFinite(price) || !zone) return false;
 
@@ -1438,35 +1461,30 @@ function formatScript2Zone(zone) {
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
-  if (!candles || candles.length < 3) return false;
+  if (!candles || candles.length < 2) return false;
 
-  // Measure directional volume across the latest 3 CLOSED 5M candles,
-  // while requiring the latest closed candle itself to agree with the entry.
-  // This uses the same candle-direction volume classification as the bot's
-  // existing Volume Imbalance Report.
-  const recentCandles = candles.slice(-3);
+  // Measure directional volume across the latest 2 CLOSED 5M candles
+  // using Binance taker-buy volume. Candle body size/color is not used.
+  const recentCandles = candles.slice(-2);
   let buyVol = 0;
   let sellVol = 0;
 
   for (const candle of recentCandles) {
-    const open = Number(candle.open);
-    const close = Number(candle.close);
     const volume = Number(candle.volume);
+    const takerBuyVolume = Number(candle.takerBuyVolume);
 
     if (
-      !Number.isFinite(open) ||
-      !Number.isFinite(close) ||
       !Number.isFinite(volume) ||
-      volume <= 0
+      volume <= 0 ||
+      !Number.isFinite(takerBuyVolume) ||
+      takerBuyVolume < 0 ||
+      takerBuyVolume > volume
     ) {
       return false;
     }
 
-    if (close > open) {
-      buyVol += volume;
-    } else if (close < open) {
-      sellVol += volume;
-    }
+    buyVol += takerBuyVolume;
+    sellVol += volume - takerBuyVolume;
   }
 
   const totalVol = buyVol + sellVol;
@@ -1475,28 +1493,23 @@ function hasEntryVolumeImbalance(candles, direction) {
   const buyPct = (buyVol / totalVol) * 100;
   const sellPct = (sellVol / totalVol) * 100;
 
-  const latest = recentCandles[recentCandles.length - 1];
-  const latestBullish = Number(latest.close) > Number(latest.open);
-  const latestBearish = Number(latest.close) < Number(latest.open);
-
   if (direction === "BUY") {
-    return latestBullish && buyPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+    return buyPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
   }
 
   if (direction === "SELL") {
-    return latestBearish && sellPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+    return sellPct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
   }
 
   return false;
 }
-
 // =====================================================
-// 5M STC DIVERGENCE — 1H STC TRANSITION WARNING
+// 5M STC DIVERGENCE — 30M STC TRANSITION WARNING
 // =====================================================
 // This is NOT an entry trigger. It is a protective filter.
 // When the 1H cycle is BULL, bearish 5M STC divergence blocks
 // new BUYs. When the 1H cycle is BEAR, bullish 5M STC divergence
-// blocks new SELLs. The 1H STC cycle must still actually flip
+// blocks new SELLs. The 30M STC cycle must still actually flip
 // before the opposite-direction entries are allowed.
 // =====================================================
 const STC_DIVERGENCE_LOOKBACK = 36;
@@ -3087,7 +3100,7 @@ async function monitorPriceActivations() {
           `↕️ Cross: *${crossDirection}*\n\n` +
           `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
           `This is the same action as /activate ${symbol}.\n` +
-          `The normal 1H STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
+          `The normal 30M STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
         );
 
         log(
@@ -3128,10 +3141,14 @@ setInterval(async () => {
 
     try {
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
+      const candles30M = await fetchFuturesKlines(symbol, "30m", 100);
       if (!candles1H || candles1H.length < 30) continue;
+      if (!candles30M || candles30M.length < 30) continue;
 
       const closedCandles1H = candles1H.slice(0, -1);
       const closes1H = closedCandles1H.map((c) => c.close);
+      const closedCandles30M = candles30M.slice(0, -1);
+      const closes30M = closedCandles30M.map((c) => c.close);
 
       // =============================
       // TRUE DAILY LEVELS
@@ -3161,20 +3178,20 @@ setInterval(async () => {
       const atrMsgCooldown = 60 * 60 * 1000;
 
       // =============================
-      // 1H STC SLOPE
+      // 30M STC SLOPE
       // =============================
-      const stcSeries1H = [];
-      for (let i = 0; i < closes1H.length; i++) {
-        const slice = closes1H.slice(0, i + 1);
+      const stcSeries30M = [];
+      for (let i = 0; i < closes30M.length; i++) {
+        const slice = closes30M.slice(0, i + 1);
         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-        if (val !== null) stcSeries1H.push(val);
+        if (val !== null) stcSeries30M.push(val);
       }
-      if (stcSeries1H.length < 2) continue;
+      if (stcSeries30M.length < 2) continue;
 
-      const prev1H = stcSeries1H[stcSeries1H.length - 2];
-      const curr1H = stcSeries1H[stcSeries1H.length - 1];
-      const stcRising = curr1H > prev1H;
-      const stcFalling = curr1H < prev1H;
+      const prev30M = stcSeries30M[stcSeries30M.length - 2];
+      const curr30M = stcSeries30M[stcSeries30M.length - 1];
+      const stcRising = curr30M > prev30M;
+      const stcFalling = curr30M < prev30M;
 
       // =====================================================
       // COMBINED ATR + STC SIGNALS
@@ -3229,10 +3246,10 @@ setInterval(async () => {
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
-      // 1H STC CYCLE
+      // 30M STC CYCLE
       // =====================================================
       // In AUTO mode (MANUAL_CYCLE === null), the cycle is
-      // continuously synchronized with the latest CLOSED 1H
+      // continuously synchronized with the latest CLOSED 30M
       // STC direction. When STC changes from rising to falling
       // or falling to rising, the trading cycle changes
       // automatically without requiring /setbull or /setbear.
@@ -3249,7 +3266,7 @@ setInterval(async () => {
 
           if (previousCycle) {
             // Immediately measure the opposing 5M pressure after every real
-            // 1H STC cycle flip. This is informational only and does not
+            // 30M STC cycle flip. This is informational only and does not
             // change entry, exit, or trade-management behavior.
             let opposingDirection = autoCycle === "BULL" ? "SELL" : "BUY";
             let opposingDelta = "N/A";
@@ -3301,13 +3318,13 @@ setInterval(async () => {
                 : "✅";
 
             await sendMessage(
-              `🔄 1H STC FLIP — *${symbol}*\n` +
+              `🔄 30M STC FLIP — *${symbol}*\n` +
               `${previousCycle === "BULL" ? "🟢" : "🔴"}→${autoCycle === "BULL" ? "🟢" : "🔴"} *${autoCycle}*\n` +
               `${pressureEmoji} Opposing ${opposingDirection}: ${opposingDelta} Delta | ${opposingVolume} Vol`,
             );
           } else {
             await sendMessage(
-              `🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`,
+              `🔁 30M STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`,
             );
           }
         }
@@ -3319,20 +3336,20 @@ setInterval(async () => {
       if (!trendCycle) continue;
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 1H STC
+// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 30M STC
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
 // 2) The bot first checks for bullish/bearish absorption at that zone.
 // 3) If absorption is detected, the last 2 CLOSED 5M candles must show
-//    >=85% directional volume imbalance confirming the absorption.
+//    >=85% directional volume imbalance from Binance taker-buy/sell volume.
 // 4) If no absorption is detected, the zone can still qualify as a
-//    TREND CONTINUATION setup when: ATR HIGH + 1H BULL, or ATR LOW + 1H BEAR.
-// 5) Continuation also requires >=85% directional volume imbalance in
-//    the 1H trend direction.
-// 6) If 1H STC is opposite the valid setup direction, store the setup
-//    and wait for the real closed-1H STC flip into that direction.
+//    TREND CONTINUATION setup when: ATR HIGH + 30M BULL, or ATR LOW + 30M BEAR.
+// 5) Continuation also requires >=85% directional volume imbalance from
+//    Binance taker-buy/sell volume in the 30M trend direction.
+// 6) If 30M STC is opposite the valid setup direction, store the setup
+//    and wait for the real closed-30M STC flip into that direction.
 //
 // Existing STC flip, pressure, absorption, liquidity, SL and
 // trade-management messages remain unchanged.
@@ -3415,7 +3432,7 @@ if (script2Zone) {
     }
   } else if (volumeImbalance?.direction) {
     // CONTINUATION BRANCH:
-    // Absence of absorption alone is NOT enough. The 1H STC must
+    // Absence of absorption alone is NOT enough. The 30M STC must
     // already show the continuation direction at the ATR extreme:
     // ATR HIGH + BULL = bullish continuation
     // ATR LOW  + BEAR = bearish continuation
@@ -3439,7 +3456,7 @@ if (script2Zone) {
 }
 
 // -----------------------------------------------------
-// STEP 4 — CURRENT 1H STC OR WAIT FOR A FLIP
+// STEP 4 — CURRENT 30M STC OR WAIT FOR A FLIP
 // -----------------------------------------------------
 
 let direction = null;
@@ -3454,8 +3471,8 @@ if (pendingSetup) {
   }
 }
 
-// If the 1H STC was opposite when the setup was detected, the normal
-// STC cycle update above will change trendCycle when the real closed-1H
+// If the 30M STC was opposite when the setup was detected, the normal
+// STC cycle update above will change trendCycle when the real closed-30M
 // flip occurs. At that point the pending setup becomes executable.
 
       // =====================================================
@@ -3485,14 +3502,30 @@ if (pendingSetup) {
         await executeMarketOrderForAllUsers(symbol, direction);
         delete script2PendingSetups[symbol];
 
-        const buyVol = closedCandles5.reduce((sum, c) => sum + (c.close > c.open ? c.volume : 0), 0);
-        const sellVol = closedCandles5.reduce((sum, c) => sum + (c.close < c.open ? c.volume : 0), 0);
+        const reportCandles = closedCandles5.slice(-2);
+        let buyVol = 0;
+        let sellVol = 0;
+
+        for (const candle of reportCandles) {
+          const volume = Number(candle.volume);
+          const takerBuyVolume = Number(candle.takerBuyVolume);
+          if (Number.isFinite(volume) && Number.isFinite(takerBuyVolume)) {
+            buyVol += takerBuyVolume;
+            sellVol += Math.max(0, volume - takerBuyVolume);
+          }
+        }
+
         const totalVol = buyVol + sellVol;
+        const delta = buyVol - sellVol;
         const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
         const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
+        const deltaPct = totalVol ? ((Math.abs(delta) / totalVol) * 100).toFixed(1) : 0;
 
         await sendMessage(
-          `📊 Volume Imbalance Report: *${symbol}*\nBuy: ${buyVol.toFixed(2)} (${buyPct}%)\nSell: ${sellVol.toFixed(2)} (${sellPct}%)`,
+          `📊 Directional Volume Imbalance: *${symbol}*\n` +
+          `🟢 Buy: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
+          `🔴 Sell: ${sellVol.toFixed(2)} (${sellPct}%)\n` +
+          `⚡ Delta: ${delta >= 0 ? "+" : ""}${delta.toFixed(2)} (${deltaPct}%)`,
         );
 
         symbolCooldowns[symbol] = now;
@@ -6161,7 +6194,7 @@ bot.onText(/\/setauto$/, async (msg) => {
   if (!isAdmin(msg)) return;
   MANUAL_CYCLE = null;
   currentCycle = {};
-  await sendMessage("🤖 AUTO MODE: 1H STC detection re-enabled");
+  await sendMessage("🤖 AUTO MODE: 30M STC detection re-enabled");
 });
 
 // --- Per-symbol BULL/BEAR commands ---
