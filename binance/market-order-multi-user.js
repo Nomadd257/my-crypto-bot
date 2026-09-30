@@ -1,6 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// STC STRATEGY: 30M STC = direction, 5M Trend-Reset Delta = entry
+// STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
 // Volume imbalance report uses 5M closed candles
 // MAX TRADES = 7 per user
@@ -3100,7 +3100,7 @@ async function monitorPriceActivations() {
           `↕️ Cross: *${crossDirection}*\n\n` +
           `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
           `This is the same action as /activate ${symbol}.\n` +
-          `The normal 30M STC + 15M Trend-Reset Cumulative Delta strategy will decide BUY or SELL.`
+          `The 1H STC is monitored for trend context. Entry execution is based on zone, absorption/continuation and 2-candle directional volume imbalance.`
         );
 
         log(
@@ -3119,7 +3119,7 @@ async function monitorPriceActivations() {
 
 setInterval(monitorPriceActivations, 5000);
 
-// --- Full-auto STC + OBV entry scanning loop ---
+// --- Full-auto 1H STC monitoring + Script 2 entry scanning loop ---
 
 let prevBullishFlip = [];
 let prevBearishFlip = [];
@@ -3141,14 +3141,10 @@ setInterval(async () => {
 
     try {
       const candles1H = await fetchFuturesKlines(symbol, "1h", 100);
-      const candles30M = await fetchFuturesKlines(symbol, "30m", 100);
       if (!candles1H || candles1H.length < 30) continue;
-      if (!candles30M || candles30M.length < 30) continue;
 
       const closedCandles1H = candles1H.slice(0, -1);
       const closes1H = closedCandles1H.map((c) => c.close);
-      const closedCandles30M = candles30M.slice(0, -1);
-      const closes30M = closedCandles30M.map((c) => c.close);
 
       // =============================
       // TRUE DAILY LEVELS
@@ -3178,20 +3174,20 @@ setInterval(async () => {
       const atrMsgCooldown = 60 * 60 * 1000;
 
       // =============================
-      // 30M STC SLOPE
+      // 1H STC SLOPE — INFORMATIONAL / TREND CONTEXT ONLY
       // =============================
-      const stcSeries30M = [];
-      for (let i = 0; i < closes30M.length; i++) {
-        const slice = closes30M.slice(0, i + 1);
+      const stcSeries1H = [];
+      for (let i = 0; i < closes1H.length; i++) {
+        const slice = closes1H.slice(0, i + 1);
         const val = calculateSTC(slice, { cycle: 4, fast: 10, slow: 20 });
-        if (val !== null) stcSeries30M.push(val);
+        if (val !== null) stcSeries1H.push(val);
       }
-      if (stcSeries30M.length < 2) continue;
+      if (stcSeries1H.length < 2) continue;
 
-      const prev30M = stcSeries30M[stcSeries30M.length - 2];
-      const curr30M = stcSeries30M[stcSeries30M.length - 1];
-      const stcRising = curr30M > prev30M;
-      const stcFalling = curr30M < prev30M;
+      const prev1H = stcSeries1H[stcSeries1H.length - 2];
+      const curr1H = stcSeries1H[stcSeries1H.length - 1];
+      const stcRising = curr1H > prev1H;
+      const stcFalling = curr1H < prev1H;
 
       // =====================================================
       // COMBINED ATR + STC SIGNALS
@@ -3246,10 +3242,10 @@ setInterval(async () => {
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
       // =====================================================
-      // 30M STC CYCLE
+      // 1H STC CYCLE — INFORMATIONAL / TREND CONTEXT ONLY
       // =====================================================
       // In AUTO mode (MANUAL_CYCLE === null), the cycle is
-      // continuously synchronized with the latest CLOSED 30M
+      // continuously synchronized with the latest CLOSED 1H
       // STC direction. When STC changes from rising to falling
       // or falling to rising, the trading cycle changes
       // automatically without requiring /setbull or /setbear.
@@ -3266,7 +3262,7 @@ setInterval(async () => {
 
           if (previousCycle) {
             // Immediately measure the opposing 5M pressure after every real
-            // 30M STC cycle flip. This is informational only and does not
+            // 1H STC cycle flip. This is informational only and does not
             // change entry, exit, or trade-management behavior.
             let opposingDirection = autoCycle === "BULL" ? "SELL" : "BUY";
             let opposingDelta = "N/A";
@@ -3318,13 +3314,13 @@ setInterval(async () => {
                 : "✅";
 
             await sendMessage(
-              `🔄 30M STC FLIP — *${symbol}*\n` +
+              `🔄 1H STC FLIP — *${symbol}*\n` +
               `${previousCycle === "BULL" ? "🟢" : "🔴"}→${autoCycle === "BULL" ? "🟢" : "🔴"} *${autoCycle}*\n` +
               `${pressureEmoji} Opposing ${opposingDirection}: ${opposingDelta} Delta | ${opposingVolume} Vol`,
             );
           } else {
             await sendMessage(
-              `🔁 30M STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`,
+              `🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`,
             );
           }
         }
@@ -3333,26 +3329,23 @@ setInterval(async () => {
       }
 
       const trendCycle = currentCycle[symbol];
-      if (!trendCycle) continue;
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION → 85% IMBALANCE → 30M STC
+// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION/CONTINUATION → 75% IMBALANCE
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
-// 2) The bot first checks for bullish/bearish absorption at that zone.
-// 3) If absorption is detected, the last 2 CLOSED 5M candles must show
-//    >=85% directional volume imbalance from Binance taker-buy/sell volume.
-// 4) If no absorption is detected, the zone can still qualify as a
-//    TREND CONTINUATION setup when: ATR HIGH + 30M BULL, or ATR LOW + 30M BEAR.
-// 5) Continuation also requires >=85% directional volume imbalance from
-//    Binance taker-buy/sell volume in the 30M trend direction.
-// 6) If 30M STC is opposite the valid setup direction, store the setup
-//    and wait for the real closed-30M STC flip into that direction.
+// 2) If absorption is detected, absorption determines the reversal direction.
+// 3) The last 2 CLOSED 5M candles must confirm that direction with
+//    >=70% directional volume imbalance from Binance taker-buy/sell volume.
+// 4) If no absorption is detected, continuation is allowed only at the
+//    corresponding ATR extreme: ATR HIGH for BUY continuation or ATR LOW
+//    for SELL continuation, confirmed by the same >=70% imbalance.
+// 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
-// Existing STC flip, pressure, absorption, liquidity, SL and
-// trade-management messages remain unchanged.
+// 1H STC flip/pressure messages, absorption, liquidity, SL and
+// trade-management messages remain available as context/diagnostics.
 // =====================================================
 
 const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
@@ -3419,7 +3412,7 @@ if (script2Zone) {
   if (absorption?.direction) {
     // REVERSAL BRANCH:
     // Absorption determines direction, and the 2-candle imbalance
-    // must confirm that same direction at the configured >=85% level.
+    // must confirm that same direction at the configured >=70% level.
     if (volumeImbalance?.direction === absorption.direction) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
@@ -3432,17 +3425,16 @@ if (script2Zone) {
     }
   } else if (volumeImbalance?.direction) {
     // CONTINUATION BRANCH:
-    // Absence of absorption alone is NOT enough. The 30M STC must
-    // already show the continuation direction at the ATR extreme:
-    // ATR HIGH + BULL = bullish continuation
-    // ATR LOW  + BEAR = bearish continuation
+    // With STC removed from execution, the ATR extreme supplies the
+    // location context and the 2-candle directional imbalance supplies
+    // the execution direction.
     const atrSide = script2Zone.atrLocation?.side;
     const continuationDirection =
-      atrSide === "HIGH" && trendCycle === "BULL" ? "BUY" :
-      atrSide === "LOW" && trendCycle === "BEAR" ? "SELL" :
+      atrSide === "HIGH" && volumeImbalance.direction === "BUY" ? "BUY" :
+      atrSide === "LOW" && volumeImbalance.direction === "SELL" ? "SELL" :
       null;
 
-    if (continuationDirection && volumeImbalance.direction === continuationDirection) {
+    if (continuationDirection) {
       script2PendingSetups[symbol] = {
         direction: continuationDirection,
         setupType: "CONTINUATION",
@@ -3456,24 +3448,18 @@ if (script2Zone) {
 }
 
 // -----------------------------------------------------
-// STEP 4 — CURRENT 30M STC OR WAIT FOR A FLIP
+// STEP 4 — EXECUTION DIRECTION
 // -----------------------------------------------------
+// STC is completely removed from execution. Once a valid setup is
+// created, the confirmed direction is executable immediately subject
+// only to the existing liquidity gate.
 
 let direction = null;
 const pendingSetup = script2PendingSetups[symbol];
 
 if (pendingSetup) {
-  const requiredCycle = pendingSetup.direction === "BUY" ? "BULL" : "BEAR";
-
-  if (trendCycle === requiredCycle) {
-    // STC is already aligned with the absorption direction and confirmed imbalance.
-    direction = pendingSetup.direction;
-  }
+  direction = pendingSetup.direction;
 }
-
-// If the 30M STC was opposite when the setup was detected, the normal
-// STC cycle update above will change trendCycle when the real closed-30M
-// flip occurs. At that point the pending setup becomes executable.
 
       // =====================================================
       // LIQUIDITY GATE + EXECUTION
@@ -6194,7 +6180,7 @@ bot.onText(/\/setauto$/, async (msg) => {
   if (!isAdmin(msg)) return;
   MANUAL_CYCLE = null;
   currentCycle = {};
-  await sendMessage("🤖 AUTO MODE: 30M STC detection re-enabled");
+  await sendMessage("🤖 AUTO MODE: 1H STC detection re-enabled");
 });
 
 // --- Per-symbol BULL/BEAR commands ---
