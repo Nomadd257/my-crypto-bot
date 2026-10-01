@@ -152,7 +152,7 @@ let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 
 // --- STC cycle trackers ---
 let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
-let script2PendingSetups = {}; // { symbol: { direction, zone, detectedAt, volumeImbalance } }
+let script2PendingSetups = {}; // { symbol: reversal setup OR staged continuation setup }
 let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zone absorption tracking
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
@@ -604,6 +604,13 @@ const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
+
+// Script 2 continuation confirmation settings.
+// A directional 2-candle imbalance creates a candidate only. Continuation
+// becomes executable after a CLOSED 5M candle breaks the relevant zone boundary
+// and a later CLOSED 5M candle retests that boundary without reclaiming it.
+const SCRIPT2_CONTINUATION_MAX_BREAK_CANDLES = 3;
+const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 
 // Script 2 entry-zone settings. Price must interact with a detected
 // liquidity level or order block before the 2-candle imbalance is evaluated.
@@ -1566,6 +1573,216 @@ function calculateTwoCandleVolumeImbalance(candles) {
     candles: 2
   };
 }
+
+function getScript2CandleKey(candle, fallback = "") {
+  if (!candle) return fallback;
+  return String(
+    candle.openTime ??
+    candle.time ??
+    candle.timestamp ??
+    fallback
+  );
+}
+
+function getScript2ZoneBoundary(zone, direction) {
+  if (!zone || !direction) return null;
+
+  if (zone.kind === "ORDER_BLOCK") {
+    const low = Number(zone.low);
+    const high = Number(zone.high);
+
+    if (!Number.isFinite(low) || !Number.isFinite(high)) return null;
+
+    return direction === "SELL" ? low : high;
+  }
+
+  const price = Number(zone.price);
+  return Number.isFinite(price) ? price : null;
+}
+
+function getScript2ZoneRetest(candle, zone, direction) {
+  if (!candle || !zone || !direction) return false;
+
+  const high = Number(candle.high);
+  const low = Number(candle.low);
+  const close = Number(candle.close);
+  const boundary = getScript2ZoneBoundary(zone, direction);
+
+  if (![high, low, close, boundary].every(Number.isFinite)) return false;
+
+  if (direction === "SELL") {
+    // Price must revisit the broken boundary/zone but close back below it.
+    return high >= boundary && close < boundary;
+  }
+
+  // BUY: price must revisit the broken boundary/zone but close back above it.
+  return low <= boundary && close > boundary;
+}
+
+function getScript2ContinuationState(candles, setup) {
+  if (!Array.isArray(candles) || !candles.length || !setup) return null;
+
+  const latestIndex = candles.length - 1;
+  const latest = candles[latestIndex];
+  const latestKey = getScript2CandleKey(latest, String(latestIndex));
+
+  const createdIndex = candles.findIndex(
+    (candle) => getScript2CandleKey(candle) === String(setup.createdCandleKey)
+  );
+
+  if (createdIndex < 0) {
+    return {
+      status: "WAIT",
+      latestKey,
+      latestIndex,
+      candlesSinceCreation: 0
+    };
+  }
+
+  if (setup.stage === "CANDIDATE") {
+    const candlesSinceCreation = latestIndex - createdIndex;
+
+    if (candlesSinceCreation <= 0) {
+      return {
+        status: "WAIT",
+        latestKey,
+        latestIndex,
+        candlesSinceCreation
+      };
+    }
+
+    if (candlesSinceCreation > SCRIPT2_CONTINUATION_MAX_BREAK_CANDLES) {
+      return {
+        status: "EXPIRE",
+        reason: "BREAK_NOT_CONFIRMED"
+      };
+    }
+
+    const boundary = getScript2ZoneBoundary(setup.zone, setup.direction);
+    const close = Number(latest.close);
+
+    if (!Number.isFinite(boundary) || !Number.isFinite(close)) {
+      return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
+    }
+
+    const breakConfirmed = setup.direction === "SELL"
+      ? close < boundary
+      : close > boundary;
+
+    if (breakConfirmed) {
+      return {
+        status: "BREAK_CONFIRMED",
+        latestKey,
+        latestIndex,
+        boundary,
+        candlesSinceCreation
+      };
+    }
+
+    return {
+      status: "WAIT",
+      latestKey,
+      latestIndex,
+      candlesSinceCreation
+    };
+  }
+
+  if (setup.stage === "BREAK_CONFIRMED") {
+    const breakIndex = candles.findIndex(
+      (candle) => getScript2CandleKey(candle) === String(setup.breakCandleKey)
+    );
+
+    if (breakIndex < 0) {
+      return { status: "EXPIRE", reason: "BREAK_CANDLE_NOT_FOUND" };
+    }
+
+    const candlesSinceBreak = latestIndex - breakIndex;
+
+    if (candlesSinceBreak <= 0) {
+      return {
+        status: "WAIT",
+        latestKey,
+        latestIndex,
+        candlesSinceBreak
+      };
+    }
+
+    if (candlesSinceBreak > SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES) {
+      return {
+        status: "EXPIRE",
+        reason: "RETEST_NOT_CONFIRMED"
+      };
+    }
+
+    if (getScript2ZoneRetest(latest, setup.zone, setup.direction)) {
+      return {
+        status: "RETEST_CONFIRMED",
+        latestKey,
+        latestIndex,
+        candlesSinceBreak
+      };
+    }
+
+    return {
+      status: "WAIT",
+      latestKey,
+      latestIndex,
+      candlesSinceBreak
+    };
+  }
+
+  return { status: "WAIT", latestKey, latestIndex };
+}
+
+function processScript2Continuation(symbol, closedCandles5, now) {
+  const setup = script2PendingSetups[symbol];
+
+  if (!setup || setup.setupType !== "CONTINUATION") return null;
+
+  const state = getScript2ContinuationState(closedCandles5, setup);
+
+  if (!state) return null;
+
+  if (state.status === "EXPIRE") {
+    log(
+      `⏳ Script 2 continuation expired ${symbol}: ` +
+      `${state.reason || "confirmation timeout"}`
+    );
+    delete script2PendingSetups[symbol];
+    return null;
+  }
+
+  if (state.status === "BREAK_CONFIRMED") {
+    setup.stage = "BREAK_CONFIRMED";
+    setup.breakCandleKey = state.latestKey;
+    setup.breakConfirmedAt = now;
+    setup.breakBoundary = state.boundary;
+
+    log(
+      `📉 Script 2 continuation break confirmed ${symbol}: ` +
+      `${setup.direction} beyond ${Number(state.boundary).toPrecision(8)}`
+    );
+
+    return null;
+  }
+
+  if (state.status === "RETEST_CONFIRMED") {
+    setup.stage = "RETEST_CONFIRMED";
+    setup.retestCandleKey = state.latestKey;
+    setup.retestConfirmedAt = now;
+    setup.confirmedAt = now;
+
+    log(
+      `✅ Script 2 continuation confirmed ${symbol}: ` +
+      `${setup.direction} break + failed reclaim`
+    );
+
+    return setup.direction;
+  }
+
+  return null;
+}
+
 function priceInteractsWithZone(price, zone) {
   if (!Number.isFinite(price) || !zone) return false;
 
@@ -3655,20 +3872,21 @@ if (script2Zone) {
   // ---------------------------------------------------
   const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
+  const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
+  const latestClosedCandleKey = getScript2CandleKey(
+    latestClosedCandle,
+    String(closedCandles5.length - 1)
+  );
 
   // REVERSAL BRANCH:
-  // Absorption alone determines the reversal direction. Importantly,
-  // no other reversal entry condition is evaluated until the absorption
-  // candle has reached the required >=2.0x volume multiple. The
-  // detectScript2Absorption() result can only exist after that threshold
-  // (plus the required candle-body/wick conditions) is satisfied.
+  // Absorption determines the reversal direction. No continuation
+  // candidate is created when the qualifying reversal pattern exists.
   // ATR LOW -> BUY reversal; ATR HIGH -> SELL reversal.
   if (
     absorption?.direction &&
     ((atrSide === "LOW" && absorption.direction === "BUY") ||
      (atrSide === "HIGH" && absorption.direction === "SELL"))
   ) {
-    // Only now evaluate the remaining reversal confirmation condition.
     const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
 
     if (volumeImbalance?.direction === absorption.direction) {
@@ -3682,10 +3900,14 @@ if (script2Zone) {
       };
     }
   } else {
-    // CONTINUATION BRANCH:
-    // Continuation is independent of absorption. It has its own direction
-    // rule based on the ATR extreme and 2-candle directional imbalance.
-    // ATR HIGH -> BUY continuation; ATR LOW -> SELL continuation.
+    // CONTINUATION CANDIDATE:
+    // Imbalance is only the initial evidence of directional pressure.
+    // It does NOT authorize execution. The candidate must subsequently
+    // prove structural acceptance with a closed-candle break and a
+    // failed-reclaim retest.
+    //
+    // ATR HIGH -> BUY continuation candidate.
+    // ATR LOW  -> SELL continuation candidate.
     const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
     const continuationDirection =
       atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
@@ -3693,15 +3915,53 @@ if (script2Zone) {
       null;
 
     if (continuationDirection) {
-      script2PendingSetups[symbol] = {
-        direction: continuationDirection,
-        setupType: "CONTINUATION",
-        absorption: null,
-        zone: script2Zone,
-        detectedAt: Date.now(),
-        volumeImbalance
-      };
+      const existing = script2PendingSetups[symbol];
+
+      // Do not reset a continuation candidate every scan while price
+      // remains inside the same zone. A candidate gets one confirmation
+      // window tied to the candle on which the imbalance was detected.
+      if (
+        !existing ||
+        existing.setupType !== "CONTINUATION" ||
+        existing.direction !== continuationDirection ||
+        getScript2ZoneObservationKey(existing.zone) !== getScript2ZoneObservationKey(script2Zone)
+      ) {
+        script2PendingSetups[symbol] = {
+          direction: continuationDirection,
+          setupType: "CONTINUATION",
+          stage: "CANDIDATE",
+          absorption: null,
+          zone: script2Zone,
+          detectedAt: Date.now(),
+          createdCandleKey: latestClosedCandleKey,
+          breakCandleKey: null,
+          retestCandleKey: null,
+          volumeImbalance
+        };
+      }
     }
+  }
+}
+
+// -----------------------------------------------------
+// STEP 3 — ADVANCE A STAGED CONTINUATION
+// -----------------------------------------------------
+// This runs even after price leaves the original zone. That is
+// intentional: once a continuation candidate exists, the bot must
+// watch for the structural break and retest instead of requiring
+// price to still be inside the zone.
+const confirmedContinuationDirection = processScript2Continuation(
+  symbol,
+  closedCandles5,
+  now
+);
+
+// If a continuation was confirmed, it is now executable through the
+// same existing manual-direction and liquidity gates below.
+if (confirmedContinuationDirection) {
+  const confirmedSetup = script2PendingSetups[symbol];
+  if (confirmedSetup) {
+    confirmedSetup.direction = confirmedContinuationDirection;
   }
 }
 
@@ -3722,6 +3982,12 @@ let direction = null;
 const pendingSetup = script2PendingSetups[symbol];
 
 if (pendingSetup) {
+  // Continuation setups are executable only after the staged
+  // break + failed-reclaim confirmation has completed.
+  const continuationReady =
+    pendingSetup.setupType !== "CONTINUATION" ||
+    pendingSetup.stage === "RETEST_CONFIRMED";
+
   const setupDirection = pendingSetup.direction;
 
   // Manual BULL/BEAR mode controls execution direction only.
@@ -3732,7 +3998,10 @@ if (pendingSetup) {
     MANUAL_CYCLE === "BEAR" ? "SELL" :
     null;
 
-  if (!manualDirection || setupDirection === manualDirection) {
+  if (
+    continuationReady &&
+    (!manualDirection || setupDirection === manualDirection)
+  ) {
     direction = setupDirection;
   }
 }
