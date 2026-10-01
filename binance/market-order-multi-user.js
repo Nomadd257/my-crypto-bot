@@ -152,6 +152,7 @@ let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 // --- STC cycle trackers ---
 let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
 let script2PendingSetups = {}; // { symbol: { direction, zone, detectedAt, volumeImbalance } }
+let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zone absorption tracking
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -1246,6 +1247,276 @@ function detectScript2Absorption(candles, zone) {
   }
 
   return null;
+}
+
+
+// =====================================================
+// SCRIPT 2 — LIQUIDITY-ZONE ABSORPTION OBSERVATION
+// =====================================================
+// Observation only. This does NOT approve, delay, block, or trigger
+// an entry. It tracks what happens while price remains at a qualifying
+// ATR HIGH/ATR LOW liquidity or order-block zone so we can later study
+// absorption strength, persistence, and eventual move size.
+//
+// HIGH absorption uses the same thresholds as detectScript2Absorption().
+// LOW means the zone is active but the latest closed 5M candle does not
+// meet those absorption thresholds.
+// =====================================================
+const SCRIPT2_ZONE_ABSORPTION_EXIT_GRACE_MS = 10 * 60 * 1000;
+
+function getScript2ZoneObservationKey(zone) {
+  if (!zone) return null;
+
+  const atrName = zone.atrLocation?.name || "ATR ZONE";
+  if (zone.kind === "ORDER_BLOCK") {
+    return [
+      "ORDER_BLOCK",
+      zone.type || "ORDER BLOCK",
+      Number(zone.low).toFixed(8),
+      Number(zone.high).toFixed(8),
+      atrName
+    ].join("|");
+  }
+
+  return [
+    "LIQUIDITY",
+    zone.type || "LIQUIDITY",
+    Number(zone.price).toFixed(8),
+    atrName
+  ].join("|");
+}
+
+function getScript2ZoneAbsorptionObservation(candles, zone) {
+  if (!Array.isArray(candles) || candles.length < 22 || !zone) return null;
+
+  const recent = candles.slice(-21, -1);
+  const latest = candles[candles.length - 1];
+
+  const open = Number(latest.open);
+  const high = Number(latest.high);
+  const low = Number(latest.low);
+  const close = Number(latest.close);
+  const volume = Number(latest.volume);
+
+  if (![open, high, low, close, volume].every(Number.isFinite) || volume <= 0) {
+    return null;
+  }
+
+  const candleTouchesZone = zone.kind === "ORDER_BLOCK"
+    ? high >= zone.low && low <= zone.high
+    : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+      percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+      (low <= zone.price && high >= zone.price);
+
+  if (!candleTouchesZone) {
+    return {
+      level: "LOW",
+      confirmed: false,
+      touchesZone: false,
+      effortRatio: null,
+      bodyRatio: null,
+      wickRatio: null,
+      type: null,
+      direction: null,
+      candle: latest
+    };
+  }
+
+  const avgVolume = recent.reduce((sum, candle) => {
+    const v = Number(candle.volume);
+    return sum + (Number.isFinite(v) && v > 0 ? v : 0);
+  }, 0) / recent.length;
+
+  const range = high - low;
+  if (!Number.isFinite(avgVolume) || avgVolume <= 0 || range <= 0) return null;
+
+  const body = Math.abs(close - open);
+  const upperWick = high - Math.max(open, close);
+  const lowerWick = Math.min(open, close) - low;
+  const effortRatio = volume / avgVolume;
+  const bodyRatio = body / range;
+  const upperWickRatio = upperWick / range;
+  const lowerWickRatio = lowerWick / range;
+
+  if (
+    close < open &&
+    effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    lowerWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+  ) {
+    return {
+      level: "HIGH",
+      confirmed: true,
+      touchesZone: true,
+      effortRatio,
+      bodyRatio,
+      wickRatio: lowerWickRatio,
+      type: "BULLISH ABSORPTION",
+      direction: "BUY",
+      candle: latest
+    };
+  }
+
+  if (
+    close > open &&
+    effortRatio >= ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= ABSORPTION_MAX_BODY_TO_RANGE &&
+    upperWickRatio >= ABSORPTION_MIN_WICK_TO_RANGE
+  ) {
+    return {
+      level: "HIGH",
+      confirmed: true,
+      touchesZone: true,
+      effortRatio,
+      bodyRatio,
+      wickRatio: upperWickRatio,
+      type: "BEARISH ABSORPTION",
+      direction: "SELL",
+      candle: latest
+    };
+  }
+
+  return {
+    level: "LOW",
+    confirmed: true,
+    touchesZone: true,
+    effortRatio,
+    bodyRatio,
+    wickRatio: Math.max(upperWickRatio, lowerWickRatio),
+    type: null,
+    direction: null,
+    candle: latest
+  };
+}
+
+function formatScript2ZoneDwell(ms) {
+  const minutes = Math.max(0, Math.floor(ms / 60000));
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+}
+
+async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
+  try {
+    if (!zone || !zone.atrLocation?.side) return;
+
+    const zoneKey = getScript2ZoneObservationKey(zone);
+    if (!zoneKey) return;
+
+    let state = script2ZoneAbsorptionState[symbol];
+    if (!state || state.zoneKey !== zoneKey) {
+      state = {
+        zoneKey,
+        zone,
+        startedAt: now,
+        lastSeenAt: now,
+        lastCandleKey: null,
+        candlesInZone: 0,
+        highAbsorptionCandles: 0,
+        lowAbsorptionCandles: 0,
+        peakEffortRatio: 0,
+        latestObservation: null,
+        entryAlertSent: false,
+        highAlertSent: false
+      };
+      script2ZoneAbsorptionState[symbol] = state;
+    } else {
+      state.lastSeenAt = now;
+      state.zone = zone;
+    }
+
+    const observation = getScript2ZoneAbsorptionObservation(closedCandles5, zone);
+    if (observation) {
+      const latest = observation.candle;
+      const candleKey = `${latest?.openTime || latest?.time || latest?.timestamp || closedCandles5.length}`;
+
+      if (candleKey !== state.lastCandleKey) {
+        state.lastCandleKey = candleKey;
+        if (observation.touchesZone) {
+          state.candlesInZone += 1;
+          if (observation.level === "HIGH") state.highAbsorptionCandles += 1;
+          else state.lowAbsorptionCandles += 1;
+        }
+        if (Number.isFinite(observation.effortRatio)) {
+          state.peakEffortRatio = Math.max(state.peakEffortRatio, observation.effortRatio);
+        }
+        state.latestObservation = observation;
+      }
+    }
+
+    const atrLabel = zone.atrLocation.name || `ATR ${zone.atrLocation.side}`;
+    const zoneType = zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${zone.type}` : `LIQUIDITY — ${zone.type}`;
+    const current = observation || {};
+    const absorptionLevel = current.level || "LOW";
+    const absorptionType = current.type || "No qualifying absorption candle yet";
+    const setupBias = zone.atrLocation.side === "LOW" ? "Potential LONG 🟢" : "Potential SHORT 🔴";
+    const effortText = Number.isFinite(current.effortRatio) ? `${current.effortRatio.toFixed(2)}x` : "N/A";
+    const bodyText = Number.isFinite(current.bodyRatio) ? `${(current.bodyRatio * 100).toFixed(1)}%` : "N/A";
+    const wickText = Number.isFinite(current.wickRatio) ? `${(current.wickRatio * 100).toFixed(1)}%` : "N/A";
+
+    const shouldSendEntryAlert = !state.entryAlertSent;
+    const shouldSendHighAlert =
+      state.entryAlertSent &&
+      !state.highAlertSent &&
+      current.level === "HIGH";
+
+    if (!shouldSendEntryAlert && !shouldSendHighAlert) return;
+
+    if (shouldSendEntryAlert) state.entryAlertSent = true;
+    if (shouldSendHighAlert) state.highAlertSent = true;
+
+    const title = shouldSendHighAlert
+      ? `🔥 *HIGH ABSORPTION CONFIRMED*`
+      : `⚠️ *LIQUIDITY ZONE ABSORPTION*`;
+
+    await sendMessage(
+      `${title}\n\n` +
+      `🪙 Coin: *${symbol}*\n` +
+      `📍 Zone: *${atrLabel}*\n` +
+      `🧱 Type: *${zoneType}*\n` +
+      `📈 Bias: *${setupBias}*\n\n` +
+      `🔎 Absorption: *${absorptionLevel}*\n` +
+      `🛑 Pattern: *${absorptionType}*\n` +
+      `📊 Volume vs 20-bar avg: *${effortText}*\n` +
+      `📏 Body/Range: *${bodyText}*\n` +
+      `↩️ Opposing Wick/Range: *${wickText}*\n\n` +
+      `⏱️ Zone Dwell: *${formatScript2ZoneDwell(now - state.startedAt)}*\n` +
+      `🕯️ Closed candles touching zone: *${state.candlesInZone}*\n\n` +
+      `ℹ️ *OBSERVATION ONLY — does not affect execution.*`
+    );
+  } catch (err) {
+    log(`❌ Script 2 zone absorption observation error ${symbol}: ${err?.message || err}`);
+  }
+}
+
+async function finalizeScript2ZoneAbsorptionObservation(symbol, now) {
+  const state = script2ZoneAbsorptionState[symbol];
+  if (!state) return;
+
+  if (now - state.lastSeenAt < SCRIPT2_ZONE_ABSORPTION_EXIT_GRACE_MS) return;
+
+  const atrLabel = state.zone?.atrLocation?.name || "ATR ZONE";
+  const zoneType = state.zone?.kind === "ORDER_BLOCK"
+    ? `ORDER BLOCK — ${state.zone?.type || "ORDER BLOCK"}`
+    : `LIQUIDITY — ${state.zone?.type || "LIQUIDITY"}`;
+  const peakText = Number.isFinite(state.peakEffortRatio)
+    ? `${state.peakEffortRatio.toFixed(2)}x`
+    : "N/A";
+
+  await sendMessage(
+    `🏁 *LIQUIDITY ZONE ABSORPTION ENDED*\n\n` +
+    `🪙 Coin: *${symbol}*\n` +
+    `📍 Zone: *${atrLabel}*\n` +
+    `🧱 Type: *${zoneType}*\n\n` +
+    `⏱️ Total Dwell: *${formatScript2ZoneDwell(state.lastSeenAt - state.startedAt)}*\n` +
+    `🕯️ Candles Touching Zone: *${state.candlesInZone}*\n` +
+    `🔴 High-Absorption Candles: *${state.highAbsorptionCandles}*\n` +
+    `⚪ Low-Absorption Candles: *${state.lowAbsorptionCandles}*\n` +
+    `📊 Peak Volume vs 20-bar avg: *${peakText}*\n\n` +
+    `ℹ️ *OBSERVATION ONLY — no execution logic changed.*`
+  );
+
+  delete script2ZoneAbsorptionState[symbol];
 }
 
 function calculateTwoCandleVolumeImbalance(candles) {
@@ -3341,7 +3612,7 @@ setInterval(async () => {
 //    >=70% directional volume imbalance from Binance taker-buy/sell volume.
 // 4) If no absorption is detected, continuation is allowed only at the
 //    corresponding ATR extreme: ATR HIGH for BUY continuation or ATR LOW
-//    for SELL continuation, confirmed by the same >=70% imbalance.
+//    for SELL continuation, confirmed by the same >=75% imbalance.
 // 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -3403,6 +3674,9 @@ const script2Zone = findScript2Zone(
 );
 
 if (script2Zone) {
+  // Observation-only liquidity-zone absorption tracking.
+  await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
+
   // ---------------------------------------------------
   // STEP 2 — DETERMINE ABSORPTION OR CONTINUATION
   // ---------------------------------------------------
@@ -3412,7 +3686,7 @@ if (script2Zone) {
   if (absorption?.direction) {
     // REVERSAL BRANCH:
     // Absorption determines direction, and the 2-candle imbalance
-    // must confirm that same direction at the configured >=70% level.
+    // must confirm that same direction at the configured >=75% level.
     if (volumeImbalance?.direction === absorption.direction) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
@@ -3447,6 +3721,12 @@ if (script2Zone) {
   }
 }
 
+// If price is no longer detected in a qualifying zone, keep the observation
+// alive briefly to avoid false exits caused by a single scanner miss.
+if (!script2Zone) {
+  await finalizeScript2ZoneAbsorptionObservation(symbol, now);
+}
+
 // -----------------------------------------------------
 // STEP 4 — EXECUTION DIRECTION
 // -----------------------------------------------------
@@ -3458,7 +3738,19 @@ let direction = null;
 const pendingSetup = script2PendingSetups[symbol];
 
 if (pendingSetup) {
-  direction = pendingSetup.direction;
+  const setupDirection = pendingSetup.direction;
+
+  // Manual BULL/BEAR mode controls execution direction only.
+  // It does not reintroduce STC into the entry logic.
+  // /setbull = BUY only, /setbear = SELL only, /setauto = no manual restriction.
+  const manualDirection =
+    MANUAL_CYCLE === "BULL" ? "BUY" :
+    MANUAL_CYCLE === "BEAR" ? "SELL" :
+    null;
+
+  if (!manualDirection || setupDirection === manualDirection) {
+    direction = setupDirection;
+  }
 }
 
       // =====================================================
