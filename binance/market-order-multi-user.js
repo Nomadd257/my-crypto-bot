@@ -57,7 +57,7 @@ const SL_ORDER_BLOCK_INSIDE_PERCENT = 0.10;
 
 // --- Absorption warnings ---
 // Absorption is informational only for now. It NEVER blocks an entry.
-const ABSORPTION_VOLUME_MULTIPLE = 1.5;
+const ABSORPTION_VOLUME_MULTIPLE = 2.0;
 const ABSORPTION_MAX_BODY_TO_RANGE = 0.35;
 const ABSORPTION_MIN_WICK_TO_RANGE = 0.45;
 const ABSORPTION_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
@@ -1454,20 +1454,18 @@ async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
     const bodyText = Number.isFinite(current.bodyRatio) ? `${(current.bodyRatio * 100).toFixed(1)}%` : "N/A";
     const wickText = Number.isFinite(current.wickRatio) ? `${(current.wickRatio * 100).toFixed(1)}%` : "N/A";
 
-    const shouldSendEntryAlert = !state.entryAlertSent;
+    // Telegram alert policy: do NOT send the initial LOW-absorption
+    // zone message. LOW observations are still recorded internally.
+    // Only send one alert when HIGH absorption is confirmed.
     const shouldSendHighAlert =
-      state.entryAlertSent &&
       !state.highAlertSent &&
       current.level === "HIGH";
 
-    if (!shouldSendEntryAlert && !shouldSendHighAlert) return;
+    if (!shouldSendHighAlert) return;
 
-    if (shouldSendEntryAlert) state.entryAlertSent = true;
-    if (shouldSendHighAlert) state.highAlertSent = true;
+    state.highAlertSent = true;
 
-    const title = shouldSendHighAlert
-      ? `🔥 *HIGH ABSORPTION CONFIRMED*`
-      : `⚠️ *LIQUIDITY ZONE ABSORPTION*`;
+    const title = `🔥 *HIGH ABSORPTION CONFIRMED*`;
 
     await sendMessage(
       `${title}\n\n` +
@@ -3602,17 +3600,17 @@ setInterval(async () => {
       const trendCycle = currentCycle[symbol];
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION/CONTINUATION → 75% IMBALANCE
+// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION/CONTINUATION → 70% IMBALANCE
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
 // 2) If absorption is detected, absorption determines the reversal direction.
 // 3) The last 2 CLOSED 5M candles must confirm that direction with
-//    >=75% directional volume imbalance from Binance taker-buy/sell volume.
+//    >=70% directional volume imbalance from Binance taker-buy/sell volume.
 // 4) If no absorption is detected, continuation is allowed only at the
 //    corresponding ATR extreme: ATR HIGH for BUY continuation or ATR LOW
-//    for SELL continuation, confirmed by the same >=75% imbalance.
+//    for SELL continuation, confirmed by the same >=70% imbalance.
 // 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -3686,7 +3684,7 @@ if (script2Zone) {
   if (absorption?.direction) {
     // REVERSAL BRANCH:
     // Absorption determines direction, and the 2-candle imbalance
-    // must confirm that same direction at the configured >=75% level.
+    // must confirm that same direction at the configured >=70% level.
     if (volumeImbalance?.direction === absorption.direction) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
