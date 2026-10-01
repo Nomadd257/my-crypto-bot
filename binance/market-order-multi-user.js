@@ -3609,7 +3609,7 @@ setInterval(async () => {
 //    associated with the current-day or previous-day high/low.
 // 2) If absorption is detected, absorption determines the reversal direction.
 // 3) The last 2 CLOSED 5M candles must confirm that direction with
-//    >=70% directional volume imbalance from Binance taker-buy/sell volume.
+//    >=75% directional volume imbalance from Binance taker-buy/sell volume.
 // 4) If no absorption is detected, continuation is allowed only at the
 //    corresponding ATR extreme: ATR HIGH for BUY continuation or ATR LOW
 //    for SELL continuation, confirmed by the same >=75% imbalance.
