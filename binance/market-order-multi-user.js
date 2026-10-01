@@ -56,7 +56,8 @@ const SL_ORDER_BLOCK_NEAR_PERCENT = 0.25;
 const SL_ORDER_BLOCK_INSIDE_PERCENT = 0.10;
 
 // --- Absorption warnings ---
-// Absorption is informational only for now. It NEVER blocks an entry.
+// Absorption threshold for reversal setups. A reversal cannot proceed until
+// the ATR-zone absorption check reaches at least this volume multiple.
 const ABSORPTION_VOLUME_MULTIPLE = 2.0;
 const ABSORPTION_MAX_BODY_TO_RANGE = 0.35;
 const ABSORPTION_MIN_WICK_TO_RANGE = 0.45;
@@ -1253,8 +1254,9 @@ function detectScript2Absorption(candles, zone) {
 // =====================================================
 // SCRIPT 2 — LIQUIDITY-ZONE ABSORPTION OBSERVATION
 // =====================================================
-// Observation only. This does NOT approve, delay, block, or trigger
-// an entry. It tracks what happens while price remains at a qualifying
+// Observation only. This tracker does NOT approve, delay, block, or trigger
+// an entry by itself. Reversal execution separately uses the qualifying
+// absorption check in the entry scanner. It tracks what happens while price remains at a qualifying
 // ATR HIGH/ATR LOW liquidity or order-block zone so we can later study
 // absorption strength, persistence, and eventual move size.
 //
@@ -1444,44 +1446,34 @@ async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
       }
     }
 
-    const atrLabel = zone.atrLocation.name || `ATR ${zone.atrLocation.side}`;
-    const zoneType = zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${zone.type}` : `LIQUIDITY — ${zone.type}`;
+    // Telegram alert policy: send one message when HIGH absorption
+    // (>= ABSORPTION_VOLUME_MULTIPLE) is confirmed at the zone.
+    // Absorption-ended notifications remain disabled.
     const current = observation || {};
-    const absorptionLevel = current.level || "LOW";
-    const absorptionType = current.type || "No qualifying absorption candle yet";
-    const setupBias = zone.atrLocation.side === "LOW" ? "Potential LONG 🟢" : "Potential SHORT 🔴";
-    const effortText = Number.isFinite(current.effortRatio) ? `${current.effortRatio.toFixed(2)}x` : "N/A";
-    const bodyText = Number.isFinite(current.bodyRatio) ? `${(current.bodyRatio * 100).toFixed(1)}%` : "N/A";
-    const wickText = Number.isFinite(current.wickRatio) ? `${(current.wickRatio * 100).toFixed(1)}%` : "N/A";
+    const shouldSendHighAlert = !state.highAlertSent && current.level === "HIGH";
 
-    // Telegram alert policy: do NOT send the initial LOW-absorption
-    // zone message. LOW observations are still recorded internally.
-    // Only send one alert when HIGH absorption is confirmed.
-    const shouldSendHighAlert =
-      !state.highAlertSent &&
-      current.level === "HIGH";
+    if (shouldSendHighAlert) {
+      state.highAlertSent = true;
 
-    if (!shouldSendHighAlert) return;
+      const atrLabel = zone.atrLocation.name || `ATR ${zone.atrLocation.side}`;
+      const zoneType = zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${zone.type}` : `LIQUIDITY — ${zone.type}`;
+      const absorptionType = current.type || "Qualifying absorption";
+      const effortText = Number.isFinite(current.effortRatio) ? `${current.effortRatio.toFixed(2)}x` : "N/A";
+      const bodyText = Number.isFinite(current.bodyRatio) ? `${(current.bodyRatio * 100).toFixed(1)}%` : "N/A";
+      const wickText = Number.isFinite(current.wickRatio) ? `${(current.wickRatio * 100).toFixed(1)}%` : "N/A";
 
-    state.highAlertSent = true;
-
-    const title = `🔥 *HIGH ABSORPTION CONFIRMED*`;
-
-    await sendMessage(
-      `${title}\n\n` +
-      `🪙 Coin: *${symbol}*\n` +
-      `📍 Zone: *${atrLabel}*\n` +
-      `🧱 Type: *${zoneType}*\n` +
-      `📈 Bias: *${setupBias}*\n\n` +
-      `🔎 Absorption: *${absorptionLevel}*\n` +
-      `🛑 Pattern: *${absorptionType}*\n` +
-      `📊 Volume vs 20-bar avg: *${effortText}*\n` +
-      `📏 Body/Range: *${bodyText}*\n` +
-      `↩️ Opposing Wick/Range: *${wickText}*\n\n` +
-      `⏱️ Zone Dwell: *${formatScript2ZoneDwell(now - state.startedAt)}*\n` +
-      `🕯️ Closed candles touching zone: *${state.candlesInZone}*\n\n` +
-      `ℹ️ *OBSERVATION ONLY — does not affect execution.*`
-    );
+      await sendMessage(
+        `🔥 *HIGH ABSORPTION CONFIRMED*\n\n` +
+        `🪙 Coin: *${symbol}*\n` +
+        `📍 Zone: *${atrLabel}*\n` +
+        `🧱 Type: *${zoneType}*\n` +
+        `🛑 Pattern: *${absorptionType}*\n` +
+        `📊 Volume vs 20-bar avg: *${effortText}*\n` +
+        `📏 Body/Range: *${bodyText}*\n` +
+        `↩️ Opposing Wick/Range: *${wickText}*\n\n` +
+        `ℹ️ *OBSERVATION ONLY — does not affect execution.*`
+      );
+    }
   } catch (err) {
     log(`❌ Script 2 zone absorption observation error ${symbol}: ${err?.message || err}`);
   }
@@ -1493,26 +1485,7 @@ async function finalizeScript2ZoneAbsorptionObservation(symbol, now) {
 
   if (now - state.lastSeenAt < SCRIPT2_ZONE_ABSORPTION_EXIT_GRACE_MS) return;
 
-  const atrLabel = state.zone?.atrLocation?.name || "ATR ZONE";
-  const zoneType = state.zone?.kind === "ORDER_BLOCK"
-    ? `ORDER BLOCK — ${state.zone?.type || "ORDER BLOCK"}`
-    : `LIQUIDITY — ${state.zone?.type || "LIQUIDITY"}`;
-  const peakText = Number.isFinite(state.peakEffortRatio)
-    ? `${state.peakEffortRatio.toFixed(2)}x`
-    : "N/A";
-
-  await sendMessage(
-    `🏁 *LIQUIDITY ZONE ABSORPTION ENDED*\n\n` +
-    `🪙 Coin: *${symbol}*\n` +
-    `📍 Zone: *${atrLabel}*\n` +
-    `🧱 Type: *${zoneType}*\n\n` +
-    `⏱️ Total Dwell: *${formatScript2ZoneDwell(state.lastSeenAt - state.startedAt)}*\n` +
-    `🕯️ Candles Touching Zone: *${state.candlesInZone}*\n` +
-    `🔴 High-Absorption Candles: *${state.highAbsorptionCandles}*\n` +
-    `⚪ Low-Absorption Candles: *${state.lowAbsorptionCandles}*\n` +
-    `📊 Peak Volume vs 20-bar avg: *${peakText}*\n\n` +
-    `ℹ️ *OBSERVATION ONLY — no execution logic changed.*`
-  );
+  // Zone-absorption end reports are intentionally disabled.
 
   delete script2ZoneAbsorptionState[symbol];
 }
@@ -3600,17 +3573,19 @@ setInterval(async () => {
       const trendCycle = currentCycle[symbol];
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → ABSORPTION/CONTINUATION → 70% IMBALANCE
+// SCRIPT 2 ENTRY LOGIC — ZONE → REVERSAL OR CONTINUATION
 // =====================================================
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
-// 2) If absorption is detected, absorption determines the reversal direction.
-// 3) The last 2 CLOSED 5M candles must confirm that direction with
-//    >=70% directional volume imbalance from Binance taker-buy/sell volume.
-// 4) If no absorption is detected, continuation is allowed only at the
-//    corresponding ATR extreme: ATR HIGH for BUY continuation or ATR LOW
-//    for SELL continuation, confirmed by the same >=70% imbalance.
+// 2) REVERSAL: absorption is the directional trigger. The absorption
+//    check must first reach >=2.0x average volume before the remaining
+//    reversal entry conditions (including volume imbalance) are evaluated.
+//    ATR LOW reversal = BUY absorption; ATR HIGH reversal = SELL absorption.
+// 3) CONTINUATION is a separate setup. It does not use absorption to
+//    determine direction. At ATR HIGH, BUY imbalance can create a BUY
+//    continuation; at ATR LOW, SELL imbalance can create a SELL continuation.
+// 4) The 2 CLOSED 5M candle directional volume imbalance threshold is 70%.
 // 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -3676,15 +3651,26 @@ if (script2Zone) {
   await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
 
   // ---------------------------------------------------
-  // STEP 2 — DETERMINE ABSORPTION OR CONTINUATION
+  // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
   // ---------------------------------------------------
+  const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
-  const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
 
-  if (absorption?.direction) {
-    // REVERSAL BRANCH:
-    // Absorption determines direction, and the 2-candle imbalance
-    // must confirm that same direction at the configured >=70% level.
+  // REVERSAL BRANCH:
+  // Absorption alone determines the reversal direction. Importantly,
+  // no other reversal entry condition is evaluated until the absorption
+  // candle has reached the required >=2.0x volume multiple. The
+  // detectScript2Absorption() result can only exist after that threshold
+  // (plus the required candle-body/wick conditions) is satisfied.
+  // ATR LOW -> BUY reversal; ATR HIGH -> SELL reversal.
+  if (
+    absorption?.direction &&
+    ((atrSide === "LOW" && absorption.direction === "BUY") ||
+     (atrSide === "HIGH" && absorption.direction === "SELL"))
+  ) {
+    // Only now evaluate the remaining reversal confirmation condition.
+    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+
     if (volumeImbalance?.direction === absorption.direction) {
       script2PendingSetups[symbol] = {
         direction: absorption.direction,
@@ -3695,15 +3681,15 @@ if (script2Zone) {
         volumeImbalance
       };
     }
-  } else if (volumeImbalance?.direction) {
+  } else {
     // CONTINUATION BRANCH:
-    // With STC removed from execution, the ATR extreme supplies the
-    // location context and the 2-candle directional imbalance supplies
-    // the execution direction.
-    const atrSide = script2Zone.atrLocation?.side;
+    // Continuation is independent of absorption. It has its own direction
+    // rule based on the ATR extreme and 2-candle directional imbalance.
+    // ATR HIGH -> BUY continuation; ATR LOW -> SELL continuation.
+    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
     const continuationDirection =
-      atrSide === "HIGH" && volumeImbalance.direction === "BUY" ? "BUY" :
-      atrSide === "LOW" && volumeImbalance.direction === "SELL" ? "SELL" :
+      atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
+      atrSide === "LOW" && volumeImbalance?.direction === "SELL" ? "SELL" :
       null;
 
     if (continuationDirection) {
