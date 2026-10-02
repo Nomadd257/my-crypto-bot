@@ -2,7 +2,7 @@
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
-// Volume imbalance report uses 5M closed candles
+// Volume imbalance uses the latest CLOSED 5M candle
 // MAX TRADES = 7 per user
 // 2 HRS cooldown per symbol
 // =====================================================
@@ -156,6 +156,17 @@ let script2PendingSetups = {}; // { symbol: reversal setup OR staged continuatio
 let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zone absorption tracking
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
+
+// --- Script 2 checkpoint messaging ---
+async function sendScript2Checkpoint(symbol, setupType, checkpoint, details = "") {
+  const icon = setupType === "REVERSAL" ? "🔄" : setupType === "CONTINUATION" ? "➡️" : "📍";
+  const label = setupType === "SETUP" ? "SCRIPT 2" : `SCRIPT 2 ${setupType}`;
+  await sendMessage(
+    `${icon} *${label} — ${symbol}*\n\n` +
+    `✅ *${checkpoint}*\n` +
+    (details ? `${details}\n` : "")
+  );
+}
 
 // --- Logging ---
 function log(msg) {
@@ -606,14 +617,14 @@ const OBV_DISTANCE_LOOKBACK = 20;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
 // Script 2 continuation confirmation settings.
-// A directional 2-candle imbalance creates a candidate only. Continuation
+// A directional 1-candle imbalance creates a candidate only. Continuation
 // becomes executable after a CLOSED 5M candle breaks the relevant zone boundary
 // and a later CLOSED 5M candle retests that boundary without reclaiming it.
 const SCRIPT2_CONTINUATION_MAX_BREAK_CANDLES = 3;
 const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 
 // Script 2 entry-zone settings. Price must interact with a detected
-// liquidity level or order block before the 2-candle imbalance is evaluated.
+// liquidity level or order block before the 1-candle imbalance is evaluated.
 const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.10;
 const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 
@@ -1167,11 +1178,11 @@ function calculateOBVSeries(candles) {
 
 
 // =====================================================
-// SCRIPT 2 — ZONE + 2-CANDLE VOLUME IMBALANCE
+// SCRIPT 2 — ZONE + 1-CANDLE VOLUME IMBALANCE
 // =====================================================
 // Entry begins only after price reaches a detected liquidity
-// level or potential order block. The last 2 CLOSED 5M candles
-// are then measured together for directional volume imbalance.
+// level or potential order block. The latest CLOSED 5M candle
+// is then measured for directional volume imbalance.
 // =====================================================
 
 function detectScript2Absorption(candles, zone) {
@@ -1426,6 +1437,9 @@ async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
         peakEffortRatio: 0,
         latestObservation: null,
         entryAlertSent: false,
+        absorptionCheckpointSent: false,
+        reversalDirectionCheckpointSent: false,
+        reversalImbalanceCheckpointSent: false,
         highAlertSent: false
       };
       script2ZoneAbsorptionState[symbol] = state;
@@ -1497,10 +1511,10 @@ async function finalizeScript2ZoneAbsorptionObservation(symbol, now) {
   delete script2ZoneAbsorptionState[symbol];
 }
 
-function calculateTwoCandleVolumeImbalance(candles) {
-  if (!Array.isArray(candles) || candles.length < 2) return null;
+function calculateOneCandleVolumeImbalance(candles) {
+  if (!Array.isArray(candles) || candles.length < 1) return null;
 
-  const recentCandles = candles.slice(-2);
+  const recentCandles = candles.slice(-1);
   let buyVol = 0;
   let sellVol = 0;
   let delta = 0;
@@ -1545,7 +1559,7 @@ function calculateTwoCandleVolumeImbalance(candles) {
       buyPct,
       sellPct,
       deltaPct,
-      candles: 2
+      candles: 1
     };
   }
 
@@ -1558,7 +1572,7 @@ function calculateTwoCandleVolumeImbalance(candles) {
       buyPct,
       sellPct,
       deltaPct,
-      candles: 2
+      candles: 1
     };
   }
 
@@ -1570,7 +1584,7 @@ function calculateTwoCandleVolumeImbalance(candles) {
     buyPct,
     sellPct,
     deltaPct,
-    candles: 2
+    candles: 1
   };
 }
 
@@ -1734,7 +1748,7 @@ function getScript2ContinuationState(candles, setup) {
   return { status: "WAIT", latestKey, latestIndex };
 }
 
-function processScript2Continuation(symbol, closedCandles5, now) {
+async function processScript2Continuation(symbol, closedCandles5, now) {
   const setup = script2PendingSetups[symbol];
 
   if (!setup || setup.setupType !== "CONTINUATION") return null;
@@ -1763,6 +1777,15 @@ function processScript2Continuation(symbol, closedCandles5, now) {
       `${setup.direction} beyond ${Number(state.boundary).toPrecision(8)}`
     );
 
+    await sendScript2Checkpoint(
+      symbol,
+      "CONTINUATION",
+      "STRUCTURAL BREAK CONFIRMED",
+      `📈 Direction: *${setup.direction}*\n` +
+      `📏 Zone boundary: *${Number(state.boundary).toPrecision(8)}*\n` +
+      `🕯 Closed 5M candle confirmed the break`
+    );
+
     return null;
   }
 
@@ -1775,6 +1798,15 @@ function processScript2Continuation(symbol, closedCandles5, now) {
     log(
       `✅ Script 2 continuation confirmed ${symbol}: ` +
       `${setup.direction} break + failed reclaim`
+    );
+
+    await sendScript2Checkpoint(
+      symbol,
+      "CONTINUATION",
+      "FAILED-RECLAIM RETEST CONFIRMED",
+      `🔁 Direction: *${setup.direction}*\n` +
+      `📏 Boundary: *${Number(setup.breakBoundary).toPrecision(8)}*\n` +
+      `🕯 Closed 5M candle retested without reclaiming the boundary`
     );
 
     return setup.direction;
@@ -1920,11 +1952,11 @@ function formatScript2Zone(zone) {
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
-  if (!candles || candles.length < 2) return false;
+  if (!candles || candles.length < 1) return false;
 
-  // Measure directional volume across the latest 2 CLOSED 5M candles
+  // Measure directional volume on the latest CLOSED 5M candle
   // using Binance taker-buy volume. Candle body size/color is not used.
-  const recentCandles = candles.slice(-2);
+  const recentCandles = candles.slice(-1);
   let buyVol = 0;
   let sellVol = 0;
 
@@ -2797,18 +2829,23 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
 // --- Execute market orders for all users ---
 async function executeMarketOrderForAllUsers(symbol, direction) {
   const clients = Object.entries(userClients).map(([userId, client]) => ({ userId, client }));
-  if (!clients.length) {
-    await sendMessage(`⚠️ No active users.`);
-    return;
-  }
+  const result = {
+    attempted: clients.length,
+    executed: 0,
+    skipped: 0,
+    failed: 0
+  };
 
-  await sendMessage(`⚡ Executing *${direction}* on *${symbol}* for all users...`);
+  if (!clients.length) {
+    return result;
+  }
 
   for (const { userId, client } of clients) {
     try {
       // Check user MAX_TRADES
       const userOpenTrades = Object.values(activePositions).reduce((sum, sym) => sum + (sym[userId] ? 1 : 0), 0);
       if (userOpenTrades >= MAX_TRADES) {
+        result.skipped += 1;
         log(`User ${userId} has max open trades.`);
         continue;
       }
@@ -2818,7 +2855,8 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
       const usdtBal = balances.find((b) => b.asset === "USDT");
       const bal = usdtBal ? parseFloat(usdtBal.balance) : 0;
       if (!bal || bal <= 0) {
-        await sendMessage(`⚠️ User ${userId} has *NO USDT*. Trade skipped.`);
+        result.skipped += 1;
+        log(`User ${userId} has NO USDT. Trade skipped.`);
         continue;
       }
 
@@ -2832,7 +2870,8 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         markPrice = k && k.length ? k[0].close : 0;
       }
       if (!markPrice || markPrice <= 0) {
-        log(`⚠️ markPrice invalid for ${symbol}, skipping user ${userId}`);
+        result.skipped += 1;
+        log(`markPrice invalid for ${symbol}, skipping user ${userId}`);
         continue;
       }
 
@@ -2842,12 +2881,15 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
       let lotStep = 0.001;
       try {
         const info = await client.futuresExchangeInfo();
-        const s = info.symbols.find((s) => s.symbol === symbol);
-        if (s) lotStep = parseFloat(s.filters.find((f) => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
+        const symInfo = info.symbols.find((s) => s.symbol === symbol);
+        if (symInfo) lotStep = parseFloat(symInfo.filters.find((f) => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
       } catch {}
 
       const qty = floorToStep(rawQty, lotStep);
-      if (!qty || qty <= 0) continue;
+      if (!qty || qty <= 0) {
+        result.skipped += 1;
+        continue;
+      }
 
       try {
         if (direction === "BUY") await client.futuresMarketBuy(symbol, qty);
@@ -2864,11 +2906,8 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           lowest: markPrice,
           runnerActive: false,
         };
-        // Start cooldown for this symbol
         symbolCooldowns[symbol] = Date.now();
 
-        // Record every successful order so /tradehistory can show
-        // all trades placed during the current day.
         tradeHistory.push({
           date: getTradeHistoryDate(),
           symbol,
@@ -2879,7 +2918,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           timestamp: Date.now()
         });
 
-        await sendMessage(`✅ *${direction} EXECUTED* on *${symbol}* for User ${userId} (qty ${qty})`);
+        result.executed += 1;
 
         // Informational only: inspect the existing SL after the trade is placed.
         if (!slLiquidityReportSent[symbol]) {
@@ -2887,12 +2926,16 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           await sendStopLossLiquidityReport(symbol, direction, markPrice);
         }
       } catch (err) {
-        log(`❌ Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
+        result.failed += 1;
+        log(`Order failed for ${userId} on ${symbol}: ${err?.message || err}`);
       }
     } catch (err) {
-      log(`❌ executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
+      result.failed += 1;
+      log(`executeMarketOrder error for ${userId} ${symbol}: ${err?.message || err}`);
     }
   }
+
+  return result;
 }
 
 // =====================================================
@@ -3559,7 +3602,7 @@ async function monitorPriceActivations() {
           `↕️ Cross: *${crossDirection}*\n\n` +
           `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
           `This is the same action as /activate ${symbol}.\n` +
-          `The 1H STC is monitored for trend context. Entry execution is based on zone, absorption/continuation and 2-candle directional volume imbalance.`
+          `The 1H STC is monitored for trend context. Entry execution is based on zone, absorption/continuation and 1-candle directional volume imbalance.`
         );
 
         log(
@@ -3803,7 +3846,7 @@ setInterval(async () => {
 // 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
 //    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
 //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
-// 4) The 2 CLOSED 5M candle directional volume imbalance threshold is 70%.
+// 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
 // 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -3868,6 +3911,22 @@ if (script2Zone) {
   // Observation-only liquidity-zone absorption tracking.
   await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
 
+  // Send the zone checkpoint once for this zone.
+  const script2ZoneState = script2ZoneAbsorptionState[symbol];
+  if (script2ZoneState && !script2ZoneState.entryAlertSent) {
+    script2ZoneState.entryAlertSent = true;
+    const zoneLabel = script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`;
+    const zoneType = script2Zone.kind === "ORDER_BLOCK"
+      ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}`
+      : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`;
+    await sendScript2Checkpoint(
+      symbol,
+      "SETUP",
+      "ZONE REACHED",
+      `📍 Zone: *${zoneLabel}*\n🏦 Type: *${zoneType}*`
+    );
+  }
+
   // ---------------------------------------------------
   // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
   // ---------------------------------------------------
@@ -3895,6 +3954,20 @@ if (script2Zone) {
   const reversalEligible = isPreviousDayLiquidity && hasAbsorption;
 
   if (reversalEligible) {
+    // A qualifying absorption is its own checkpoint. Send it once per zone.
+    if (script2ZoneState && !script2ZoneState.absorptionCheckpointSent) {
+      script2ZoneState.absorptionCheckpointSent = true;
+      await sendScript2Checkpoint(
+        symbol,
+        "REVERSAL",
+        "ABSORPTION CONFIRMED",
+        `🛑 Pattern: *${absorption.type}*\n` +
+        `📊 Volume: *${Number.isFinite(absorption.effortRatio) ? `${absorption.effortRatio.toFixed(2)}x average` : "N/A"}*\n` +
+        `📏 Body/Range: *${Number.isFinite(absorption.bodyRatio) ? `${(absorption.bodyRatio * 100).toFixed(1)}%` : "N/A"}*\n` +
+        `↩️ Wick/Range: *${Number.isFinite(absorption.wickRatio) ? `${(absorption.wickRatio * 100).toFixed(1)}%` : "N/A"}*`
+      );
+    }
+
     // Only qualifying absorption at PDH/PDL may create a reversal.
     // A mismatched absorption is not continuation evidence.
     delete script2PendingSetups[symbol];
@@ -3905,14 +3978,37 @@ if (script2Zone) {
       null;
 
     if (reversalDirection) {
-      const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+      if (script2ZoneState && !script2ZoneState.reversalDirectionCheckpointSent) {
+        script2ZoneState.reversalDirectionCheckpointSent = true;
+        await sendScript2Checkpoint(
+          symbol,
+          "REVERSAL",
+          "REVERSAL DIRECTION CONFIRMED",
+          `➡️ Direction: *${reversalDirection}*`
+        );
+      }
+
+      const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
 
       // Reversal still requires directional volume agreement.
       if (volumeImbalance?.direction === reversalDirection) {
+        if (script2ZoneState && !script2ZoneState.reversalImbalanceCheckpointSent) {
+          script2ZoneState.reversalImbalanceCheckpointSent = true;
+          await sendScript2Checkpoint(
+            symbol,
+            "REVERSAL",
+            "VOLUME IMBALANCE PASSED",
+            `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${Number(volumeImbalance[reversalDirection === "BUY" ? "buyPct" : "sellPct"]).toFixed(1)}%*\n` +
+            `📊 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*\n` +
+            `⚡ Delta: *${Number(volumeImbalance.delta).toFixed(2)}*\n` +
+            `🕯 Closed candles used: *1*`
+          );
+        }
+
         script2PendingSetups[symbol] = {
           direction: reversalDirection,
           setupType: "REVERSAL",
-          absorption: absorption.type,
+          absorption,
           zone: script2Zone,
           detectedAt: Date.now(),
           volumeImbalance
@@ -3934,7 +4030,7 @@ if (script2Zone) {
     // subsequently prove structural acceptance with a closed-candle
     // break and a failed-reclaim retest.
     const pdhPdlAbsorptionBlocksContinuation = isPreviousDayLiquidity && hasAbsorption;
-    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+    const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
     const continuationDirection = pdhPdlAbsorptionBlocksContinuation
       ? null
       : (atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
@@ -3944,15 +4040,35 @@ if (script2Zone) {
     if (continuationDirection) {
       const existing = script2PendingSetups[symbol];
 
-      // Do not reset a continuation candidate every scan while price
-      // remains inside the same zone. A candidate gets one confirmation
-      // window tied to the candle on which the imbalance was detected.
-      if (
+      const isNewContinuationCandidate =
         !existing ||
         existing.setupType !== "CONTINUATION" ||
         existing.direction !== continuationDirection ||
-        getScript2ZoneObservationKey(existing.zone) !== getScript2ZoneObservationKey(script2Zone)
-      ) {
+        getScript2ZoneObservationKey(existing.zone) !== getScript2ZoneObservationKey(script2Zone);
+
+      if (isNewContinuationCandidate) {
+        await sendScript2Checkpoint(
+          symbol,
+          "CONTINUATION",
+          "VOLUME IMBALANCE PASSED",
+          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"]).toFixed(1)}%*\n` +
+          `📊 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*\n` +
+          `⚡ Delta: *${Number(volumeImbalance.delta).toFixed(2)}*\n` +
+          `🕯 Closed candles used: *1*`
+        );
+      }
+
+      // Do not reset a continuation candidate every scan while price
+      // remains inside the same zone. A candidate gets one confirmation
+      // window tied to the candle on which the imbalance was detected.
+      if (isNewContinuationCandidate) {
+        await sendScript2Checkpoint(
+          symbol,
+          "CONTINUATION",
+          "CONTINUATION CANDIDATE CREATED",
+          `➡️ Direction: *${continuationDirection}*`
+        );
+
         script2PendingSetups[symbol] = {
           direction: continuationDirection,
           setupType: "CONTINUATION",
@@ -3977,7 +4093,7 @@ if (script2Zone) {
 // intentional: once a continuation candidate exists, the bot must
 // watch for the structural break and retest instead of requiring
 // price to still be inside the zone.
-const confirmedContinuationDirection = processScript2Continuation(
+const confirmedContinuationDirection = await processScript2Continuation(
   symbol,
   closedCandles5,
   now
@@ -4030,6 +4146,16 @@ if (pendingSetup) {
     (!manualDirection || setupDirection === manualDirection)
   ) {
     direction = setupDirection;
+
+    if (!pendingSetup.executionDirectionCheckpointSent) {
+      pendingSetup.executionDirectionCheckpointSent = true;
+      await sendScript2Checkpoint(
+        symbol,
+        pendingSetup.setupType,
+        "EXECUTION DIRECTION PASSED",
+        `${setupDirection === "BUY" ? "🟢" : "🔴"} *${setupDirection} allowed*`
+      );
+    }
   }
 }
 
@@ -4057,35 +4183,43 @@ if (pendingSetup) {
           continue;
         }
 
-        await executeMarketOrderForAllUsers(symbol, direction);
-        delete script2PendingSetups[symbol];
+        const setupForReport = pendingSetup;
 
-        const reportCandles = closedCandles5.slice(-2);
-        let buyVol = 0;
-        let sellVol = 0;
-
-        for (const candle of reportCandles) {
-          const volume = Number(candle.volume);
-          const takerBuyVolume = Number(candle.takerBuyVolume);
-          if (Number.isFinite(volume) && Number.isFinite(takerBuyVolume)) {
-            buyVol += takerBuyVolume;
-            sellVol += Math.max(0, volume - takerBuyVolume);
-          }
-        }
-
-        const totalVol = buyVol + sellVol;
-        const delta = buyVol - sellVol;
-        const buyPct = totalVol ? ((buyVol / totalVol) * 100).toFixed(1) : 0;
-        const sellPct = totalVol ? ((sellVol / totalVol) * 100).toFixed(1) : 0;
-        const deltaPct = totalVol ? ((Math.abs(delta) / totalVol) * 100).toFixed(1) : 0;
-
-        await sendMessage(
-          `📊 Directional Volume Imbalance: *${symbol}*\n` +
-          `🟢 Buy: ${buyVol.toFixed(2)} (${buyPct}%)\n` +
-          `🔴 Sell: ${sellVol.toFixed(2)} (${sellPct}%)\n` +
-          `⚡ Delta: ${delta >= 0 ? "+" : ""}${delta.toFixed(2)} (${deltaPct}%)`,
+        await sendScript2Checkpoint(
+          symbol,
+          setupForReport.setupType,
+          "LIQUIDITY GATE PASSED",
+          `📚 Order-book liquidity sufficient\n` +
+          `💵 24H Volume: *${Number(liquidity.quoteVolume24h || 0).toLocaleString()} USDT*\n` +
+          `↔️ Spread: *${Number(liquidity.spreadPct || 0).toFixed(3)}%*\n` +
+          `📚 Bid/Ask Depth: *${Number(liquidity.bidDepth || 0).toLocaleString()} / ${Number(liquidity.askDepth || 0).toLocaleString()} USDT*`
         );
 
+        const executionResult = await executeMarketOrderForAllUsers(symbol, direction);
+
+        if (executionResult.executed > 0) {
+          await sendScript2Checkpoint(
+            symbol,
+            setupForReport.setupType,
+            "ENTRY EXECUTED",
+            `${direction === "BUY" ? "🟢" : "🔴"} *${symbol} ${direction}*\n` +
+            `👥 Orders executed: *${executionResult.executed}/${executionResult.attempted}*` +
+            (executionResult.failed ? `\n⚠️ Failed: *${executionResult.failed}*` : "") +
+            (executionResult.skipped ? `\n⏭️ Skipped: *${executionResult.skipped}*` : "")
+          );
+        } else {
+          await sendScript2Checkpoint(
+            symbol,
+            setupForReport.setupType,
+            "ENTRY NOT EXECUTED",
+            `⚠️ No orders were executed.\n` +
+            `Attempted: *${executionResult.attempted}*\n` +
+            `Failed: *${executionResult.failed}*\n` +
+            `Skipped: *${executionResult.skipped}*`
+          );
+        }
+
+        delete script2PendingSetups[symbol];
         symbolCooldowns[symbol] = now;
       }
     } catch (err) {
