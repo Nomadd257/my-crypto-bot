@@ -3880,32 +3880,23 @@ if (script2Zone) {
   );
 
   // ===================================================
-  // SINGLE DECISION GATE — ABSORPTION FIRST
+  // DECISION GATE — PREVIOUS-DAY REVERSAL / ALL-DAY CONTINUATION
   // ===================================================
-  // At an ATR extreme the bot must choose ONE interpretation.
+  // Previous-day high/low (PDH/PDL) can produce either a reversal
+  // or a continuation. Current-day high/low (CDH/CDL) can produce
+  // continuation only.
   //
-  // 1) If a qualifying absorption pattern exists, absorption owns
-  //    the setup decision. A matching absorption can create reversal;
-  //    a non-matching/unclear absorption blocks continuation.
-  //
-  // 2) Only when there is NO qualifying absorption do we evaluate
-  //    directional volume imbalance for continuation.
-  //
-  // This prevents the same ATR extreme from simultaneously becoming
-  // a reversal and continuation candidate.
-  //
-  // ATR LOW:
-  //   bullish absorption -> BUY reversal
-  //   no absorption + SELL imbalance -> SELL continuation candidate
-  //
-  // ATR HIGH:
-  //   bearish absorption -> SELL reversal
-  //   no absorption + BUY imbalance -> BUY continuation candidate.
+  // The selected ATR location is authoritative because getScript2AtrLocation()
+  // already chooses the nearest qualifying current/previous-day level.
+  const liquiditySource = String(script2Zone.atrLocation?.name || "");
+  const isPreviousDayLiquidity = liquiditySource === "PREVIOUS DAY HIGH" ||
+    liquiditySource === "PREVIOUS DAY LOW";
   const hasAbsorption = Boolean(absorption?.direction);
+  const reversalEligible = isPreviousDayLiquidity && hasAbsorption;
 
-  if (hasAbsorption) {
-    // Any qualifying absorption takes priority over continuation.
-    // A mismatched absorption is NOT treated as continuation evidence.
+  if (reversalEligible) {
+    // Only qualifying absorption at PDH/PDL may create a reversal.
+    // A mismatched absorption is not continuation evidence.
     delete script2PendingSetups[symbol];
 
     const reversalDirection =
@@ -3932,17 +3923,23 @@ if (script2Zone) {
     // ===================================================
     // CONTINUATION CANDIDATE
     // ===================================================
-    // Continuation is considered ONLY after the absorption gate
-    // has returned no qualifying absorption.
+    // Continuation is valid at BOTH previous-day and current-day
+    // high/low liquidity. Current-day absorption is observation-only
+    // for execution routing, so it must NOT block continuation.
+    // At PDH/PDL, a qualifying absorption remains reserved for the
+    // reversal path above; mismatched PDH/PDL absorption blocks
+    // continuation rather than being reinterpreted as continuation.
     //
     // Imbalance is still only initial evidence. The candidate must
     // subsequently prove structural acceptance with a closed-candle
     // break and a failed-reclaim retest.
+    const pdhPdlAbsorptionBlocksContinuation = isPreviousDayLiquidity && hasAbsorption;
     const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
-    const continuationDirection =
-      atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
-      atrSide === "LOW" && volumeImbalance?.direction === "SELL" ? "SELL" :
-      null;
+    const continuationDirection = pdhPdlAbsorptionBlocksContinuation
+      ? null
+      : (atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
+         atrSide === "LOW" && volumeImbalance?.direction === "SELL" ? "SELL" :
+         null);
 
     if (continuationDirection) {
       const existing = script2PendingSetups[symbol];
