@@ -3795,13 +3795,14 @@ setInterval(async () => {
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
-// 2) REVERSAL: absorption is the directional trigger. The absorption
-//    check must first reach >=2.0x average volume before the remaining
-//    reversal entry conditions (including volume imbalance) are evaluated.
-//    ATR LOW reversal = BUY absorption; ATR HIGH reversal = SELL absorption.
-// 3) CONTINUATION is a separate setup. It does not use absorption to
-//    determine direction. At ATR HIGH, BUY imbalance can create a BUY
-//    continuation; at ATR LOW, SELL imbalance can create a SELL continuation.
+// 2) DECISION ORDER: absorption is checked FIRST at the ATR extreme.
+//    A qualifying absorption owns the setup decision. ATR LOW bullish
+//    absorption = BUY reversal; ATR HIGH bearish absorption = SELL reversal.
+//    A mismatched qualifying absorption blocks continuation rather than
+//    being interpreted as continuation pressure.
+// 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
+//    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
+//    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
 // 4) The 2 CLOSED 5M candle directional volume imbalance threshold is 70%.
 // 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
@@ -3878,36 +3879,65 @@ if (script2Zone) {
     String(closedCandles5.length - 1)
   );
 
-  // REVERSAL BRANCH:
-  // Absorption determines the reversal direction. No continuation
-  // candidate is created when the qualifying reversal pattern exists.
-  // ATR LOW -> BUY reversal; ATR HIGH -> SELL reversal.
-  if (
-    absorption?.direction &&
-    ((atrSide === "LOW" && absorption.direction === "BUY") ||
-     (atrSide === "HIGH" && absorption.direction === "SELL"))
-  ) {
-    const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+  // ===================================================
+  // SINGLE DECISION GATE — ABSORPTION FIRST
+  // ===================================================
+  // At an ATR extreme the bot must choose ONE interpretation.
+  //
+  // 1) If a qualifying absorption pattern exists, absorption owns
+  //    the setup decision. A matching absorption can create reversal;
+  //    a non-matching/unclear absorption blocks continuation.
+  //
+  // 2) Only when there is NO qualifying absorption do we evaluate
+  //    directional volume imbalance for continuation.
+  //
+  // This prevents the same ATR extreme from simultaneously becoming
+  // a reversal and continuation candidate.
+  //
+  // ATR LOW:
+  //   bullish absorption -> BUY reversal
+  //   no absorption + SELL imbalance -> SELL continuation candidate
+  //
+  // ATR HIGH:
+  //   bearish absorption -> SELL reversal
+  //   no absorption + BUY imbalance -> BUY continuation candidate.
+  const hasAbsorption = Boolean(absorption?.direction);
 
-    if (volumeImbalance?.direction === absorption.direction) {
-      script2PendingSetups[symbol] = {
-        direction: absorption.direction,
-        setupType: "REVERSAL",
-        absorption: absorption.type,
-        zone: script2Zone,
-        detectedAt: Date.now(),
-        volumeImbalance
-      };
+  if (hasAbsorption) {
+    // Any qualifying absorption takes priority over continuation.
+    // A mismatched absorption is NOT treated as continuation evidence.
+    delete script2PendingSetups[symbol];
+
+    const reversalDirection =
+      atrSide === "LOW" && absorption.direction === "BUY" ? "BUY" :
+      atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
+      null;
+
+    if (reversalDirection) {
+      const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
+
+      // Reversal still requires directional volume agreement.
+      if (volumeImbalance?.direction === reversalDirection) {
+        script2PendingSetups[symbol] = {
+          direction: reversalDirection,
+          setupType: "REVERSAL",
+          absorption: absorption.type,
+          zone: script2Zone,
+          detectedAt: Date.now(),
+          volumeImbalance
+        };
+      }
     }
   } else {
-    // CONTINUATION CANDIDATE:
-    // Imbalance is only the initial evidence of directional pressure.
-    // It does NOT authorize execution. The candidate must subsequently
-    // prove structural acceptance with a closed-candle break and a
-    // failed-reclaim retest.
+    // ===================================================
+    // CONTINUATION CANDIDATE
+    // ===================================================
+    // Continuation is considered ONLY after the absorption gate
+    // has returned no qualifying absorption.
     //
-    // ATR HIGH -> BUY continuation candidate.
-    // ATR LOW  -> SELL continuation candidate.
+    // Imbalance is still only initial evidence. The candidate must
+    // subsequently prove structural acceptance with a closed-candle
+    // break and a failed-reclaim retest.
     const volumeImbalance = calculateTwoCandleVolumeImbalance(closedCandles5);
     const continuationDirection =
       atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
