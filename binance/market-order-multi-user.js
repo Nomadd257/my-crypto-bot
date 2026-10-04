@@ -155,6 +155,7 @@ let currentCycle = {}; // { symbol: "BULL" | "BEAR" }
 let script2PendingSetups = {}; // { symbol: reversal setup OR staged continuation setup }
 let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zone absorption tracking
 let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
+let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -610,7 +611,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
 // Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
@@ -622,6 +623,19 @@ const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 // Candle momentum = signed body / full candle range. A BOS candle with
 // directional candle momentum >= 0.50 enters immediately without a retest.
 const SCRIPT2_HIGH_MOMENTUM_THRESHOLD = 0.5;
+
+// Global market-activity regime gate. This is direction-neutral so it can
+// support both reversal and continuation setups without forcing reversals
+// to trade in the current candle's direction. The gate measures whether
+// the market is moving with enough activity to justify starting a new setup.
+const ADEQUATE_MOMENTUM_THRESHOLD = 0.25;
+const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.50;
+const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.00;
+const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.00;
+const MARKET_REGIME_RECENT_RANGE_CANDLES = 5;
+const MARKET_REGIME_BASELINE_CANDLES = 20;
+const MARKET_REGIME_RECENT_VOLUME_CANDLES = 3;
+const MARKET_REGIME_MIN_SCORE = 2;
 
 // Script 2 entry-zone settings. Price must interact with a detected
 // liquidity level or order block before the 1-candle imbalance is evaluated.
@@ -639,6 +653,193 @@ const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
 
+
+// ======================================================
+// MARKET MOMENTUM / ACTIVITY REGIME
+// ======================================================
+// This is intentionally direction-neutral. It answers only:
+// "Is the market active enough to justify starting a new setup?"
+// It does NOT decide BUY vs SELL. Reversal direction still comes from
+// absorption at the ATR high/low zone, while continuation direction still
+// comes from the existing volume-imbalance + BOS logic.
+//
+// Score components:
+// 1) Recent candle momentum activity: average ABS(body/range) over the
+//    most recent closed 5M candles must reach 0.25.
+// 2) ATR activity: recent average true range must be at least the baseline.
+// 3) Volume activity: recent average volume must be at least the baseline.
+//
+// At least 2 of 3 must pass. This avoids allowing a single abnormal candle
+// to classify an otherwise dead/choppy market as tradable.
+function getScript2MomentumRegime(closedCandles5) {
+  if (!Array.isArray(closedCandles5) || closedCandles5.length < 35) {
+    return {
+      allowed: false,
+      regime: "LOW_MOMENTUM",
+      score: 0,
+      candleMomentum: null,
+      atrRatio: null,
+      volumeRatio: null,
+      candleMomentumPassed: false,
+      atrPassed: false,
+      volumePassed: false
+    };
+  }
+
+  const recentCandles = closedCandles5.slice(-MARKET_REGIME_RECENT_RANGE_CANDLES);
+  const baselineStart = -(MARKET_REGIME_RECENT_RANGE_CANDLES + MARKET_REGIME_BASELINE_CANDLES);
+  const baselineEnd = -MARKET_REGIME_RECENT_RANGE_CANDLES;
+  const baselineCandles = closedCandles5.slice(baselineStart, baselineEnd);
+  const recentVolumeCandles = closedCandles5.slice(-MARKET_REGIME_RECENT_VOLUME_CANDLES);
+  const volumeBaselineCandles = closedCandles5.slice(
+    -(MARKET_REGIME_RECENT_VOLUME_CANDLES + MARKET_REGIME_BASELINE_CANDLES),
+    -MARKET_REGIME_RECENT_VOLUME_CANDLES
+  );
+
+  const momentumValues = recentCandles
+    .map((candle) => {
+      const open = Number(candle.open);
+      const high = Number(candle.high);
+      const low = Number(candle.low);
+      const close = Number(candle.close);
+      const range = high - low;
+      return Number.isFinite(open) && Number.isFinite(high) &&
+        Number.isFinite(low) && Number.isFinite(close) && range > 0
+        ? Math.abs((close - open) / range)
+        : null;
+    })
+    .filter(Number.isFinite);
+
+  const candleMomentum = momentumValues.length
+    ? momentumValues.reduce((sum, value) => sum + value, 0) / momentumValues.length
+    : null;
+
+  const trueRange = (candle, previousClose) => {
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const prev = Number(previousClose);
+    if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(prev)) return null;
+    return Math.max(high - low, Math.abs(high - prev), Math.abs(low - prev));
+  };
+
+  const recentAtrValues = [];
+  const recentStartIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
+  for (let i = recentStartIndex; i < closedCandles5.length; i++) {
+    const tr = trueRange(closedCandles5[i], closedCandles5[i - 1]?.close);
+    if (Number.isFinite(tr) && tr > 0) recentAtrValues.push(tr);
+  }
+
+  const baselineAtrValues = [];
+  const baselineStartIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES - MARKET_REGIME_BASELINE_CANDLES;
+  const baselineEndIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
+  for (let i = baselineStartIndex; i < baselineEndIndex; i++) {
+    const tr = trueRange(closedCandles5[i], closedCandles5[i - 1]?.close);
+    if (Number.isFinite(tr) && tr > 0) baselineAtrValues.push(tr);
+  }
+
+  const recentAtr = recentAtrValues.length
+    ? recentAtrValues.reduce((sum, value) => sum + value, 0) / recentAtrValues.length
+    : null;
+  const baselineAtr = baselineAtrValues.length
+    ? baselineAtrValues.reduce((sum, value) => sum + value, 0) / baselineAtrValues.length
+    : null;
+  const atrRatio = Number.isFinite(recentAtr) && Number.isFinite(baselineAtr) && baselineAtr > 0
+    ? recentAtr / baselineAtr
+    : null;
+
+  const recentVolumes = recentVolumeCandles
+    .map((candle) => Number(candle.volume))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const baselineVolumes = volumeBaselineCandles
+    .map((candle) => Number(candle.volume))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  const recentVolume = recentVolumes.length
+    ? recentVolumes.reduce((sum, value) => sum + value, 0) / recentVolumes.length
+    : null;
+  const baselineVolume = baselineVolumes.length
+    ? baselineVolumes.reduce((sum, value) => sum + value, 0) / baselineVolumes.length
+    : null;
+  const volumeRatio = Number.isFinite(recentVolume) && Number.isFinite(baselineVolume) && baselineVolume > 0
+    ? recentVolume / baselineVolume
+    : null;
+
+  const candleMomentumPassed = Number.isFinite(candleMomentum) &&
+    candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD;
+  const atrPassed = Number.isFinite(atrRatio) &&
+    atrRatio >= MARKET_REGIME_ATR_EXPANSION_MIN_RATIO;
+  const volumePassed = Number.isFinite(volumeRatio) &&
+    volumeRatio >= MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO;
+
+  const score = [candleMomentumPassed, atrPassed, volumePassed]
+    .filter(Boolean).length;
+  const allowed = score >= MARKET_REGIME_MIN_SCORE;
+  const highActivity = allowed &&
+    Number.isFinite(candleMomentum) &&
+    candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
+
+  return {
+    allowed,
+    regime: allowed ? (highActivity ? "HIGH_MOMENTUM" : "ADEQUATE_MOMENTUM") : "LOW_MOMENTUM",
+    score,
+    candleMomentum,
+    atrRatio,
+    volumeRatio,
+    candleMomentumPassed,
+    atrPassed,
+    volumePassed
+  };
+}
+
+function maybeSendScript2MomentumRegimeCheckpoint(symbol, regime, candleKey) {
+  if (!regime || !candleKey) return;
+
+  const previous = script2MomentumRegimeState[symbol];
+  const changed = !previous || previous.regime !== regime.regime;
+
+  // Only report regime changes. This keeps the checkpoint useful for
+  // studying transitions without creating a message every 5 minutes for
+  // every symbol in a large scan universe.
+  if (!changed) return;
+
+  script2MomentumRegimeState[symbol] = {
+    regime: regime.regime,
+    candleKey
+  };
+
+  const scoreText = `${regime.score}/${3}`;
+  const candleMomentumText = Number.isFinite(regime.candleMomentum)
+    ? regime.candleMomentum.toFixed(2)
+    : "N/A";
+  const atrRatioText = Number.isFinite(regime.atrRatio)
+    ? regime.atrRatio.toFixed(2)
+    : "N/A";
+  const volumeRatioText = Number.isFinite(regime.volumeRatio)
+    ? regime.volumeRatio.toFixed(2)
+    : "N/A";
+
+  if (regime.allowed) {
+    awaitSendScript2Checkpoint(
+      `🟢 *MOMENTUM REGIME PASSED* — *${symbol}*\n` +
+      `📈 Regime: *${regime.regime}*\n` +
+      `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
+      `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
+      `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
+      `🎯 Activity Score: *${scoreText}*\n` +
+      `✅ New reversal/continuation setups allowed`
+    );
+  } else {
+    awaitSendScript2Checkpoint(
+      `⛔ *MOMENTUM GATE FAILED* — *${symbol}*\n` +
+      `📉 Regime: *LOW_MOMENTUM*\n` +
+      `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
+      `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
+      `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
+      `🎯 Activity Score: *${scoreText}* (need ${MARKET_REGIME_MIN_SCORE}/3)\n` +
+      `🚫 No new reversal/continuation setups`
+    );
+  }
+}
 
 // ------------------------------------------------------
 // EMA SERIES
@@ -3830,7 +4031,11 @@ setInterval(async () => {
 //    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
 //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
 // 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
-// 5) The 1H STC is NOT used to approve, delay, block or trigger execution.
+// 5) A direction-neutral market-activity gate must allow NEW setups.
+//    It requires at least 2 of 3 activity measures: candle momentum, ATR
+//    activity, and volume activity. This prevents new trades during dead
+//    markets without forcing reversal setups to follow momentum direction.
+// 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
 // trade-management messages remain available as context/diagnostics.
@@ -3841,6 +4046,19 @@ if (!candles5 || candles5.length < 40) continue;
 
 // Only CLOSED 5M candles are used for the volume imbalance.
 const closedCandles5 = candles5.slice(0, -1);
+
+// Global market-activity regime. This gates ONLY new setup creation.
+// Existing staged setups continue through their normal BOS/retest expiry.
+const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
+const script2LatestClosedCandleKey = getScript2CandleKey(
+  closedCandles5[closedCandles5.length - 1],
+  String(closedCandles5.length - 1)
+);
+maybeSendScript2MomentumRegimeCheckpoint(
+  symbol,
+  script2MomentumRegime,
+  script2LatestClosedCandleKey
+);
 
 // Current market price is used only to determine whether price has
 // reached/interacted with a detected zone.
@@ -3910,6 +4128,10 @@ if (script2Zone) {
   // ---------------------------------------------------
   // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
   // ---------------------------------------------------
+  // The market-regime gate is direction-neutral and applies only to NEW
+  // setup creation. A valid staged setup is still allowed to progress
+  // through BOS/retest after the regime changes.
+  if (script2MomentumRegime.allowed) {
   const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
   const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
@@ -4051,6 +4273,7 @@ if (script2Zone) {
       }
     }
   }
+  }
 }
 
 // -----------------------------------------------------
@@ -4171,6 +4394,7 @@ if (pendingSetup) {
           await sendMessage(
             `🚀 *${modeText} ENTRY EXECUTED* — *${symbol}*\n` +
             `${direction === "BUY" ? "🟢" : "🔴"} *${symbol} ${direction}*\n` +
+            `📈 Market Regime: *${script2MomentumRegime.regime}*\n` +
             `👥 Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
             (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
             (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : "")
