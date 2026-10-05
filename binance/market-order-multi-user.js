@@ -617,7 +617,9 @@ const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
 // A directional 1-candle imbalance creates a candidate only. Continuation
 // becomes executable after a CLOSED 5M candle breaks the relevant zone boundary
 // and a later CLOSED 5M candle retests that boundary without reclaiming it.
-const SCRIPT2_CONTINUATION_MAX_BREAK_CANDLES = 3;
+// Continuation candidates are NOT time-expired. They remain valid while
+// price stays within this distance of the anchored structure level.
+const SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT = 1.0;
 const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 // High-momentum continuation uses the breakout candle's directional momentum.
 // Candle momentum = signed body / full candle range. A BOS candle with
@@ -1831,44 +1833,65 @@ function getScript2ZoneRetest(candle, zone, direction) {
   return low <= boundary && close > boundary;
 }
 
-function getScript2ContinuationState(candles, setup) {
+function getScript2ContinuationState(candles, setup, currentPrice = null) {
   if (!Array.isArray(candles) || !candles.length || !setup) return null;
 
   const latestIndex = candles.length - 1;
   const latest = candles[latestIndex];
   const latestKey = getScript2CandleKey(latest, String(latestIndex));
 
+  const boundary = Number.isFinite(Number(setup.anchoredBoundary))
+    ? Number(setup.anchoredBoundary)
+    : getScript2ZoneBoundary(setup.zone, setup.direction);
+
+  if (!Number.isFinite(boundary) || boundary <= 0) {
+    return { status: "WAIT", latestKey, latestIndex };
+  }
+
+  // Before BOS, there is deliberately NO candle-count expiry. The setup
+  // remains alive while price stays within the configured distance of the
+  // locked structure level. This lets valid setups take 20, 30, or more
+  // minutes to break without being discarded merely because of time.
+
   const createdIndex = candles.findIndex(
     (candle) => getScript2CandleKey(candle) === String(setup.createdCandleKey)
   );
 
   if (createdIndex < 0) {
-    return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation: 0 };
+    return { status: "WAIT", latestKey, latestIndex };
   }
 
   if (setup.stage === "CANDIDATE") {
     const candlesSinceCreation = latestIndex - createdIndex;
-    if (candlesSinceCreation <= 0) return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
-    if (candlesSinceCreation > SCRIPT2_CONTINUATION_MAX_BREAK_CANDLES) {
-      return { status: "EXPIRE", reason: "BREAK_NOT_CONFIRMED" };
-    }
-
-    // Always use the setup's anchored zone. Do NOT recalculate this
-    // boundary from the current ATR zone; ATR expansion must not move an
-    // already-active continuation setup to a new price level.
-    const boundary = Number.isFinite(Number(setup.anchoredBoundary))
-      ? Number(setup.anchoredBoundary)
-      : getScript2ZoneBoundary(setup.zone, setup.direction);
-    const close = Number(latest.close);
-    if (!Number.isFinite(boundary) || !Number.isFinite(close)) {
+    if (candlesSinceCreation <= 0) {
       return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
     }
 
-    const breakConfirmed = setup.direction === "SELL" ? close < boundary : close > boundary;
-    if (!breakConfirmed) return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
+    const close = Number(latest.close);
+    if (!Number.isFinite(close)) {
+      return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
+    }
+
+    const breakConfirmed = setup.direction === "SELL"
+      ? close < boundary
+      : close > boundary;
+
+    if (!breakConfirmed) {
+      if (Number.isFinite(Number(currentPrice))) {
+        const distanceFromStructure = percentDistance(Number(currentPrice), boundary);
+        if (distanceFromStructure > SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT) {
+          return {
+            status: "EXPIRE",
+            reason: "STRUCTURE_DISTANCE_EXCEEDED",
+            distanceFromStructure,
+            boundary
+          };
+        }
+      }
+      return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
+    }
 
     // Candle momentum is measured directly from the CLOSED BOS candle.
-    // Signed body/range gives a directional value from -1 to +1.
     const candleOpen = Number(latest.open);
     const candleHigh = Number(latest.high);
     const candleLow = Number(latest.low);
@@ -1921,8 +1944,6 @@ function getScript2ContinuationState(candles, setup) {
       return { status: "EXPIRE", reason: "RETEST_NOT_CONFIRMED" };
     }
 
-    // Retest the same anchored boundary that produced the BOS.
-    // A later ATR adjustment must never move this retest target.
     if (getScript2ZoneRetest(latest, setup.zone, setup.direction)) {
       return { status: "RETEST_CONFIRMED", latestKey, latestIndex, candlesSinceBreak };
     }
@@ -1932,15 +1953,22 @@ function getScript2ContinuationState(candles, setup) {
   return { status: "WAIT", latestKey, latestIndex };
 }
 
-function processScript2Continuation(symbol, closedCandles5, now) {
+async function processScript2Continuation(symbol, closedCandles5, now, currentPrice = null) {
   const setup = script2PendingSetups[symbol];
   if (!setup || setup.setupType !== "CONTINUATION") return null;
 
-  const state = getScript2ContinuationState(closedCandles5, setup);
+  const state = getScript2ContinuationState(closedCandles5, setup, currentPrice);
   if (!state) return null;
 
   if (state.status === "EXPIRE") {
     log(`⏳ Script 2 continuation expired ${symbol}: ${state.reason || "confirmation timeout"}`);
+    if (state.reason === "STRUCTURE_DISTANCE_EXCEEDED") {
+      await sendMessage(
+        `⏳ *CONTINUATION SETUP EXPIRED* — *${symbol}*\n` +
+        `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
+        `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`
+      );
+    }
     delete script2PendingSetups[symbol];
     return null;
   }
@@ -2055,6 +2083,49 @@ function getScript2AtrLocation(zone, atr, currentDayHigh, currentDayLow, previou
   }
 
   return nearest;
+}
+
+function findScript2ContinuationStructureLevel(candles, currentPrice) {
+  if (!Array.isArray(candles) || candles.length < 10 || !Number.isFinite(currentPrice)) {
+    return null;
+  }
+
+  const closed = candles.slice(-SCRIPT2_ZONE_LOOKBACK_CANDLES);
+  const levels = detectPotentialLiquidityLevels(closed);
+  const candidates = [];
+
+  for (const level of levels) {
+    const price = Number(level?.price);
+    const type = String(level?.type || "");
+    if (!Number.isFinite(price) || price <= 0) continue;
+
+    const isHighStructure = type.includes("HIGH");
+    const isLowStructure = type.includes("LOW");
+    if (!isHighStructure && !isLowStructure) continue;
+
+    const direction = isHighStructure ? "BUY" : "SELL";
+    const distancePercent = percentDistance(currentPrice, price);
+
+    // Continuation must interact with the structure level before the
+    // directional imbalance is allowed to create a candidate.
+    if (distancePercent > SCRIPT2_ZONE_TOLERANCE_PERCENT) continue;
+
+    // Do not treat an already-broken level as a new candidate.
+    if (direction === "BUY" && currentPrice > price) continue;
+    if (direction === "SELL" && currentPrice < price) continue;
+
+    candidates.push({
+      kind: "STRUCTURE",
+      type,
+      price,
+      direction,
+      distancePercent
+    });
+  }
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => a.distancePercent - b.distancePercent);
+  return candidates[0];
 }
 
 function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow) {
@@ -4212,47 +4283,47 @@ if (script2Zone) {
         };
       }
     }
-  } else {
-    // ===================================================
-    // CONTINUATION CANDIDATE
-    // ===================================================
-    // Continuation is valid at BOTH previous-day and current-day
-    // high/low liquidity. Current-day absorption is observation-only
-    // for execution routing, so it must NOT block continuation.
-    // At PDH/PDL, a qualifying absorption remains reserved for the
-    // reversal path above; mismatched PDH/PDL absorption blocks
-    // continuation rather than being reinterpreted as continuation.
-    //
-    // Imbalance is still only initial evidence. The candidate must
-    // subsequently prove structural acceptance with a closed-candle
-    // break and a failed-reclaim retest.
-    const pdhPdlAbsorptionBlocksContinuation = isPreviousDayLiquidity && hasAbsorption;
-    const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
-    const continuationDirection = pdhPdlAbsorptionBlocksContinuation
-      ? null
-      : (atrSide === "HIGH" && volumeImbalance?.direction === "BUY" ? "BUY" :
-         atrSide === "LOW" && volumeImbalance?.direction === "SELL" ? "SELL" :
-         null);
+  }
+  }
+}
 
-    if (continuationDirection) {
-      const existing = script2PendingSetups[symbol];
-      const activeContinuation = existing?.setupType === "CONTINUATION";
+// -----------------------------------------------------
+// STEP 2B — STRUCTURE-BASED CONTINUATION CANDIDATE
+// -----------------------------------------------------
+// Continuation is intentionally independent of current-day ATR high/low.
+// A meaningful swing/equal high can produce BUY continuation evidence; a
+// meaningful swing/equal low can produce SELL continuation evidence.
+// Once created, the structure level is locked to the setup.
+if (script2MomentumRegime.allowed) {
+  const existing = script2PendingSetups[symbol];
+  const activeContinuation = existing?.setupType === "CONTINUATION";
+  const activeReversal = existing?.setupType === "REVERSAL";
 
-      // Once a continuation candidate is created, its qualifying zone is
-      // LOCKED to that setup. ATR high/low can expand or contract on later
-      // scans, but that must not replace the level the setup is already
-      // proving. The active setup owns its original zone until it succeeds
-      // or its existing break/retest expiry is reached.
-      //
-      // This is deliberately different from starting a brand-new setup:
-      // new ATR levels can be used after the current continuation setup is
-      // completed or expired.
-      if (!activeContinuation) {
+  if (!activeContinuation && !activeReversal) {
+    const structureLevel = findScript2ContinuationStructureLevel(
+      closedCandles5,
+      script2CurrentPrice
+    );
+
+    if (structureLevel) {
+      const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
+      const continuationDirection =
+        volumeImbalance?.direction === structureLevel.direction
+          ? structureLevel.direction
+          : null;
+
+      if (continuationDirection) {
+        const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
+        const latestClosedCandleKey = getScript2CandleKey(
+          latestClosedCandle,
+          String(closedCandles5.length - 1)
+        );
+
         const anchoredZone = {
-          ...script2Zone,
-          atrLocation: script2Zone.atrLocation
-            ? { ...script2Zone.atrLocation }
-            : script2Zone.atrLocation
+          kind: "STRUCTURE",
+          type: structureLevel.type,
+          price: structureLevel.price,
+          direction: continuationDirection
         };
 
         script2PendingSetups[symbol] = {
@@ -4262,8 +4333,8 @@ if (script2Zone) {
           absorption: null,
           zone: anchoredZone,
           zoneLocked: true,
-          anchoredZoneKey: getScript2ZoneObservationKey(anchoredZone),
-          anchoredBoundary: getScript2ZoneBoundary(anchoredZone, continuationDirection),
+          anchoredZoneKey: `${structureLevel.type}:${structureLevel.price}`,
+          anchoredBoundary: structureLevel.price,
           detectedAt: Date.now(),
           createdCandleKey: latestClosedCandleKey,
           breakCandleKey: null,
@@ -4279,25 +4350,26 @@ if (script2Zone) {
           volumeImbalance
         };
 
-        if (!script2PendingSetups[symbol].volumeImbalanceNotified) {
-          script2PendingSetups[symbol].volumeImbalanceNotified = true;
-          await sendMessage(
-            `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-            `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance?.[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
-            `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
-          );
-        }
-        if (!script2PendingSetups[symbol].candidateNotified) {
-          script2PendingSetups[symbol].candidateNotified = true;
-          await sendMessage(
-            `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
-            `Direction: *${continuationDirection}*\n` +
-            `⏳ Waiting for break of structure`
-          );
-        }
+        await sendMessage(
+          `📍 *CONTINUATION STRUCTURE REACHED* — *${symbol}*\n` +
+          `🏗️ ${structureLevel.type}\n` +
+          `🎯 Structure Level: *${Number(structureLevel.price).toPrecision(8)}*`
+        );
+
+        await sendMessage(
+          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance?.[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
+          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
+        );
+
+        await sendMessage(
+          `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
+          `Direction: *${continuationDirection}*\n` +
+          `🔒 Structure locked at: *${Number(structureLevel.price).toPrecision(8)}*\n` +
+          `📏 Setup remains alive while price stays within *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* of the structure`
+        );
       }
     }
-  }
   }
 }
 
@@ -4306,12 +4378,14 @@ if (script2Zone) {
 // -----------------------------------------------------
 // This runs even after price leaves the original zone. That is
 // intentional: once a continuation candidate exists, the bot must
-// watch for the structural break; low-momentum setups then require a retest,
-// while high-momentum setups can execute immediately after BOS.
-const confirmedContinuationDirection = processScript2Continuation(
+// watch for the structural break; there is no fixed BOS time limit.
+// Low-momentum setups then require a retest, while high-momentum setups
+// can execute immediately after BOS.
+const confirmedContinuationDirection = await processScript2Continuation(
   symbol,
   closedCandles5,
-  now
+  now,
+  script2CurrentPrice
 );
 
 // If a continuation was confirmed, it is now executable through the
