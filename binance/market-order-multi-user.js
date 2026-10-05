@@ -611,7 +611,7 @@ const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 2;
 const OBV_MIN_DISTANCE_PERCENT = 0.10;
 const OBV_DISTANCE_LOOKBACK = 20;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
 
 // Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
@@ -1853,7 +1853,12 @@ function getScript2ContinuationState(candles, setup) {
       return { status: "EXPIRE", reason: "BREAK_NOT_CONFIRMED" };
     }
 
-    const boundary = getScript2ZoneBoundary(setup.zone, setup.direction);
+    // Always use the setup's anchored zone. Do NOT recalculate this
+    // boundary from the current ATR zone; ATR expansion must not move an
+    // already-active continuation setup to a new price level.
+    const boundary = Number.isFinite(Number(setup.anchoredBoundary))
+      ? Number(setup.anchoredBoundary)
+      : getScript2ZoneBoundary(setup.zone, setup.direction);
     const close = Number(latest.close);
     if (!Number.isFinite(boundary) || !Number.isFinite(close)) {
       return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
@@ -1916,6 +1921,8 @@ function getScript2ContinuationState(candles, setup) {
       return { status: "EXPIRE", reason: "RETEST_NOT_CONFIRMED" };
     }
 
+    // Retest the same anchored boundary that produced the BOS.
+    // A later ATR adjustment must never move this retest target.
     if (getScript2ZoneRetest(latest, setup.zone, setup.direction)) {
       return { status: "RETEST_CONFIRMED", latestKey, latestIndex, candlesSinceBreak };
     }
@@ -4158,14 +4165,20 @@ if (script2Zone) {
   if (reversalEligible) {
     // Only qualifying absorption at PDH/PDL may create a reversal.
     // A mismatched absorption is not continuation evidence.
-    delete script2PendingSetups[symbol];
+    // IMPORTANT: never cancel an already-active continuation setup merely
+    // because ATR expansion/reselection now points at another zone. The
+    // active continuation owns its anchored zone until success or expiry.
+    const activeContinuationSetup = script2PendingSetups[symbol]?.setupType === "CONTINUATION";
+    if (!activeContinuationSetup) {
+      delete script2PendingSetups[symbol];
+    }
 
     const reversalDirection =
       atrSide === "LOW" && absorption.direction === "BUY" ? "BUY" :
       atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
       null;
 
-    if (reversalDirection) {
+    if (reversalDirection && !activeContinuationSetup) {
       const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
 
       await sendMessage(
@@ -4223,22 +4236,34 @@ if (script2Zone) {
 
     if (continuationDirection) {
       const existing = script2PendingSetups[symbol];
+      const activeContinuation = existing?.setupType === "CONTINUATION";
 
-      // Do not reset a continuation candidate every scan while price
-      // remains inside the same zone. A candidate gets one confirmation
-      // window tied to the candle on which the imbalance was detected.
-      if (
-        !existing ||
-        existing.setupType !== "CONTINUATION" ||
-        existing.direction !== continuationDirection ||
-        getScript2ZoneObservationKey(existing.zone) !== getScript2ZoneObservationKey(script2Zone)
-      ) {
+      // Once a continuation candidate is created, its qualifying zone is
+      // LOCKED to that setup. ATR high/low can expand or contract on later
+      // scans, but that must not replace the level the setup is already
+      // proving. The active setup owns its original zone until it succeeds
+      // or its existing break/retest expiry is reached.
+      //
+      // This is deliberately different from starting a brand-new setup:
+      // new ATR levels can be used after the current continuation setup is
+      // completed or expired.
+      if (!activeContinuation) {
+        const anchoredZone = {
+          ...script2Zone,
+          atrLocation: script2Zone.atrLocation
+            ? { ...script2Zone.atrLocation }
+            : script2Zone.atrLocation
+        };
+
         script2PendingSetups[symbol] = {
           direction: continuationDirection,
           setupType: "CONTINUATION",
           stage: "CANDIDATE",
           absorption: null,
-          zone: script2Zone,
+          zone: anchoredZone,
+          zoneLocked: true,
+          anchoredZoneKey: getScript2ZoneObservationKey(anchoredZone),
+          anchoredBoundary: getScript2ZoneBoundary(anchoredZone, continuationDirection),
           detectedAt: Date.now(),
           createdCandleKey: latestClosedCandleKey,
           breakCandleKey: null,
