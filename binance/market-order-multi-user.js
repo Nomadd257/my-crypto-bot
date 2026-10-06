@@ -23,6 +23,7 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // --- USERS FILE ---
 const USERS_FILE = "./users.json";
+const ACTIVE_TRADES_FILE = "./active_trades.json";
 
 // --- Settings ---
 const TRADE_PERCENT = 0.1;
@@ -130,6 +131,50 @@ let absorptionWarningState = {}; // { symbol: { BUY/SELL: candleKey } }
 let liquidityWarningState = {}; // { symbol: lastWarningTimestamp }
 let slLiquidityReportSent = {}; // { symbol: true }
 
+// --- Persistent active-trade state ---
+// For this test, the bot restores active positions from local JSON after a restart.
+function saveActivePositions() {
+  try {
+    const tempFile = `${ACTIVE_TRADES_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(activePositions, null, 2), "utf8");
+    fs.renameSync(tempFile, ACTIVE_TRADES_FILE);
+  } catch (err) {
+    log(`❌ saveActivePositions error: ${err?.message || err}`);
+  }
+}
+
+function loadActivePositions() {
+  try {
+    if (!fs.existsSync(ACTIVE_TRADES_FILE)) {
+      log("ℹ️ No active_trades.json found. Starting with no restored positions.");
+      return;
+    }
+
+    const raw = fs.readFileSync(ACTIVE_TRADES_FILE, "utf8").trim();
+    if (!raw) return;
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      log("⚠️ active_trades.json has an invalid format. Ignoring it.");
+      return;
+    }
+
+    activePositions = parsed;
+
+    let restored = 0;
+    for (const users of Object.values(activePositions)) {
+      if (users && typeof users === "object") restored += Object.keys(users).length;
+    }
+
+    log(`♻️ Restored ${restored} active trade record(s) from ${ACTIVE_TRADES_FILE}.`);
+    if (restored > 0) {
+      sendMessage(`♻️ *TRADE STATE RESTORED*\n\nRecovered *${restored}* active trade record(s) from local JSON after restart.`).catch(() => {});
+    }
+  } catch (err) {
+    log(`❌ loadActivePositions error: ${err?.message || err}`);
+  }
+}
+
 function getTradeHistoryDate() {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Africa/Lagos",
@@ -211,6 +256,9 @@ function createBinanceClients() {
 }
 createBinanceClients();
 log("✅ Binance clients initialized at startup.");
+// Restore JSON state only after Binance clients are ready. monitorPositions()
+// will validate every restored record against Binance before managing it.
+loadActivePositions();
 setInterval(createBinanceClients, 60 * 1000);
 
 // --- Telegram send ---
@@ -615,22 +663,21 @@ const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 75;
 
 // Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
-// becomes executable after a CLOSED 5M candle breaks the relevant zone boundary
-// and a later CLOSED 5M candle retests that boundary without reclaiming it.
+// becomes executable only after a CLOSED 5M candle breaks the relevant zone
+// with high directional momentum and sufficient ATR-relative candle size.
 // Continuation candidates are NOT time-expired. They remain valid while
 // price stays within this distance of the anchored structure level.
 const SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT = 1.0;
-const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 // High-momentum continuation uses the breakout candle's directional momentum.
-// Candle momentum = signed body / full candle range. A BOS candle with
-// directional candle momentum >= 0.50 enters immediately without a retest.
+// Candle momentum = signed body / full candle range. A BOS candle must have
+// directional candle momentum >= 0.50 and its full range must be at least
+// 0.50 x the 5M ATR. There is no adequate/low-momentum continuation path.
 const SCRIPT2_HIGH_MOMENTUM_THRESHOLD = 0.5;
+const SCRIPT2_MIN_BOS_CANDLE_ATR_MULTIPLE = 0.50;
 
-// Global market-activity regime gate. This is direction-neutral so it can
-// support both reversal and continuation setups without forcing reversals
-// to trade in the current candle's direction. The gate measures whether
-// the market is moving with enough activity to justify starting a new setup.
-const ADEQUATE_MOMENTUM_THRESHOLD = 0.25;
+// Global market-activity regime gate. Only HIGH MOMENTUM is allowed for new
+// Script 2 setup creation. This is direction-neutral; it does not decide BUY
+// vs SELL.
 const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.50;
 const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.00;
 const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.00;
@@ -767,7 +814,7 @@ function getScript2MomentumRegime(closedCandles5) {
     : null;
 
   const candleMomentumPassed = Number.isFinite(candleMomentum) &&
-    candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD;
+    candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
   const atrPassed = Number.isFinite(atrRatio) &&
     atrRatio >= MARKET_REGIME_ATR_EXPANSION_MIN_RATIO;
   const volumePassed = Number.isFinite(volumeRatio) &&
@@ -775,14 +822,14 @@ function getScript2MomentumRegime(closedCandles5) {
 
   const score = [candleMomentumPassed, atrPassed, volumePassed]
     .filter(Boolean).length;
-  const allowed = score >= MARKET_REGIME_MIN_SCORE;
-  const highActivity = allowed &&
+  const highActivity = score >= MARKET_REGIME_MIN_SCORE &&
     Number.isFinite(candleMomentum) &&
     candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
+  const allowed = highActivity;
 
   return {
     allowed,
-    regime: allowed ? (highActivity ? "HIGH_MOMENTUM" : "ADEQUATE_MOMENTUM") : "LOW_MOMENTUM",
+    regime: allowed ? "HIGH_MOMENTUM" : "LOW_MOMENTUM",
     score,
     candleMomentum,
     atrRatio,
@@ -1814,24 +1861,6 @@ function getScript2ZoneBoundary(zone, direction) {
   return Number.isFinite(price) ? price : null;
 }
 
-function getScript2ZoneRetest(candle, zone, direction) {
-  if (!candle || !zone || !direction) return false;
-
-  const high = Number(candle.high);
-  const low = Number(candle.low);
-  const close = Number(candle.close);
-  const boundary = getScript2ZoneBoundary(zone, direction);
-
-  if (![high, low, close, boundary].every(Number.isFinite)) return false;
-
-  if (direction === "SELL") {
-    // Price must revisit the broken boundary/zone but close back below it.
-    return high >= boundary && close < boundary;
-  }
-
-  // BUY: price must revisit the broken boundary/zone but close back above it.
-  return low <= boundary && close > boundary;
-}
 
 function getScript2ContinuationState(candles, setup, currentPrice = null) {
   if (!Array.isArray(candles) || !candles.length || !setup) return null;
@@ -1891,7 +1920,9 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
       return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
     }
 
-    // Candle momentum is measured directly from the CLOSED BOS candle.
+    // The continuation path is HIGH MOMENTUM ONLY. The BOS candle must
+    // have both strong directional efficiency and a meaningful range
+    // relative to the current 5M ATR.
     const candleOpen = Number(latest.open);
     const candleHigh = Number(latest.high);
     const candleLow = Number(latest.low);
@@ -1906,18 +1937,31 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
         ? (candleClose - candleOpen) / candleRange
         : null;
 
+    const bosAtr = calculateATR(candles, ATR_PERIOD);
+    const candleAtrMultiple = Number.isFinite(bosAtr) && bosAtr > 0 && candleRange > 0
+      ? candleRange / bosAtr
+      : null;
+
     const highMomentum = setup.direction === "BUY"
       ? Number.isFinite(candleMomentum) && candleMomentum >= SCRIPT2_HIGH_MOMENTUM_THRESHOLD
       : Number.isFinite(candleMomentum) && candleMomentum <= -SCRIPT2_HIGH_MOMENTUM_THRESHOLD;
+    const longCandle = Number.isFinite(candleAtrMultiple) &&
+      candleAtrMultiple >= SCRIPT2_MIN_BOS_CANDLE_ATR_MULTIPLE;
+    const highMomentumContinuation = highMomentum && longCandle;
 
     return {
-      status: highMomentum ? "HIGH_MOMENTUM_BREAK_CONFIRMED" : "BREAK_CONFIRMED",
+      status: highMomentumContinuation ? "HIGH_MOMENTUM_BREAK_CONFIRMED" : "EXPIRE",
+      reason: highMomentumContinuation ? null : "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL",
       latestKey,
       latestIndex,
       boundary,
       candlesSinceCreation,
       candleMomentum,
-      highMomentum
+      candleAtrMultiple,
+      bosAtr,
+      highMomentum,
+      longCandle,
+      highMomentumContinuation
     };
   }
 
@@ -1930,24 +1974,6 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
       candleMomentum: setup.breakCandleMomentum,
       highMomentum: true
     };
-  }
-
-  if (setup.stage === "BREAK_CONFIRMED") {
-    const breakIndex = candles.findIndex(
-      (candle) => getScript2CandleKey(candle) === String(setup.breakCandleKey)
-    );
-    if (breakIndex < 0) return { status: "EXPIRE", reason: "BREAK_CANDLE_NOT_FOUND" };
-
-    const candlesSinceBreak = latestIndex - breakIndex;
-    if (candlesSinceBreak <= 0) return { status: "WAIT", latestKey, latestIndex, candlesSinceBreak };
-    if (candlesSinceBreak > SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES) {
-      return { status: "EXPIRE", reason: "RETEST_NOT_CONFIRMED" };
-    }
-
-    if (getScript2ZoneRetest(latest, setup.zone, setup.direction)) {
-      return { status: "RETEST_CONFIRMED", latestKey, latestIndex, candlesSinceBreak };
-    }
-    return { status: "WAIT", latestKey, latestIndex, candlesSinceBreak };
   }
 
   return { status: "WAIT", latestKey, latestIndex };
@@ -1968,6 +1994,14 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
         `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
         `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`
       );
+    } else if (state.reason === "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL") {
+      awaitSendScript2Checkpoint(
+        `⛔ *CONTINUATION REJECTED* — *${symbol}*\n` +
+        `⚡ BOS did not meet the HIGH-MOMENTUM requirement\n` +
+        `📊 Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}* / required *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for BUY or *≤ -${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for SELL\n` +
+        `📏 Candle Range / ATR: *${Number.isFinite(state.candleAtrMultiple) ? state.candleAtrMultiple.toFixed(2) : "N/A"}x* / required *≥ ${SCRIPT2_MIN_BOS_CANDLE_ATR_MULTIPLE.toFixed(2)}x*\n` +
+        `🚫 No adequate/low-momentum continuation or retest path`
+      );
     }
     delete script2PendingSetups[symbol];
     return null;
@@ -1986,46 +2020,10 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
       awaitSendScript2Checkpoint(
         `🔥 *HIGH-MOMENTUM CONTINUATION CONFIRMED* — *${symbol}*\n` +
         `⚡ Candle Momentum: *${Number(state.candleMomentum).toFixed(2)}*\n` +
-        `🎯 Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
-        `📈 Break of structure confirmed — *no retest required*\n` +
+        `🎯 Momentum Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
+        `📏 Candle Range / ATR: *${Number.isFinite(state.candleAtrMultiple) ? state.candleAtrMultiple.toFixed(2) : "N/A"}x* (min *${SCRIPT2_MIN_BOS_CANDLE_ATR_MULTIPLE.toFixed(2)}x*)\n` +
+        `📈 Break of structure confirmed — *HIGH MOMENTUM ONLY*\n` +
         `➡️ Direction: *${setup.direction}*`
-      );
-    }
-    return setup.direction;
-  }
-
-  if (state.status === "BREAK_CONFIRMED") {
-    setup.stage = "BREAK_CONFIRMED";
-    setup.continuationMode = "LOW_MOMENTUM";
-    setup.breakCandleKey = state.latestKey;
-    setup.breakConfirmedAt = now;
-    setup.breakBoundary = state.boundary;
-
-    if (!setup.breakNotified) {
-      setup.breakNotified = true;
-      awaitSendScript2Checkpoint(
-        `📈 *BREAK OF STRUCTURE CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${setup.direction}*\n` +
-        `⚡ Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}*\n` +
-        `🔁 Low-momentum path: *RETEST REQUIRED*`
-      );
-    }
-    return null;
-  }
-
-  if (state.status === "RETEST_CONFIRMED") {
-    setup.stage = "RETEST_CONFIRMED";
-    setup.continuationMode = "LOW_MOMENTUM";
-    setup.retestCandleKey = state.latestKey;
-    setup.retestConfirmedAt = now;
-    setup.confirmedAt = now;
-
-    if (!setup.retestNotified) {
-      setup.retestNotified = true;
-      awaitSendScript2Checkpoint(
-        `🔁 *FAILED-RECLAIM RETEST CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${setup.direction}*\n` +
-        `✅ Low-momentum continuation structure complete`
       );
     }
     return setup.direction;
@@ -3170,6 +3168,10 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
         };
         symbolCooldowns[symbol] = Date.now();
 
+        // Persist only after Binance confirms the market order succeeded.
+        // This is the first durable record of the newly opened position.
+        saveActivePositions();
+
         tradeHistory.push({
           date: getTradeHistoryDate(),
           symbol,
@@ -3595,6 +3597,7 @@ async function monitorPositions() {
       const client = userClients[userId];
       if (!client) {
         delete activePositions[symbol][userId];
+        saveActivePositions();
         continue;
       }
 
@@ -3606,7 +3609,10 @@ async function monitorPositions() {
         const amt = p ? parseFloat(p.positionAmt || 0) : 0;
 
         if (!p || amt === 0) {
+          // Binance confirms the position is already closed. Remove only the
+          // stale local JSON/in-memory record; do NOT send a close order.
           delete activePositions[symbol][userId];
+          saveActivePositions();
           continue;
         }
 
@@ -3631,6 +3637,7 @@ async function monitorPositions() {
         // =====================================================
         if (move >= RUNNER_ACTIVATION_PCT && !pos.runnerActive) {
           pos.runnerActive = true;
+          saveActivePositions();
 
           if (!runnerActivationNotified[symbol]) {
             runnerActivationNotified[symbol] = true;
@@ -3657,11 +3664,13 @@ async function monitorPositions() {
 
           if (!pos.trailingStop || trail > pos.trailingStop) {
             pos.trailingStop = trail;
+            saveActivePositions();
           }
 
           if (mark <= pos.trailingStop) {
             await client.futuresMarketSell(symbol, Math.abs(amt));
             delete activePositions[symbol][userId];
+            saveActivePositions();
 
             await sendMessage(
               `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
@@ -3675,11 +3684,13 @@ async function monitorPositions() {
 
           if (!pos.trailingStop || trail < pos.trailingStop) {
             pos.trailingStop = trail;
+            saveActivePositions();
           }
 
           if (mark >= pos.trailingStop) {
             await client.futuresMarketBuy(symbol, Math.abs(amt));
             delete activePositions[symbol][userId];
+            saveActivePositions();
 
             await sendMessage(
               `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
@@ -3721,6 +3732,7 @@ async function monitorPositions() {
             ) {
               await client.futuresMarketSell(symbol, Math.abs(amt));
               delete activePositions[symbol][userId];
+              saveActivePositions();
 
               await sendMessage(
                 `🏃 RUNNER EXIT: *${symbol}* LONG\n` +
@@ -3738,6 +3750,7 @@ async function monitorPositions() {
             ) {
               await client.futuresMarketBuy(symbol, Math.abs(amt));
               delete activePositions[symbol][userId];
+              saveActivePositions();
 
               await sendMessage(
                 `🏃 RUNNER EXIT: *${symbol}* SHORT\n` +
@@ -3767,6 +3780,7 @@ async function monitorPositions() {
           }
 
           delete activePositions[symbol][userId];
+          saveActivePositions();
 
           await sendMessage(
             `🔻 STOP LOSS: *${symbol}* User ${userId}`
@@ -3794,6 +3808,9 @@ async function monitorPositions() {
       delete activePositions[symbol];
     }
   }
+
+  // Persist runner/trailing-stop updates and removals so a restart can restore them.
+  saveActivePositions();
 }
 setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 
@@ -4110,9 +4127,9 @@ setInterval(async () => {
 //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
 // 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
 // 5) A direction-neutral market-activity gate must allow NEW setups.
-//    It requires at least 2 of 3 activity measures: candle momentum, ATR
-//    activity, and volume activity. This prevents new trades during dead
-//    markets without forcing reversal setups to follow momentum direction.
+//    It requires high candle momentum plus at least 2 of 3 activity measures:
+//    candle momentum, ATR activity, and volume activity. This prevents new
+//    trades during dead/slow markets.
 // 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -4126,7 +4143,7 @@ if (!candles5 || candles5.length < 40) continue;
 const closedCandles5 = candles5.slice(0, -1);
 
 // Global market-activity regime. This gates ONLY new setup creation.
-// Existing staged setups continue through their normal BOS/retest expiry.
+// Existing staged setups continue through their locked high-momentum BOS confirmation.
 const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
 const script2LatestClosedCandleKey = getScript2CandleKey(
   closedCandles5[closedCandles5.length - 1],
@@ -4208,7 +4225,7 @@ if (script2Zone) {
   // ---------------------------------------------------
   // The market-regime gate is direction-neutral and applies only to NEW
   // setup creation. A valid staged setup is still allowed to progress
-  // through BOS/retest after the regime changes.
+  // through high-momentum BOS confirmation after the regime changes.
   if (script2MomentumRegime.allowed) {
   const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
@@ -4338,11 +4355,9 @@ if (script2MomentumRegime.allowed) {
           detectedAt: Date.now(),
           createdCandleKey: latestClosedCandleKey,
           breakCandleKey: null,
-          retestCandleKey: null,
           continuationMode: "PENDING",
           breakNotified: false,
           highMomentumNotified: false,
-          retestNotified: false,
           executionDirectionNotified: false,
           liquidityNotified: false,
           volumeImbalanceNotified: false,
@@ -4379,8 +4394,8 @@ if (script2MomentumRegime.allowed) {
 // This runs even after price leaves the original zone. That is
 // intentional: once a continuation candidate exists, the bot must
 // watch for the structural break; there is no fixed BOS time limit.
-// Low-momentum setups then require a retest, while high-momentum setups
-// can execute immediately after BOS.
+// Only high-momentum BOS confirmations can execute; there is no
+// adequate/low-momentum continuation or retest path.
 const confirmedContinuationDirection = await processScript2Continuation(
   symbol,
   closedCandles5,
@@ -4414,12 +4429,10 @@ let direction = null;
 const pendingSetup = script2PendingSetups[symbol];
 
 if (pendingSetup) {
-  // Continuation setups are executable after either:
-  // • high-momentum BOS confirmation, or
-  // • low-momentum BOS + failed-reclaim retest confirmation.
+  // Continuation setups are executable ONLY after a high-momentum BOS
+  // candle also passes the ATR-relative candle-size filter.
   const continuationReady =
     pendingSetup.setupType !== "CONTINUATION" ||
-    pendingSetup.stage === "RETEST_CONFIRMED" ||
     pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED";
 
   const setupDirection = pendingSetup.direction;
@@ -4487,7 +4500,7 @@ if (pendingSetup) {
           const modeText = setupForReport.setupType === "CONTINUATION"
             ? (setupForReport.continuationMode === "HIGH_MOMENTUM"
               ? "🔥 HIGH-MOMENTUM CONTINUATION"
-              : "🟡 LOW-MOMENTUM CONTINUATION")
+              : "⛔ CONTINUATION REJECTED")
             : "🔄 REVERSAL";
 
           await sendMessage(
@@ -7122,6 +7135,7 @@ bot.onText(/\/closeall/, async (msg) => {
     }
   }
   activePositions = {};
+  saveActivePositions();
   await sendMessage("🛑 All positions closed.");
 });
 
@@ -7145,6 +7159,7 @@ bot.onText(/\/close (.+)/, async (msg, match) => {
     }
   }
   delete activePositions[symbol];
+  saveActivePositions();
   await sendMessage(`✅ *${symbol}* fully closed for all users`);
 });
 
