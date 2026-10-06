@@ -652,13 +652,11 @@ const DELTA_STRENGTH_THRESHOLD = 0.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M OBV entry confirmation.
-// The entry sequence starts with the OBV crossing its 50 EMA, then
-// holding on the correct side for 2 consecutive CLOSED 5M candles,
-// with meaningful separation from the EMA on each candle.
+// OBV is a directional confirmation only. A fresh crossover and minimum
+// separation are NOT required. The latest CLOSED 5M OBV only needs to be
+// on the correct side of its 50 EMA.
 const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 1;
-const OBV_MIN_DISTANCE_PERCENT = 0.10;
-const OBV_DISTANCE_LOOKBACK = 20;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
 // Script 2 continuation confirmation settings.
@@ -673,6 +671,7 @@ const SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT = 1.0;
 // directional candle momentum >= 0.50 and its full range must be at least
 // 0.50 x the 5M ATR. There is no adequate/low-momentum continuation path.
 const SCRIPT2_HIGH_MOMENTUM_THRESHOLD = 0.5;
+// BOS candle range/ATR is intentionally not required.
 
 // Global market-activity regime gate. Only HIGH MOMENTUM is allowed for new
 // Script 2 setup creation. This is direction-neutral; it does not decide BUY
@@ -1920,8 +1919,8 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
     }
 
     // The continuation path is HIGH MOMENTUM ONLY. The BOS candle must
-    // have strong directional efficiency. OBV remains the final execution
-    // confirmation later in the entry sequence.
+    // have both strong directional efficiency and a meaningful range
+    // relative to the current 5M ATR.
     const candleOpen = Number(latest.open);
     const candleHigh = Number(latest.high);
     const candleLow = Number(latest.low);
@@ -1936,20 +1935,29 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
         ? (candleClose - candleOpen) / candleRange
         : null;
 
+    const bosAtr = calculateATR(candles, ATR_PERIOD);
+    const candleAtrMultiple = Number.isFinite(bosAtr) && bosAtr > 0 && candleRange > 0
+      ? candleRange / bosAtr
+      : null;
+
     const highMomentum = setup.direction === "BUY"
       ? Number.isFinite(candleMomentum) && candleMomentum >= SCRIPT2_HIGH_MOMENTUM_THRESHOLD
       : Number.isFinite(candleMomentum) && candleMomentum <= -SCRIPT2_HIGH_MOMENTUM_THRESHOLD;
-    const highMomentumContinuation = highMomentum;
+    const longCandle = true;
+    const highMomentumContinuation = highMomentum && longCandle;
 
     return {
       status: highMomentumContinuation ? "HIGH_MOMENTUM_BREAK_CONFIRMED" : "EXPIRE",
-      reason: highMomentumContinuation ? null : "BOS_NOT_HIGH_MOMENTUM",
+      reason: highMomentumContinuation ? null : "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL",
       latestKey,
       latestIndex,
       boundary,
       candlesSinceCreation,
       candleMomentum,
+      candleAtrMultiple,
+      bosAtr,
       highMomentum,
+      longCandle,
       highMomentumContinuation
     };
   }
@@ -1983,11 +1991,12 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
         `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
         `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`
       );
-    } else if (state.reason === "BOS_NOT_HIGH_MOMENTUM") {
+    } else if (state.reason === "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL") {
       awaitSendScript2Checkpoint(
         `⛔ *CONTINUATION REJECTED* — *${symbol}*\n` +
         `⚡ BOS did not meet the HIGH-MOMENTUM requirement\n` +
         `📊 Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}* / required *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for BUY or *≤ -${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for SELL\n` +
+  
         `🚫 No adequate/low-momentum continuation or retest path`
       );
     }
@@ -2009,6 +2018,7 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
         `🔥 *HIGH-MOMENTUM CONTINUATION CONFIRMED* — *${symbol}*\n` +
         `⚡ Candle Momentum: *${Number(state.candleMomentum).toFixed(2)}*\n` +
         `🎯 Momentum Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
+  
         `📈 Break of structure confirmed — *HIGH MOMENTUM ONLY*\n` +
         `➡️ Direction: *${setup.direction}*`
       );
@@ -2319,11 +2329,9 @@ function has5MSTCDivergence(candles, divergenceType) {
 
 function calculateOBVConfirmation(candles, direction) {
   // OBV confirmation uses ONLY the latest CLOSED 5M candle.
-  // The latest candle must itself cross OBV through the 50 EMA,
-  // remain on the correct side, and meet the minimum separation.
-  if (!candles || candles.length < OBV_DISTANCE_LOOKBACK + OBV_EMA_LENGTH + 2) {
-    return false;
-  }
+  // A fresh crossover is NOT required. OBV only needs to be on the
+  // correct side of its 50 EMA for the requested trade direction.
+  if (!candles || candles.length < OBV_EMA_LENGTH + 2) return false;
 
   const obvSeries = calculateOBVSeries(candles);
   if (obvSeries.length !== candles.length) return false;
@@ -2337,41 +2345,15 @@ function calculateOBVConfirmation(candles, direction) {
   if (obvEMA.length !== candles.length) return false;
 
   const lastIndex = candles.length - 1;
-  const previousIndex = lastIndex - 1;
-
-  const previousOBV = obvSeries[previousIndex];
-  const previousEMA = obvEMA[previousIndex];
   const latestOBV = obvSeries[lastIndex];
   const latestEMA = obvEMA[lastIndex];
 
-  if (!Number.isFinite(previousOBV) || !Number.isFinite(previousEMA) ||
-      !Number.isFinite(latestOBV) || !Number.isFinite(latestEMA)) {
-    return false;
-  }
+  if (!Number.isFinite(latestOBV) || !Number.isFinite(latestEMA)) return false;
 
-  // The latest CLOSED 5M candle itself must be the fresh OBV/EMA cross.
-  const crossed = direction === "BUY"
-    ? previousOBV <= previousEMA && latestOBV > latestEMA
-    : previousOBV >= previousEMA && latestOBV < latestEMA;
+  if (direction === "BUY") return latestOBV > latestEMA;
+  if (direction === "SELL") return latestOBV < latestEMA;
 
-  if (!crossed) return false;
-
-  const rangeStart = lastIndex - OBV_DISTANCE_LOOKBACK + 1;
-  const range = obvSeries.slice(rangeStart, lastIndex + 1);
-  if (range.length < OBV_DISTANCE_LOOKBACK) return false;
-
-  const highestOBV = Math.max(...range);
-  const lowestOBV = Math.min(...range);
-  const obvRange = highestOBV - lowestOBV;
-  if (!Number.isFinite(obvRange) || obvRange <= 0) return false;
-
-  const distance = Math.abs(latestOBV - latestEMA);
-  const minimumDistance = obvRange * OBV_MIN_DISTANCE_PERCENT;
-  const correctSide = direction === "BUY"
-    ? latestOBV > latestEMA
-    : latestOBV < latestEMA;
-
-  return correctSide && Number.isFinite(distance) && distance >= minimumDistance;
+  return false;
 }
 
 // =====================================================
@@ -4431,9 +4413,8 @@ if (pendingSetup) {
         // FINAL CONFIRMATION — 5M OBV
         // ---------------------------------------------------
         // OBV is the final confirmation for both reversal and continuation
-        // setups. It uses the existing OBV rules: a fresh cross of OBV
-        // through its 50 EMA on the latest closed 5M candle, with the minimum
-        // OBV/EMA separation.
+        // setups. A fresh crossover is NOT required; the latest closed 5M
+        // OBV only needs to be on the correct side of its 50 EMA.
         const obvConfirmed = calculateOBVConfirmation(closedCandles5, direction);
 
         if (!obvConfirmed) {
@@ -4445,8 +4426,8 @@ if (pendingSetup) {
           await sendMessage(
             `📈 *OBV CONFIRMATION PASSED* — *${symbol}*\n` +
             `${direction === "BUY" ? "🟢" : "🔴"} ${direction}\n` +
-            `📊 Latest closed 5M candle crossed OBV through the ${OBV_EMA_LENGTH}-EMA\n` +
-            `📏 Minimum separation: *${OBV_MIN_DISTANCE_PERCENT.toFixed(2)}%* of the ${OBV_DISTANCE_LOOKBACK}-candle OBV range`
+            `📊 Latest closed 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA\n` +
+            `✅ OBV is on the correct side of the EMA — no fresh crossover required`
           );
         }
 
