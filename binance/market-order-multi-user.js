@@ -208,22 +208,20 @@ function isScript2AccumulationDistributionActive(symbol) {
   return Boolean(state?.phase === "ACCUMULATION" || state?.phase === "DISTRIBUTION");
 }
 
-// --- Custom Accumulation / Distribution detector (observation only) ---
-// This layer never blocks, delays, changes direction, or creates a trade.
-// It watches closed 5M candles for a controlled directional buildup before
-// expansion and reports every closed candle while that phase is active.
-const AD_PHASE_LOOKBACK_CANDLES = 12;
-const AD_MIN_PHASE_CANDLES = 3;
-const AD_MAX_PHASE_CANDLES = 12;
-const AD_BASELINE_RANGE_CANDLES = 20;
-const AD_MIN_DIRECTIONAL_DRIFT_PCT = 0.03;
-const AD_MAX_DIRECTIONAL_DRIFT_PCT = 1.00;
-const AD_MAX_PHASE_AVG_RANGE_RATIO = 1.05;
-const AD_MIN_TAKER_DIRECTION_PCT = 52.0;
-const AD_MAX_TAKER_DIRECTION_PCT = 65.0;
-const AD_MAX_VOLUME_SPIKE_RATIO = 1.75;
-const AD_PHASE_BREAKOUT_RANGE_RATIO = 1.75;
-const AD_PHASE_BREAKOUT_VOLUME_RATIO = 1.75;
+// --- Classic Chaikin Accumulation / Distribution Line (ADL) + expansion gate ---
+// The ADL is the underlying pressure/phase detector. New entries are blocked
+// during the quiet accumulation/distribution stage, but the lock is released
+// by a genuine directional expansion rather than by simply waiting for the ADL
+// phase label to disappear. This is designed to skip the noisy buildup and wake
+// the entry engine when price + volume actually expand.
+const ADL_EMA_LENGTH = 5;
+const ADL_SLOPE_LOOKBACK_CANDLES = 3;
+const ADL_MIN_NORMALIZED_SLOPE = 0.02;
+const AD_EXPANSION_BASELINE_CANDLES = 5;
+const AD_EXPANSION_RANGE_RATIO = 1.50;
+const AD_EXPANSION_VOLUME_RATIO = 1.50;
+const AD_EXPANSION_MIN_CANDLE_MOMENTUM = 0.50;
+const AD_EXPANSION_MIN_CLOSE_LOCATION = 0.65;
 
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -1857,132 +1855,194 @@ function calculateOneCandleVolumeImbalance(candles) {
 }
 
 function calculateScript2AccumulationDistribution(candles) {
-  if (!Array.isArray(candles) || candles.length < AD_BASELINE_RANGE_CANDLES + AD_MIN_PHASE_CANDLES) {
-    return null;
-  }
+  // Classic Chaikin Accumulation/Distribution Line (ADL):
+  // Money Flow Multiplier = ((Close - Low) - (High - Close)) / (High - Low)
+  // Money Flow Volume = Money Flow Multiplier * Period Volume
+  // ADL = Previous ADL + Money Flow Volume
+  //
+  // ADL identifies the underlying buying/selling-pressure phase. It is NOT
+  // used by itself as an entry trigger. The entry lock stays active during
+  // the buildup and is released only when price/range/volume show a genuine
+  // directional expansion aligned with the ADL pressure.
+  if (!Array.isArray(candles) || candles.length < 12) return null;
 
-  const latestIndex = candles.length - 1;
-  const latest = candles[latestIndex];
-  if (!latest) return null;
+  const adlValues = [];
+  let adl = 0;
 
-  const rangePct = (c) => {
+  for (const c of candles) {
     const high = Number(c?.high);
     const low = Number(c?.low);
     const close = Number(c?.close);
-    if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) || close <= 0) return null;
-    return ((high - low) / close) * 100;
-  };
+    const volume = Number(c?.volume);
 
-  const priceChangePct = (fromCandle, toCandle) => {
-    const from = Number(fromCandle?.close);
-    const to = Number(toCandle?.close);
-    if (!Number.isFinite(from) || !Number.isFinite(to) || from <= 0) return null;
-    return ((to - from) / from) * 100;
-  };
+    if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) ||
+        !Number.isFinite(volume) || high <= low || volume < 0) {
+      adlValues.push(null);
+      continue;
+    }
 
-  const quoteVolume = (c) => {
-    const q = Number(c?.quoteVolume);
-    if (Number.isFinite(q) && q > 0) return q;
-    const v = Number(c?.volume);
-    const close = Number(c?.close);
-    return Number.isFinite(v) && v > 0 && Number.isFinite(close) && close > 0 ? v * close : null;
-  };
-
-  const takerBuyQuote = (c) => {
-    const q = Number(c?.takerBuyQuoteVolume);
-    if (Number.isFinite(q) && q >= 0) return q;
-    const buyBase = Number(c?.takerBuyVolume);
-    const close = Number(c?.close);
-    return Number.isFinite(buyBase) && buyBase >= 0 && Number.isFinite(close) && close > 0 ? buyBase * close : null;
-  };
-
-  const baselineStart = Math.max(0, latestIndex - AD_BASELINE_RANGE_CANDLES - AD_PHASE_LOOKBACK_CANDLES);
-  const baselineEnd = Math.max(0, latestIndex - AD_PHASE_LOOKBACK_CANDLES);
-  const baselineRanges = candles.slice(baselineStart, baselineEnd).map(rangePct).filter(Number.isFinite);
-  const baselineVolume = candles.slice(baselineStart, baselineEnd).map(quoteVolume).filter(Number.isFinite);
-  if (baselineRanges.length < 10 || baselineVolume.length < 10) return null;
-
-  const baselineAvgRange = baselineRanges.reduce((a, b) => a + b, 0) / baselineRanges.length;
-  const baselineAvgVolume = baselineVolume.reduce((a, b) => a + b, 0) / baselineVolume.length;
-  if (!(baselineAvgRange > 0) || !(baselineAvgVolume > 0)) return null;
-
-  const evaluateWindow = (startIndex) => {
-    const window = candles.slice(startIndex, latestIndex + 1);
-    if (window.length < AD_MIN_PHASE_CANDLES || window.length > AD_MAX_PHASE_CANDLES) return null;
-
-    const ranges = window.map(rangePct).filter(Number.isFinite);
-    const volumes = window.map(quoteVolume).filter(Number.isFinite);
-    const takerBuy = window.map(takerBuyQuote);
-    if (ranges.length !== window.length || volumes.length !== window.length || takerBuy.some((v) => !Number.isFinite(v))) return null;
-
-    const first = window[0];
-    const last = window[window.length - 1];
-    const drift = priceChangePct(first, last);
-    if (!Number.isFinite(drift)) return null;
-
-    const avgRange = ranges.reduce((a, b) => a + b, 0) / ranges.length;
-    const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-    const phaseRangeRatio = avgRange / baselineAvgRange;
-    const phaseVolumeRatio = avgVolume / baselineAvgVolume;
-
-    const buyQuote = takerBuy.reduce((a, b) => a + b, 0);
-    const totalQuote = volumes.reduce((a, b) => a + b, 0);
-    const sellQuote = totalQuote - buyQuote;
-    if (!(totalQuote > 0)) return null;
-
-    const buyPct = (buyQuote / totalQuote) * 100;
-    const sellPct = (sellQuote / totalQuote) * 100;
-    const direction = drift >= 0 ? "BUY" : "SELL";
-    const directionalTakerPct = direction === "BUY" ? buyPct : sellPct;
-
-    const directionalCandles = window.filter((c) => {
-      const o = Number(c?.open);
-      const cl = Number(c?.close);
-      return Number.isFinite(o) && Number.isFinite(cl) && (direction === "BUY" ? cl >= o : cl <= o);
-    }).length;
-
-    const rangeControlled = phaseRangeRatio <= AD_MAX_PHASE_AVG_RANGE_RATIO;
-    const driftValid = Math.abs(drift) >= AD_MIN_DIRECTIONAL_DRIFT_PCT && Math.abs(drift) <= AD_MAX_DIRECTIONAL_DRIFT_PCT;
-    const directionalPrice = directionalCandles >= Math.ceil(window.length * 0.60);
-    const takerDirectional = directionalTakerPct >= AD_MIN_TAKER_DIRECTION_PCT;
-    const noExpansionVolume = phaseVolumeRatio <= AD_MAX_VOLUME_SPIKE_RATIO;
-
-    const score = [driftValid, directionalPrice, rangeControlled, takerDirectional, noExpansionVolume]
-      .filter(Boolean).length;
-
-    if (score < 4) return null;
-
-    return {
-      direction,
-      phase: direction === "BUY" ? "ACCUMULATION" : "DISTRIBUTION",
-      startIndex,
-      candleCount: window.length,
-      driftPct: drift,
-      avgRangePct: avgRange,
-      phaseRangeRatio,
-      avgVolume,
-      phaseVolumeRatio,
-      buyQuote,
-      sellQuote,
-      buyPct,
-      sellPct,
-      directionalTakerPct,
-      directionalCandles,
-      score,
-      latestRangePct: ranges[ranges.length - 1],
-      latestVolume: volumes[volumes.length - 1],
-      baselineAvgRange,
-      baselineAvgVolume
-    };
-  };
-
-  // Prefer the longest valid developing phase ending on the latest closed candle.
-  for (let length = Math.min(AD_MAX_PHASE_CANDLES, latestIndex + 1); length >= AD_MIN_PHASE_CANDLES; length--) {
-    const candidate = evaluateWindow(latestIndex - length + 1);
-    if (candidate) return candidate;
+    const moneyFlowMultiplier = ((close - low) - (high - close)) / (high - low);
+    const moneyFlowVolume = moneyFlowMultiplier * volume;
+    adl += moneyFlowVolume;
+    adlValues.push(adl);
   }
 
-  return null;
+  const valid = adlValues.filter(Number.isFinite);
+  if (valid.length < 12) return null;
+
+  // Smooth the ADL just enough to avoid changing phase on every small 5M wiggle.
+  const alpha = 2 / (ADL_EMA_LENGTH + 1);
+  const emaValues = [];
+  let ema = null;
+
+  for (const value of adlValues) {
+    if (!Number.isFinite(value)) {
+      emaValues.push(null);
+      continue;
+    }
+    ema = ema === null ? value : (alpha * value + (1 - alpha) * ema);
+    emaValues.push(ema);
+  }
+
+  const latestIndex = candles.length - 1;
+  const latestAdl = adlValues[latestIndex];
+  const latestEma = emaValues[latestIndex];
+  if (!Number.isFinite(latestAdl) || !Number.isFinite(latestEma)) return null;
+
+  const slopeLookback = ADL_SLOPE_LOOKBACK_CANDLES;
+  const previousIndex = latestIndex - slopeLookback;
+  const olderIndex = latestIndex - (slopeLookback * 2);
+  if (previousIndex < 0 || olderIndex < 0) return null;
+
+  const previousEma = emaValues[previousIndex];
+  const olderEma = emaValues[olderIndex];
+  if (!Number.isFinite(previousEma) || !Number.isFinite(olderEma)) return null;
+
+  const currentSlope = latestEma - previousEma;
+  const previousSlope = previousEma - olderEma;
+
+  // Normalize ADL slope by recent average volume so the detector works across
+  // symbols without fixed ADL-unit thresholds.
+  const recentVolumes = candles.slice(Math.max(0, latestIndex - 11), latestIndex + 1)
+    .map(c => Number(c?.volume))
+    .filter(v => Number.isFinite(v) && v > 0);
+  const avgVolume = recentVolumes.length
+    ? recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length
+    : 0;
+  if (!(avgVolume > 0)) return null;
+
+  const normalizedCurrentSlope = currentSlope / (avgVolume * slopeLookback);
+  const normalizedPreviousSlope = previousSlope / (avgVolume * slopeLookback);
+
+  let phase = null;
+  let direction = null;
+
+  // Require both the current and preceding ADL slope to agree. This identifies
+  // an actual developing pressure phase rather than a one-candle ADL flip.
+  if (normalizedCurrentSlope >= ADL_MIN_NORMALIZED_SLOPE &&
+      normalizedPreviousSlope >= ADL_MIN_NORMALIZED_SLOPE) {
+    phase = "ACCUMULATION";
+    direction = "BUY";
+  } else if (normalizedCurrentSlope <= -ADL_MIN_NORMALIZED_SLOPE &&
+             normalizedPreviousSlope <= -ADL_MIN_NORMALIZED_SLOPE) {
+    phase = "DISTRIBUTION";
+    direction = "SELL";
+  }
+
+  if (!phase) return null;
+
+  const phaseStartIndex = Math.max(0, latestIndex - AD_EXPANSION_BASELINE_CANDLES);
+  const baselineCandles = candles.slice(phaseStartIndex, latestIndex);
+
+  const rangeValues = baselineCandles.map(c => {
+    const high = Number(c?.high);
+    const low = Number(c?.low);
+    const close = Number(c?.close);
+    return Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) && close > 0 && high > low
+      ? (high - low) / close
+      : null;
+  }).filter(Number.isFinite);
+
+  const volumeValues = baselineCandles.map(c => {
+    const quote = Number(c?.quoteVolume);
+    if (Number.isFinite(quote) && quote > 0) return quote;
+    const volume = Number(c?.volume);
+    const close = Number(c?.close);
+    return Number.isFinite(volume) && Number.isFinite(close) && volume > 0 && close > 0
+      ? volume * close
+      : null;
+  }).filter(Number.isFinite);
+
+  const avgBaselineRange = rangeValues.length
+    ? rangeValues.reduce((a, b) => a + b, 0) / rangeValues.length
+    : null;
+  const avgBaselineVolume = volumeValues.length
+    ? volumeValues.reduce((a, b) => a + b, 0) / volumeValues.length
+    : null;
+
+  const open = Number(candles[latestIndex]?.open);
+  const high = Number(candles[latestIndex]?.high);
+  const low = Number(candles[latestIndex]?.low);
+  const close = Number(candles[latestIndex]?.close);
+  const quoteVolume = Number(candles[latestIndex]?.quoteVolume);
+  const baseVolume = Number(candles[latestIndex]?.volume);
+  const latestVolume = Number.isFinite(quoteVolume) && quoteVolume > 0
+    ? quoteVolume
+    : (Number.isFinite(baseVolume) && Number.isFinite(close) ? baseVolume * close : null);
+
+  const latestRangePct = Number.isFinite(close) && close > 0 && high > low
+    ? ((high - low) / close) * 100
+    : null;
+  const latestRangeRatio = Number.isFinite(avgBaselineRange) && avgBaselineRange > 0 && high > low && close > 0
+    ? ((high - low) / close) / avgBaselineRange
+    : null;
+  const latestVolumeRatio = Number.isFinite(avgBaselineVolume) && avgBaselineVolume > 0 && Number.isFinite(latestVolume)
+    ? latestVolume / avgBaselineVolume
+    : null;
+  const candleMomentum = Number.isFinite(open) && Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) && high > low
+    ? (close - open) / (high - low)
+    : null;
+  const closeLocation = Number.isFinite(high) && Number.isFinite(low) && Number.isFinite(close) && high > low
+    ? (close - low) / (high - low)
+    : null;
+
+  const directionalExpansion = direction === "BUY"
+    ? Number.isFinite(candleMomentum) && candleMomentum >= AD_EXPANSION_MIN_CANDLE_MOMENTUM &&
+      Number.isFinite(closeLocation) && closeLocation >= AD_EXPANSION_MIN_CLOSE_LOCATION
+    : Number.isFinite(candleMomentum) && candleMomentum <= -AD_EXPANSION_MIN_CANDLE_MOMENTUM &&
+      Number.isFinite(closeLocation) && closeLocation <= (1 - AD_EXPANSION_MIN_CLOSE_LOCATION);
+
+  const expansionDetected =
+    baselineCandles.length >= 3 &&
+    Number.isFinite(latestRangeRatio) && latestRangeRatio >= AD_EXPANSION_RANGE_RATIO &&
+    Number.isFinite(latestVolumeRatio) && latestVolumeRatio >= AD_EXPANSION_VOLUME_RATIO &&
+    directionalExpansion;
+
+  return {
+    phase,
+    direction,
+    startIndex: phaseStartIndex,
+    candleCount: candles.length - phaseStartIndex,
+    latestAdl,
+    latestAdlEma: latestEma,
+    currentSlope,
+    previousSlope,
+    normalizedCurrentSlope,
+    normalizedPreviousSlope,
+    adlPosition: latestAdl - latestEma,
+    latestRangePct,
+    latestPriceChangePct: Number.isFinite(open) && open > 0 && Number.isFinite(close)
+      ? ((close - open) / open) * 100
+      : null,
+    avgVolume,
+    avgBaselineRange,
+    avgBaselineVolume,
+    latestRangeRatio,
+    latestVolumeRatio,
+    candleMomentum,
+    closeLocation,
+    expansionDetected
+  };
 }
 
 function getScript2AccumulationDistributionReport(state, candles, latestCandle) {
@@ -2016,7 +2076,7 @@ function getScript2AccumulationDistributionReport(state, candles, latestCandle) 
     ? ((Number(latestCandle.high) - Number(latestCandle.low)) / Number(latestCandle.close)) * 100
     : null;
 
-  const phaseStart = state.startIndex;
+  const phaseStart = Math.max(0, state.startIndex);
   const phaseCandles = candles.slice(phaseStart);
   const phaseVolumes = phaseCandles.map((c) => {
     const q = Number(c.quoteVolume);
@@ -2024,30 +2084,32 @@ function getScript2AccumulationDistributionReport(state, candles, latestCandle) 
   }).filter((v) => Number.isFinite(v) && v > 0);
   const phaseAvgVolume = phaseVolumes.length
     ? phaseVolumes.reduce((a, b) => a + b, 0) / phaseVolumes.length
-    : state.avgVolume;
-  const phaseVolumeVsAvgPct = phaseAvgVolume > 0 ? ((totalVolume / phaseAvgVolume) - 1) * 100 : null;
+    : null;
 
-  const directionalLabel = state.direction === "BUY" ? "Buyer" : "Seller";
-  const strengthening = state.directionalTakerPct >= 55 && Number.isFinite(volumeChangePct) && volumeChangePct >= 0;
-  const controlled = Number.isFinite(candleRangePct) && candleRangePct <= state.baselineAvgRange * 1.05;
-
-  let assessment = [];
-  assessment.push(`${state.phase} ${strengthening ? "strengthening" : "developing"}`);
-  assessment.push(`${directionalLabel} participation ${state.directionalTakerPct >= 55 ? "increasing" : "present"}`);
-  assessment.push(`Price still moving slowly ${state.direction === "BUY" ? "higher" : "lower"}`);
-  if (controlled) assessment.push("Candle range remains controlled");
+  const assessment = [];
+  assessment.push(`${state.phase} pressure confirmed by ADL slope`);
+  assessment.push(`ADL ${state.direction === "BUY" ? "rising" : "falling"}`);
+  assessment.push(`ADL slope: ${state.normalizedCurrentSlope >= 0 ? "+" : ""}${(state.normalizedCurrentSlope * 100).toFixed(2)}% of avg volume per candle`);
+  if (Number.isFinite(state.adlPosition)) {
+    assessment.push(`ADL is ${state.adlPosition >= 0 ? "above" : "below"} its 5-candle EMA`);
+  }
 
   return {
     totalVolume,
     phaseAvgVolume,
     volumeChangePct,
-    phaseVolumeVsAvgPct,
     takerBuyValue,
     takerSellValue,
     takerBuyPct: totalVolume > 0 ? (takerBuyValue / totalVolume) * 100 : null,
     takerSellPct: totalVolume > 0 ? (takerSellValue / totalVolume) * 100 : null,
     priceChangePct,
     candleRangePct,
+    adl: state.latestAdl,
+    adlEma: state.latestAdlEma,
+    adlSlope: state.normalizedCurrentSlope,
+    rangeRatio: state.latestRangeRatio,
+    volumeRatio: state.latestVolumeRatio,
+    candleMomentum: state.candleMomentum,
     assessment
   };
 }
@@ -2061,27 +2123,87 @@ async function observeScript2AccumulationDistribution(symbol, closedCandles5) {
   let state = script2AccumulationDistributionState[symbol];
 
   if (!detected) {
-    if (state) {
-      state.invalidCount = (state.invalidCount || 0) + 1;
-      if (state.invalidCount >= 2) {
-        await sendMessage(
-          `⏹️ *${state.phase} ENDED* — *${symbol}*\n` +
-          `5M candles analyzed: *${state.candleCount}*\n` +
-          `Observation phase ended; new entries are allowed again.`
-        );
-        delete script2AccumulationDistributionState[symbol];
-      }
+    // Once expansion has started, do not re-lock the symbol merely because
+    // the ADL phase temporarily becomes ambiguous. A new opposite ADL phase
+    // can still establish a fresh lock later.
+    if (state?.phase === "EXPANSION") return;
+    return;
+  }
+
+  // ---------------------------------------------------------
+  // EXPANSION IS THE UNLOCK EVENT
+  // ---------------------------------------------------------
+  // The latest closed candle must expand both range and quote volume and show
+  // strong directional candle momentum in the same direction as ADL pressure.
+  // This is what ends the waiting/noise stage. We do NOT wait for ADL to flatten.
+  if (detected.expansionDetected) {
+    const sameExpansionCandle = state?.phase === "EXPANSION" &&
+      state.expansionCandleKey === candleKey;
+
+    if (!sameExpansionCandle) {
+      state = {
+        ...(state || {}),
+        phase: "EXPANSION",
+        previousPhase: detected.phase,
+        direction: detected.direction,
+        startKey: state?.startKey || getScript2CandleKey(closedCandles5[detected.startIndex], String(detected.startIndex)),
+        startIndex: state?.startIndex ?? detected.startIndex,
+        latestAdl: detected.latestAdl,
+        latestAdlEma: detected.latestAdlEma,
+        currentSlope: detected.currentSlope,
+        previousSlope: detected.previousSlope,
+        normalizedCurrentSlope: detected.normalizedCurrentSlope,
+        normalizedPreviousSlope: detected.normalizedPreviousSlope,
+        adlPosition: detected.adlPosition,
+        candleCount: Math.max(1, closedCandles5.length - (state?.startIndex ?? detected.startIndex)),
+        lastReportedCandleKey: candleKey,
+        expansionCandleKey: candleKey,
+        expansionDetectedAt: Date.now(),
+        expansionRangeRatio: detected.latestRangeRatio,
+        expansionVolumeRatio: detected.latestVolumeRatio,
+        expansionCandleMomentum: detected.candleMomentum,
+        tradeBlockedNotified: false
+      };
+      script2AccumulationDistributionState[symbol] = state;
+
+      const rangeRatioText = Number.isFinite(detected.latestRangeRatio) ? `${detected.latestRangeRatio.toFixed(2)}x` : "N/A";
+      const volumeRatioText = Number.isFinite(detected.latestVolumeRatio) ? `${detected.latestVolumeRatio.toFixed(2)}x` : "N/A";
+      const momentumText = Number.isFinite(detected.candleMomentum) ? `${detected.candleMomentum >= 0 ? "+" : ""}${detected.candleMomentum.toFixed(2)}` : "N/A";
+
+      await sendMessage(
+        `🔥 *EXPANSION DETECTED* — *${symbol}*\n\n` +
+        `Previous phase: *${detected.phase}*\n` +
+        `Direction: *${detected.direction}*\n` +
+        `Range expansion: *${rangeRatioText}* baseline\n` +
+        `Volume expansion: *${volumeRatioText}* baseline\n` +
+        `Candle momentum: *${momentumText}*\n\n` +
+        `🔓 *ACCUMULATION/DISTRIBUTION LOCK RELEASED*\n` +
+        `The entry engine can now evaluate the existing setup confirmations.`
+      );
     }
     return;
+  }
+
+  // If a fresh opposite ADL phase appears after a prior expansion, start a new
+  // waiting phase. If it is the same phase as an expansion, keep the symbol unlocked.
+  if (state?.phase === "EXPANSION") {
+    if (state.previousPhase === detected.phase) {
+      state.latestAdl = detected.latestAdl;
+      state.latestAdlEma = detected.latestAdlEma;
+      state.currentSlope = detected.currentSlope;
+      state.previousSlope = detected.previousSlope;
+      state.normalizedCurrentSlope = detected.normalizedCurrentSlope;
+      state.normalizedPreviousSlope = detected.normalizedPreviousSlope;
+      state.adlPosition = detected.adlPosition;
+      return;
+    }
+    state = null;
   }
 
   const detectedStartKey = getScript2CandleKey(
     closedCandles5[detected.startIndex],
     String(detected.startIndex)
   );
-  // Once a phase is identified, keep its original start anchored. The
-  // detector may find an earlier qualifying candle as the phase develops,
-  // but that must extend the observation rather than restart/spam it.
   const isNewPhase = !state || state.phase !== detected.phase;
 
   if (isNewPhase) {
@@ -2090,8 +2212,13 @@ async function observeScript2AccumulationDistribution(symbol, closedCandles5) {
       direction: detected.direction,
       startKey: detectedStartKey,
       startIndex: detected.startIndex,
-      directionalTakerPct: detected.directionalTakerPct,
-      baselineAvgRange: detected.baselineAvgRange,
+      latestAdl: detected.latestAdl,
+      latestAdlEma: detected.latestAdlEma,
+      currentSlope: detected.currentSlope,
+      previousSlope: detected.previousSlope,
+      normalizedCurrentSlope: detected.normalizedCurrentSlope,
+      normalizedPreviousSlope: detected.normalizedPreviousSlope,
+      adlPosition: detected.adlPosition,
       candleCount: 0,
       lastReportedCandleKey: null,
       invalidCount: 0,
@@ -2099,9 +2226,8 @@ async function observeScript2AccumulationDistribution(symbol, closedCandles5) {
     };
     script2AccumulationDistributionState[symbol] = state;
 
-    // The detector becomes confident after a minimum number of candles.
-    // Backfill those already-completed phase candles so the report contains
-    // the full developing sequence rather than starting halfway through it.
+    // Backfill the already-completed buildup so Telegram still shows the
+    // candle-by-candle sequence, but keep the entry lock active during it.
     for (let i = detected.startIndex; i <= closedCandles5.length - 1; i++) {
       const phaseCandle = closedCandles5[i];
       const phaseCandleKey = getScript2CandleKey(phaseCandle, String(i));
@@ -2118,13 +2244,16 @@ async function observeScript2AccumulationDistribution(symbol, closedCandles5) {
       await sendScript2AccumulationDistributionReport(symbol, state, report);
       state.lastReportedCandleKey = phaseCandleKey;
     }
-
-    return;
   }
 
   state.invalidCount = 0;
-  state.directionalTakerPct = detected.directionalTakerPct;
-  state.baselineAvgRange = detected.baselineAvgRange;
+  state.latestAdl = detected.latestAdl;
+  state.latestAdlEma = detected.latestAdlEma;
+  state.currentSlope = detected.currentSlope;
+  state.previousSlope = detected.previousSlope;
+  state.normalizedCurrentSlope = detected.normalizedCurrentSlope;
+  state.normalizedPreviousSlope = detected.normalizedPreviousSlope;
+  state.adlPosition = detected.adlPosition;
   state.direction = detected.direction;
   state.phase = detected.phase;
   state.candleCount = closedCandles5.length - state.startIndex;
@@ -2147,6 +2276,9 @@ async function sendScript2AccumulationDistributionReport(symbol, state, report) 
   const sellPctText = Number.isFinite(report.takerSellPct) ? `${report.takerSellPct.toFixed(1)}%` : "N/A";
   const priceChangeText = Number.isFinite(report.priceChangePct) ? `${report.priceChangePct >= 0 ? "+" : ""}${report.priceChangePct.toFixed(2)}%` : "N/A";
   const rangeText = Number.isFinite(report.candleRangePct) ? `${report.candleRangePct.toFixed(2)}%` : "N/A";
+  const rangeRatioText = Number.isFinite(report.rangeRatio) ? `${report.rangeRatio.toFixed(2)}x` : "N/A";
+  const volumeRatioText = Number.isFinite(report.volumeRatio) ? `${report.volumeRatio.toFixed(2)}x` : "N/A";
+  const momentumText = Number.isFinite(report.candleMomentum) ? `${report.candleMomentum >= 0 ? "+" : ""}${report.candleMomentum.toFixed(2)}` : "N/A";
 
   await sendMessage(
     `📊 *${symbol} — ${state.phase}*\n\n` +
@@ -2159,9 +2291,12 @@ async function sendScript2AccumulationDistributionReport(symbol, state, report) 
     `Taker Buy/Sell:     ${buyPctText} / ${sellPctText}\n\n` +
     `Price Change:       ${priceChangeText}\n` +
     `Candle Range:       ${rangeText}\n\n` +
+    `ADL:                ${Number.isFinite(report.adl) ? report.adl.toFixed(2) : "N/A"}\n` +
+    `ADL 5C EMA:         ${Number.isFinite(report.adlEma) ? report.adlEma.toFixed(2) : "N/A"}\n` +
+    `ADL Slope:           ${Number.isFinite(report.adlSlope) ? ((report.adlSlope * 100 >= 0 ? "+" : "") + (report.adlSlope * 100).toFixed(2) + "%") : "N/A"}\n\n` +
     `Assessment:\n` +
     report.assessment.map((line) => line).join("\n") +
-    `\n\n🚫 *NEW ENTRIES BLOCKED while this phase is active.*`
+    `\n\n🚫 *NEW ENTRIES BLOCKED while this buildup is active.*`
   );
 }
 
@@ -4402,8 +4537,8 @@ if (!candles5 || candles5.length < 40) continue;
 const closedCandles5 = candles5.slice(0, -1);
 
 // Accumulation/distribution analysis runs on every newly closed 5M candle.
-// While an active phase exists, NEW entries are blocked. Existing staged setups
-// are preserved and may resume once the phase ends.
+// New entries are blocked only during the buildup. A genuine directional
+// expansion releases the lock; existing staged setups are preserved throughout.
 await observeScript2AccumulationDistribution(symbol, closedCandles5);
 const script2AccumulationDistributionActive = isScript2AccumulationDistributionActive(symbol);
 // Global market-activity regime. This gates ONLY new setup creation.
@@ -4421,7 +4556,7 @@ if (script2AccumulationDistributionActive) {
     await sendMessage(
       `🚫 *NEW TRADES BLOCKED* — *${symbol}*\n` +
       `📊 Active phase: *${adState.phase}*\n` +
-      `⏸️ No new reversal or continuation entries will execute until the phase ends.`
+      `⏸️ No new reversal or continuation entries will execute until expansion begins.`
     );
   }
 }
@@ -4736,9 +4871,9 @@ if (pendingSetup) {
       // =====================================================
       // ACCUMULATION/DISTRIBUTION ENTRY LOCK
       // =====================================================
-      // An active accumulation/distribution phase blocks NEW execution.
-      // Existing staged setups are intentionally preserved and can resume
-      // after the phase ends if their normal validity conditions still hold.
+      // Only the quiet buildup is blocked. The lock is released by the
+      // explicit EXPANSION DETECTED event from the ADL/range/volume gate.
+      // Existing staged setups are preserved throughout the buildup.
       // =====================================================
       // LIQUIDITY GATE + EXECUTION
       // =====================================================
