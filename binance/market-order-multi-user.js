@@ -29,6 +29,8 @@ const ACTIVE_TRADES_FILE = "./active_trades.json";
 const TRADE_PERCENT = 0.1;
 const LEVERAGE = 20;
 const RUNNER_ACTIVATION_PCT = 2;
+const RUNNER_POST_ACTIVATION_EXTRA_PCT = 1;
+const RUNNER_POST_ACTIVATION_TIMEOUT_MS = 30 * 60 * 1000;
 const SL_PCT = 1.8;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
@@ -3125,6 +3127,13 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
     }
   }
 
+  // Once at least one user has successfully entered the trade,
+  // automatically deactivate this symbol exactly as /deactivate SYMBOL
+  // would. Existing positions remain open and continue to be monitored.
+  if (result.executed > 0) {
+    await deactivateSymbol(symbol, true);
+  }
+
   return result;
 }
 
@@ -3139,7 +3148,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 // • SL
 // • pre-runner trailing stop
 // • +2% runner activation
-// • 15M delta runner exit
+// • 30-minute post-activation runner timeout
 //
 // The monitor combines the same market context already used
 // by the bot: 4H trend/quality, 1H momentum + STC, 15M ATR
@@ -3563,6 +3572,10 @@ async function monitorPositions() {
         // =====================================================
         if (move >= RUNNER_ACTIVATION_PCT && !pos.runnerActive) {
           pos.runnerActive = true;
+          pos.runnerActivatedAt = Date.now();
+          pos.runnerActivationMove = move;
+          pos.runnerTargetMove = move + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+          pos.runnerTargetReached = false;
           saveActivePositions();
 
           if (!runnerActivationNotified[symbol]) {
@@ -3573,16 +3586,78 @@ async function monitorPositions() {
               `💰 Profit: +${move.toFixed(2)}%\n` +
               `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
               `📊 Runner Mode: ACTIVE\n` +
-              `🔎 Exit Signal: 15M Delta vs Delta MA\n\n` +
+              `🎯 Runner Rule: +1% more within 30 minutes\n\n` +
               `👥 All users' ${symbol} positions are now in runner mode.`
             );
           }
         }
 
         // =====================================================
+        // RUNNER POST-ACTIVATION TARGET / TIMEOUT
+        // After runner activation at +2%, price must achieve an additional
+        // +1 percentage point of trade profit within 30 minutes.
+        // Example: activation at +2.00% -> target +3.00%.
+        // Once the target is reached, this timeout condition is permanently
+        // satisfied for the current position.
+        // =====================================================
+        if (pos.runnerActive) {
+          // Backward-compatible recovery for positions saved before this
+          // runner timeout feature existed.
+          if (!Number.isFinite(Number(pos.runnerActivatedAt))) {
+            pos.runnerActivatedAt = Date.now();
+            pos.runnerActivationMove = Number.isFinite(Number(pos.runnerActivationMove))
+              ? Number(pos.runnerActivationMove)
+              : Math.max(move, RUNNER_ACTIVATION_PCT);
+            pos.runnerTargetMove = pos.runnerActivationMove + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+            pos.runnerTargetReached = false;
+            saveActivePositions();
+          }
+
+          if (!Number.isFinite(Number(pos.runnerTargetMove))) {
+            pos.runnerTargetMove =
+              (Number.isFinite(Number(pos.runnerActivationMove))
+                ? Number(pos.runnerActivationMove)
+                : RUNNER_ACTIVATION_PCT) + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+            saveActivePositions();
+          }
+
+          if (move >= Number(pos.runnerTargetMove)) {
+            if (!pos.runnerTargetReached) {
+              pos.runnerTargetReached = true;
+              saveActivePositions();
+
+              await sendMessage(
+                `🎯 RUNNER TARGET REACHED: *${symbol}* ${pos.side}\n` +
+                `Profit: +${move.toFixed(2)}%\n` +
+                `Target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
+                `30-minute runner extension requirement satisfied.`
+              );
+            }
+          } else if (!pos.runnerTargetReached &&
+                     Date.now() - Number(pos.runnerActivatedAt) >= RUNNER_POST_ACTIVATION_TIMEOUT_MS) {
+            // Use the exact same close-order path as /close SYMBOL.
+            // Only this timed-out user's position is removed from tracking.
+            await closeTrackedPositionOrder(client, symbol, pos);
+
+            delete activePositions[symbol][userId];
+            saveActivePositions();
+
+            await sendMessage(
+              `⏱️ RUNNER TIMEOUT EXIT: *${symbol}* ${pos.side}\n` +
+              `Current Profit: ${move.toFixed(2)}%\n` +
+              `Runner activated at: +${Number(pos.runnerActivationMove || RUNNER_ACTIVATION_PCT).toFixed(2)}%\n` +
+              `Required target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
+              `The extra +${RUNNER_POST_ACTIVATION_EXTRA_PCT.toFixed(2)}% was not reached within 30 minutes.`
+            );
+
+            continue;
+          }
+        }
+
+        // =====================================================
         // TRAILING STOP
         // Active only before runner mode.
-        // Once runner mode activates, Delta controls the runner exit.
+        // Once runner mode activates, the post-activation runner timer/target applies.
         // =====================================================
         if (!pos.runnerActive && pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, mark);
@@ -3627,74 +3702,11 @@ async function monitorPositions() {
         }
 
         // =====================================================
-        // RUNNER EXIT USING 15M TREND-RESET CUMULATIVE DELTA
-        //
-        // LONG:
-        // Positive Delta > Delta MA = HOLD
-        // Positive Delta < Delta MA = EXIT
-        //
-        // SHORT:
-        // Negative Delta < Delta MA = HOLD
-        // Negative Delta > Delta MA = EXIT
+        // RUNNER EXIT
+        // The runner has NO Delta-based exit. After activation, the
+        // only runner-management exit is the post-activation target
+        // requirement: an additional +1 percentage point within 30 minutes.
         // =====================================================
-        if (pos.runnerActive) {
-          try {
-            const candles15 = await client.futuresCandles({
-              symbol,
-              interval: "15m",
-              limit: 150,
-            });
-
-            // Use closed 15M candles only.
-            const closedCandles15 = candles15.slice(0, -1);
-
-            const trDelta15 =
-              calculateTrendResetCumulativeDelta(closedCandles15);
-
-            if (
-              pos.side === "BUY" &&
-              trDelta15.cumDelta > 0 &&
-              trDelta15.cumDelta < trDelta15.deltaMA
-            ) {
-              await client.futuresMarketSell(symbol, Math.abs(amt));
-              delete activePositions[symbol][userId];
-              saveActivePositions();
-
-              await sendMessage(
-                `🏃 RUNNER EXIT: *${symbol}* LONG\n` +
-                `Profit: ${move.toFixed(2)}%\n` +
-                `Delta weakened below Delta MA.`
-              );
-
-              continue;
-            }
-
-            if (
-              pos.side === "SELL" &&
-              trDelta15.cumDelta < 0 &&
-              trDelta15.cumDelta > trDelta15.deltaMA
-            ) {
-              await client.futuresMarketBuy(symbol, Math.abs(amt));
-              delete activePositions[symbol][userId];
-              saveActivePositions();
-
-              await sendMessage(
-                `🏃 RUNNER EXIT: *${symbol}* SHORT\n` +
-                `Profit: ${move.toFixed(2)}%\n` +
-                `Delta weakened above Delta MA.`
-              );
-
-              continue;
-            }
-          } catch (deltaErr) {
-            log(
-              `⚠️ Runner delta check error ${userId} ${symbol}: ${
-                deltaErr?.message || deltaErr
-              }`
-            );
-          }
-        }
-
         // =====================================================
         // STOP LOSS REMAINS ACTIVE
         // =====================================================
@@ -7092,6 +7104,25 @@ bot.onText(/\/closeall/, async (msg) => {
   await sendMessage("🛑 All positions closed.");
 });
 
+// Execute the exact same tracked-position close order used by /close SYMBOL.
+// BUY positions are closed with a market SELL; SELL positions with a market BUY.
+async function closeTrackedPositionOrder(client, symbol, pos) {
+  if (!client) throw new Error(`No client available for ${symbol}`);
+  if (!pos || !Number.isFinite(Number(pos.qty)) || Number(pos.qty) <= 0) {
+    throw new Error(`Invalid tracked quantity for ${symbol}`);
+  }
+
+  if (pos.side === "BUY") {
+    return client.futuresMarketSell(symbol, pos.qty);
+  }
+
+  if (pos.side === "SELL") {
+    return client.futuresMarketBuy(symbol, pos.qty);
+  }
+
+  throw new Error(`Unknown position side for ${symbol}: ${pos.side}`);
+}
+
 // Close a specific symbol for all users
 bot.onText(/\/close (.+)/, async (msg, match) => {
   if (!isAdmin(msg)) return;
@@ -7104,8 +7135,7 @@ bot.onText(/\/close (.+)/, async (msg, match) => {
     const client = userClients[userId];
     if (!client) continue;
     try {
-      if (pos.side === "BUY") await client.futuresMarketSell(symbol, pos.qty);
-      else await client.futuresMarketBuy(symbol, pos.qty);
+      await closeTrackedPositionOrder(client, symbol, pos);
       await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
     } catch (err) {
       log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
@@ -7154,6 +7184,21 @@ bot.onText(/\/setbear (\w+)/, async (msg, match) => {
 });
 
 // --- Per-symbol ACTIVATE/DEACTIVATE commands ---
+async function deactivateSymbol(symbol, notify = true) {
+  const normalizedSymbol = String(symbol || "").toUpperCase();
+  if (!(normalizedSymbol in symbolActive)) return false;
+
+  symbolActive[normalizedSymbol] = false;
+
+  if (notify) {
+    await sendMessage(
+      `🚫 *${normalizedSymbol}* deactivated. No trades will be placed for this symbol.`
+    );
+  }
+
+  return true;
+}
+
 bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
   if (!isAdmin(msg)) return;
   const symbol = match[1].toUpperCase();
@@ -7161,8 +7206,7 @@ bot.onText(/\/deactivate (\w+)/, async (msg, match) => {
     await sendMessage(`⚠️ Symbol *${symbol}* not recognized.`);
     return;
   }
-  symbolActive[symbol] = false;
-    await sendMessage(`🚫 *${symbol}* deactivated. No trades will be placed for this symbol.`);
+  await deactivateSymbol(symbol, true);
 });
 
 bot.onText(/\/activate (\w+)/, async (msg, match) => {
