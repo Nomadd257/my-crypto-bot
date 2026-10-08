@@ -649,7 +649,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 1.5;
+const DELTA_STRENGTH_THRESHOLD = 2;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M OBV entry confirmation.
