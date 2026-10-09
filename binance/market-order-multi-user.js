@@ -203,6 +203,7 @@ let script2PendingSetups = {}; // { symbol: reversal setup OR staged continuatio
 let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zone absorption tracking
 let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
 let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
+let script2DeltaGateState = {}; // per-symbol 15M/5M delta alignment and confirmation state
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
 // --- Logging ---
@@ -638,7 +639,7 @@ function calculateATR(candles, period = ATR_PERIOD) {
 // ATR Multiplier  = 1
 // Delta MA        = SMA 10
 //
-// Used by the 5M entry filter; 15M remains informational/runner context.
+// Used by the 15M/5M master unlock: alignment first, then 5M strength confirmation.
 // ======================================================
 
 const TR_DELTA_EMA_LENGTH = 20;
@@ -649,7 +650,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 2;
+const DELTA_STRENGTH_THRESHOLD = 1.5;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // 5M OBV entry confirmation.
@@ -3950,7 +3951,12 @@ setInterval(async () => {
       // =====================================================
       // Skip trading if paused/inactive
       // =====================================================
-      if (!isActive || BOT_PAUSED) continue;
+      if (!isActive || BOT_PAUSED) {
+        // Force a fresh alignment/strength confirmation after a symbol is
+        // reactivated or the bot is unpaused; do not reuse a stale unlock.
+        script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
+        continue;
+      }
 
       // Price activation gate. This does not change /activate or /deactivate.
       if (
@@ -4121,6 +4127,114 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
     trendCycle === "BULL" ? "BUY" : "SELL",
     closedCandles15ForAbsorption
   );
+}
+
+// -----------------------------------------------------
+// MASTER UNLOCK — CLOSED 15M + 5M TREND-RESET DELTA
+// -----------------------------------------------------
+// Stage 1: 15M and 5M Delta must agree directionally relative to their own
+// Delta MAs. Send one Telegram message when a new alignment event begins.
+// Stage 2: the existing adaptive strength threshold must be met by the 5M
+// Delta before Script 2 setup creation/execution is unlocked.
+// If alignment breaks before confirmation, cancel the pending confirmation.
+// Once confirmed, the unlock remains valid only while the two timeframes
+// continue to align. All inputs below use CLOSED candles only.
+const closedCandles15ForDelta =
+  candles15ForAbsorption && candles15ForAbsorption.length > 1
+    ? candles15ForAbsorption.slice(0, -1)
+    : null;
+
+if (!closedCandles15ForDelta || closedCandles15ForDelta.length < 30) {
+  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
+  continue;
+}
+
+const delta15ForGate = calculateTrendResetCumulativeDelta(closedCandles15ForDelta);
+const delta5ForGate = calculateTrendResetCumulativeDelta(closedCandles5);
+
+if (!delta15ForGate || !delta5ForGate) {
+  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
+  continue;
+}
+
+const getDeltaPositionDirection = (delta) => {
+  if (delta.cumDelta > 0 && delta.cumDelta > delta.deltaMA) return "BUY";
+  if (delta.cumDelta < 0 && delta.cumDelta < delta.deltaMA) return "SELL";
+  return null;
+};
+
+const delta15Direction = getDeltaPositionDirection(delta15ForGate);
+const delta5Direction = getDeltaPositionDirection(delta5ForGate);
+const alignedDeltaDirection =
+  delta15Direction && delta15Direction === delta5Direction
+    ? delta15Direction
+    : null;
+
+let deltaGateState = script2DeltaGateState[symbol] || {
+  alignmentDirection: null,
+  confirmed: false
+};
+
+if (!alignedDeltaDirection) {
+  if (deltaGateState.alignmentDirection && !deltaGateState.confirmed) {
+    log(`⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending confirmation cancelled.`);
+  }
+  script2DeltaGateState[symbol] = {
+    alignmentDirection: null,
+    confirmed: false
+  };
+  continue;
+}
+
+if (deltaGateState.alignmentDirection !== alignedDeltaDirection) {
+  deltaGateState = {
+    alignmentDirection: alignedDeltaDirection,
+    confirmed: false,
+    alignmentStartedAt: Date.now()
+  };
+  script2DeltaGateState[symbol] = deltaGateState;
+
+  // Do not carry a staged setup in the opposite direction into a new
+  // directional Delta alignment event.
+  if (
+    script2PendingSetups[symbol] &&
+    script2PendingSetups[symbol].direction !== alignedDeltaDirection
+  ) {
+    delete script2PendingSetups[symbol];
+  }
+
+  await sendMessage(
+    `🧭 *15M + 5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
+    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
+    `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
+    `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
+    `⏳ Waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
+    `🔒 Setups remain locked until confirmation.`
+  );
+}
+
+// The 5M threshold is the second-stage confirmation. It is evaluated only
+// after directional 15M/5M alignment has been established.
+const delta5StrengthConfirmed = alignedDeltaDirection === "BUY"
+  ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+  : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
+
+if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
+  deltaGateState.confirmed = true;
+  deltaGateState.confirmedAt = Date.now();
+  script2DeltaGateState[symbol] = deltaGateState;
+
+  await sendMessage(
+    `✅ *5M DELTA STRENGTH CONFIRMED* — *${symbol}*\n\n` +
+    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
+    `📊 5M Delta strength: *${delta5ForGate.deltaStrength.toFixed(2)}*\n` +
+    `🎯 Required threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
+    `🔓 *${alignedDeltaDirection} setups unlocked.* Existing setup, OBV, liquidity and execution checks remain in force.`
+  );
+}
+
+if (!deltaGateState.confirmed) {
+  continue;
 }
 
 // -----------------------------------------------------
