@@ -207,6 +207,17 @@ let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zon
 let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
 let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
 let script2DeltaGateState = {}; // per-symbol 15M/5M delta alignment and confirmation state
+// Informational-only higher-timeframe absorption context. This state never gates entries.
+let higherTimeframeAbsorptionState = {}; // per-symbol active 4H absorption range and 1H confirmation status
+let higherTimeframeAbsorptionLastProcessed4H = {}; // prevents reprocessing the same closed 4H candle
+const HTF_ABSORPTION_LOOKBACK_CANDLES = 4;
+const HTF_ABSORPTION_BASELINE_VOLUME_CANDLES = 20;
+const HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES = 3;
+const HTF_ABSORPTION_MIN_PRESSURE_RATIO = 0.25;
+const HTF_ABSORPTION_MIN_RELATIVE_VOLUME = 0.80;
+const HTF_ABSORPTION_MAX_NET_MOVE_ATR = 0.75;
+const HTF_ABSORPTION_MAX_RANGE_ATR = 2.50;
+const HTF_ABSORPTION_CONTEXT_TTL_MS = 48 * 60 * 60 * 1000;
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
 // --- Logging ---
@@ -1362,6 +1373,172 @@ function calculateTrendResetCumulativeDelta(
         ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
         : 0) <= -DELTA_STRENGTH_THRESHOLD
   };
+}
+
+// ======================================================
+// 4H HIGHER-TIMEFRAME ABSORPTION CONTEXT (NOT A TRADE FILTER)
+// Detects persistent directional selling/buying pressure with limited price
+// progress inside a compressed rolling range. Uses the same candle-direction
+// signed-volume convention as calculateTrendResetCumulativeDelta().
+// Telegram alerts are informational; existing 15M/5M setup logic is untouched.
+// ======================================================
+function detect4HAbsorptionContext(closedCandles4H) {
+  const lookback = HTF_ABSORPTION_LOOKBACK_CANDLES;
+  const baselineCount = HTF_ABSORPTION_BASELINE_VOLUME_CANDLES;
+  if (!Array.isArray(closedCandles4H) || closedCandles4H.length < Math.max(ATR_PERIOD + 1, lookback + baselineCount)) {
+    return null;
+  }
+
+  const recent = closedCandles4H.slice(-lookback);
+  const baseline = closedCandles4H.slice(-(lookback + baselineCount), -lookback);
+  const atr = calculateATR(closedCandles4H, ATR_PERIOD);
+  if (!(atr > 0)) return null;
+
+  const totalRecentVolume = recent.reduce((sum, c) => sum + Math.max(0, Number(c.volume) || 0), 0);
+  const baselineAvgVolume = baseline.reduce((sum, c) => sum + Math.max(0, Number(c.volume) || 0), 0) / baseline.length;
+  const recentAvgVolume = totalRecentVolume / recent.length;
+  const relativeVolume = baselineAvgVolume > 0 ? recentAvgVolume / baselineAvgVolume : 0;
+  if (!(totalRecentVolume > 0) || !(baselineAvgVolume > 0) || relativeVolume < HTF_ABSORPTION_MIN_RELATIVE_VOLUME) return null;
+
+  let signedVolume = 0;
+  let negativeCandles = 0;
+  let positiveCandles = 0;
+  let rangeHigh = -Infinity;
+  let rangeLow = Infinity;
+  for (const candle of recent) {
+    const open = Number(candle.open);
+    const close = Number(candle.close);
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const volume = Math.max(0, Number(candle.volume) || 0);
+    if (![open, close, high, low, volume].every(Number.isFinite)) return null;
+    // Match the existing bot delta proxy: candle-up volume is positive; otherwise negative.
+    if (close > open) { signedVolume += volume; positiveCandles++; }
+    else { signedVolume -= volume; negativeCandles++; }
+    rangeHigh = Math.max(rangeHigh, high);
+    rangeLow = Math.min(rangeLow, low);
+  }
+
+  const firstClose = Number(recent[0].close);
+  const lastClose = Number(recent[recent.length - 1].close);
+  const netMove = lastClose - firstClose;
+  const netMoveAbs = Math.abs(netMove);
+  const rangeWidth = rangeHigh - rangeLow;
+  const pressureRatio = signedVolume / totalRecentVolume;
+  const compressed = netMoveAbs <= atr * HTF_ABSORPTION_MAX_NET_MOVE_ATR &&
+    rangeWidth <= atr * HTF_ABSORPTION_MAX_RANGE_ATR;
+  if (!compressed) return null;
+
+  let direction = null;
+  if (negativeCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES && pressureRatio <= -HTF_ABSORPTION_MIN_PRESSURE_RATIO) {
+    direction = 'BULLISH'; // sellers are active, but price is making limited downside progress
+  } else if (positiveCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES && pressureRatio >= HTF_ABSORPTION_MIN_PRESSURE_RATIO) {
+    direction = 'BEARISH'; // buyers are active, but price is making limited upside progress
+  }
+  if (!direction) return null;
+
+  return {
+    direction,
+    rangeHigh,
+    rangeLow,
+    atr,
+    pressureRatio,
+    relativeVolume,
+    netMovePct: firstClose !== 0 ? (netMove / firstClose) * 100 : 0,
+    rangePct: lastClose !== 0 ? (rangeWidth / lastClose) * 100 : 0,
+    candleCount: recent.length,
+    candleTime: recent[recent.length - 1].time
+  };
+}
+
+async function monitor4HAbsorptionContext(symbol, closedCandles4H, closedCandles1H) {
+  if (!Array.isArray(closedCandles4H) || closedCandles4H.length < 25 ||
+      !Array.isArray(closedCandles1H) || closedCandles1H.length < 2) return;
+
+  const latest4HCandle = closedCandles4H[closedCandles4H.length - 1];
+  const latest4HTime = latest4HCandle?.time;
+  if (!Number.isFinite(Number(latest4HTime))) return;
+
+  let state = higherTimeframeAbsorptionState[symbol];
+  if (state && Date.now() - state.detectedAt > HTF_ABSORPTION_CONTEXT_TTL_MS) {
+    delete higherTimeframeAbsorptionState[symbol];
+    state = null;
+  }
+
+  const latest1H = closedCandles1H[closedCandles1H.length - 1];
+  const previous1H = closedCandles1H[closedCandles1H.length - 2];
+
+  // Follow the range after the 4H alert and report a later 1H structural break once.
+  if (state && !state.breakoutAlerted) {
+    const bullishBreak = state.direction === 'BULLISH' && Number(latest1H.close) > state.rangeHigh;
+    const bearishBreak = state.direction === 'BEARISH' && Number(latest1H.close) < state.rangeLow;
+    const bullishInvalidation = state.direction === 'BULLISH' && Number(latest1H.close) < state.rangeLow;
+    const bearishInvalidation = state.direction === 'BEARISH' && Number(latest1H.close) > state.rangeHigh;
+
+    if (bullishBreak || bearishBreak) {
+      state.breakoutAlerted = true;
+      state.breakoutTime = latest1H.time;
+      await sendMessage(
+        `📣 *4H ABSORPTION — 1H STRUCTURE CONFIRMATION*\n\n` +
+        `🪙 Symbol: *${symbol}*\n` +
+        `🧭 Context: *${state.direction}*\n` +
+        `⏱️ Confirmation: 1H candle closed beyond the observed 4H consolidation range\n` +
+        `📍 Range high: *${state.rangeHigh}*\n` +
+        `📍 Range low: *${state.rangeLow}*\n` +
+        `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n\n` +
+        `ℹ️ Informational only. No trade was opened by this alert; existing 15M/5M delta alignment and execution rules are unchanged.`
+      );
+    } else if (bullishInvalidation || bearishInvalidation) {
+      await sendMessage(
+        `⚠️ *4H ABSORPTION CONTEXT INVALIDATED*\n\n` +
+        `🪙 Symbol: *${symbol}*\n` +
+        `🧭 Previous context: *${state.direction}*\n` +
+        `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n` +
+        `Price closed beyond the opposite side of the observed 4H range.\n` +
+        `ℹ️ Informational only; trading logic was not changed.`
+      );
+      delete higherTimeframeAbsorptionState[symbol];
+      state = null;
+    }
+  }
+
+  // Evaluate a new pattern only once per newly closed 4H candle.
+  if (higherTimeframeAbsorptionLastProcessed4H[symbol] === latest4HTime) return;
+  higherTimeframeAbsorptionLastProcessed4H[symbol] = latest4HTime;
+
+  const candidate = detect4HAbsorptionContext(closedCandles4H);
+  if (!candidate) return;
+
+  // Avoid repeated alerts for the same still-active absorption episode.
+  if (state && state.direction === candidate.direction) return;
+
+  higherTimeframeAbsorptionState[symbol] = {
+    ...candidate,
+    detectedAt: Date.now(),
+    breakoutAlerted: false
+  };
+  state = higherTimeframeAbsorptionState[symbol];
+
+  const deltaPressurePct = Math.abs(candidate.pressureRatio * 100).toFixed(1);
+  const directionText = candidate.direction === 'BULLISH'
+    ? 'Potential bullish absorption (persistent selling, limited downside progress)'
+    : 'Potential bearish absorption (persistent buying, limited upside progress)';
+
+  await sendMessage(
+    `🔎 *4H HIGHER-TIMEFRAME ABSORPTION WATCH*\n\n` +
+    `🪙 Symbol: *${symbol}*\n` +
+    `🧭 Potential context: *${candidate.direction}*\n` +
+    `📊 Observation: ${directionText}\n` +
+    `🕯️ Closed 4H candles: *${candidate.candleCount}*\n` +
+    `📉 Signed-volume pressure: *${deltaPressurePct}%* of observed volume\n` +
+    `📦 Relative volume: *${candidate.relativeVolume.toFixed(2)}x* its prior 20-candle average\n` +
+    `↔️ Consolidation range: *${candidate.rangePct.toFixed(2)}%*\n` +
+    `↕️ Net price change across window: *${candidate.netMovePct.toFixed(2)}%*\n` +
+    `📍 Range high: *${candidate.rangeHigh}*\n` +
+    `📍 Range low: *${candidate.rangeLow}*\n\n` +
+    `⏳ Watching for a 1H close beyond this range. This is a potential reversal area, not a trade signal. Existing 15M/5M delta alignment and all entry logic remain unchanged.`
+  );
+  log(`🔎 4H absorption watch ${symbol}: ${candidate.direction}, pressure=${candidate.pressureRatio.toFixed(3)}, relVol=${candidate.relativeVolume.toFixed(2)}x`);
 }
 
 function calculate5MATRBands(candles) {
@@ -3957,6 +4134,16 @@ setInterval(async () => {
 
       const closedCandles1H = candles1H.slice(0, -1);
       const closes1H = closedCandles1H.map((c) => c.close);
+
+      // =============================
+      // 4H HIGHER-TIMEFRAME ABSORPTION WATCH (INFORMATIONAL ONLY)
+      // This notification module does not alter setup unlocking or execution.
+      // =============================
+      const candles4HForAbsorption = await fetchFuturesKlines(symbol, "4h", 60);
+      if (candles4HForAbsorption && candles4HForAbsorption.length >= 26) {
+        const closedCandles4HForAbsorption = candles4HForAbsorption.slice(0, -1);
+        await monitor4HAbsorptionContext(symbol, closedCandles4HForAbsorption, closedCandles1H);
+      }
 
       // =============================
       // TRUE DAILY LEVELS
