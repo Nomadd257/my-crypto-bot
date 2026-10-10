@@ -18,7 +18,10 @@ globalThis.fetch = fetch;
 // --- TELEGRAM DETAILS ---
 const TELEGRAM_BOT_TOKEN = "8822289821:AAGEdXlXQzPdq0Czh3pcNiRCYl83ZAXBBvw";
 const GROUP_CHAT_ID = "-1003419090746";
-const ADMIN_ID = "1718404728";
+const ADMIN_NOTIFICATION_IDS = [
+  "1718404728", // Existing admin notification recipient
+  "6907653103"  // Additional admin: receives bot information and alerts
+];
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 // --- USERS FILE ---
@@ -268,9 +271,15 @@ async function sendMessage(msg) {
   try {
     await bot.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: "Markdown" });
   } catch {}
-  try {
-    await bot.sendMessage(ADMIN_ID, msg, { parse_mode: "Markdown" });
-  } catch {}
+
+  // Deliver the same bot information to every configured admin.
+  for (const adminChatId of ADMIN_NOTIFICATION_IDS) {
+    try {
+      await bot.sendMessage(adminChatId, msg, { parse_mode: "Markdown" });
+    } catch (err) {
+      log(`❌ Admin notification delivery failed for a configured recipient: ${err?.message || err}`);
+    }
+  }
 }
 
 // =====================================================
@@ -453,11 +462,13 @@ async function sendNewsMessage(message) {
     log(`❌ News Telegram group delivery failed: ${err?.message || err}`);
   }
 
-  try {
-    await bot.sendMessage(ADMIN_ID, message, { parse_mode: "Markdown" });
-    delivered = true;
-  } catch (err) {
-    log(`❌ News Telegram admin delivery failed: ${err?.message || err}`);
+  for (const adminChatId of ADMIN_NOTIFICATION_IDS) {
+    try {
+      await bot.sendMessage(adminChatId, message, { parse_mode: "Markdown" });
+      delivered = true;
+    } catch (err) {
+      log(`❌ News Telegram admin delivery failed for a configured recipient: ${err?.message || err}`);
+    }
   }
 
   return delivered;
@@ -669,16 +680,17 @@ const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 // price stays within this distance of the anchored structure level.
 const SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT = 1.0;
 // High-momentum continuation uses the breakout candle's directional momentum.
-// Candle momentum = signed body / full candle range. A BOS candle must have
-// directional candle momentum >= 0.50 and its full range must be at least
-// 0.50 x the 5M ATR. There is no adequate/low-momentum continuation path.
+// Candle momentum = signed body / full candle range. A directional BOS at or
+// above 0.50 can enter without waiting for a retest; regime classification is 0.40.
 const SCRIPT2_HIGH_MOMENTUM_THRESHOLD = 0.5;
+// Adequate momentum uses the original regime threshold and requires BOS + retest.
+const ADEQUATE_MOMENTUM_THRESHOLD = 0.25;
+const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 // BOS candle range/ATR is intentionally not required.
 
-// Global market-activity regime gate. Only HIGH MOMENTUM is allowed for new
-// Script 2 setup creation. This is direction-neutral; it does not decide BUY
-// vs SELL.
-const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.50;
+// Global market-activity regime gate. Adequate and high regimes can create
+// new setups; low momentum remains blocked. Direction-neutral.
+const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.40;
 const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.00;
 const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.00;
 const MARKET_REGIME_RECENT_RANGE_CANDLES = 5;
@@ -714,12 +726,12 @@ const ATR_BAND_MULTIPLIER = 1;
 //
 // Score components:
 // 1) Recent candle momentum activity: average ABS(body/range) over the
-//    most recent closed 5M candles must reach 0.25.
+//    most recent closed 5M candles must reach the original adequate threshold.
 // 2) ATR activity: recent average true range must be at least the baseline.
 // 3) Volume activity: recent average volume must be at least the baseline.
 //
-// At least 2 of 3 must pass. This avoids allowing a single abnormal candle
-// to classify an otherwise dead/choppy market as tradable.
+// At least 2 of 3 must pass. The momentum score then separates adequate
+// (0.25+) from high momentum (0.40+).
 function getScript2MomentumRegime(closedCandles5) {
   if (!Array.isArray(closedCandles5) || closedCandles5.length < 35) {
     return {
@@ -814,7 +826,7 @@ function getScript2MomentumRegime(closedCandles5) {
     : null;
 
   const candleMomentumPassed = Number.isFinite(candleMomentum) &&
-    candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
+    candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD;
   const atrPassed = Number.isFinite(atrRatio) &&
     atrRatio >= MARKET_REGIME_ATR_EXPANSION_MIN_RATIO;
   const volumePassed = Number.isFinite(volumeRatio) &&
@@ -822,14 +834,13 @@ function getScript2MomentumRegime(closedCandles5) {
 
   const score = [candleMomentumPassed, atrPassed, volumePassed]
     .filter(Boolean).length;
-  const highActivity = score >= MARKET_REGIME_MIN_SCORE &&
-    Number.isFinite(candleMomentum) &&
+  const allowed = score >= MARKET_REGIME_MIN_SCORE;
+  const highActivity = allowed && Number.isFinite(candleMomentum) &&
     candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
-  const allowed = highActivity;
 
   return {
     allowed,
-    regime: allowed ? "HIGH_MOMENTUM" : "LOW_MOMENTUM",
+    regime: allowed ? (highActivity ? "HIGH_MOMENTUM" : "ADEQUATE_MOMENTUM") : "LOW_MOMENTUM",
     score,
     candleMomentum,
     atrRatio,
@@ -1862,7 +1873,26 @@ function getScript2ZoneBoundary(zone, direction) {
 }
 
 
-function getScript2ContinuationState(candles, setup, currentPrice = null) {
+function getScript2ZoneRetest(candle, zone, direction) {
+  if (!candle || !zone || !direction) return false;
+
+  const high = Number(candle.high);
+  const low = Number(candle.low);
+  const close = Number(candle.close);
+  const boundary = getScript2ZoneBoundary(zone, direction);
+
+  if (![high, low, close, boundary].every(Number.isFinite)) return false;
+
+  if (direction === "SELL") {
+    // Retest the broken boundary and close back below it.
+    return high >= boundary && close < boundary;
+  }
+
+  // Retest the broken boundary and close back above it.
+  return low <= boundary && close > boundary;
+}
+
+function getScript2ContinuationState(candles, setup, currentPrice = null, momentumRegime = "LOW_MOMENTUM") {
   if (!Array.isArray(candles) || !candles.length || !setup) return null;
 
   const latestIndex = candles.length - 1;
@@ -1920,9 +1950,8 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
       return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
     }
 
-    // The continuation path is HIGH MOMENTUM ONLY. The BOS candle must
-    // have both strong directional efficiency and a meaningful range
-    // relative to the current 5M ATR.
+    // Classify the closed BOS candle against the high and adequate thresholds.
+    // High-momentum BOS enters directly; adequate-momentum BOS requires retest.
     const candleOpen = Number(latest.open);
     const candleHigh = Number(latest.high);
     const candleLow = Number(latest.low);
@@ -1945,23 +1974,33 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
     const highMomentum = setup.direction === "BUY"
       ? Number.isFinite(candleMomentum) && candleMomentum >= SCRIPT2_HIGH_MOMENTUM_THRESHOLD
       : Number.isFinite(candleMomentum) && candleMomentum <= -SCRIPT2_HIGH_MOMENTUM_THRESHOLD;
-    const longCandle = true;
-    const highMomentumContinuation = highMomentum && longCandle;
+    const adequateMomentum = setup.direction === "BUY"
+      ? Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD
+      : Number.isFinite(candleMomentum) && candleMomentum <= -ADEQUATE_MOMENTUM_THRESHOLD;
 
-    return {
-      status: highMomentumContinuation ? "HIGH_MOMENTUM_BREAK_CONFIRMED" : "EXPIRE",
-      reason: highMomentumContinuation ? null : "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL",
-      latestKey,
-      latestIndex,
-      boundary,
-      candlesSinceCreation,
-      candleMomentum,
-      candleAtrMultiple,
-      bosAtr,
-      highMomentum,
-      longCandle,
-      highMomentumContinuation
-    };
+    if (highMomentum) {
+      return {
+        status: "HIGH_MOMENTUM_BREAK_CONFIRMED",
+        latestKey, latestIndex, boundary, candlesSinceCreation,
+        candleMomentum, candleAtrMultiple, bosAtr,
+        highMomentum: true
+      };
+    }
+
+    // Adequate regime uses a lower directional BOS threshold, but requires
+    // a later failed-reclaim retest before the continuation is executable.
+    if (momentumRegime === "ADEQUATE_MOMENTUM" && adequateMomentum) {
+      return {
+        status: "BREAK_CONFIRMED",
+        latestKey, latestIndex, boundary, candlesSinceCreation,
+        candleMomentum, candleAtrMultiple, bosAtr,
+        highMomentum: false
+      };
+    }
+
+    // Keep the structure candidate alive rather than discarding it just
+    // because this particular closed candle did not qualify for either path.
+    return { status: "WAIT", latestKey, latestIndex, boundary, candlesSinceCreation, candleMomentum };
   }
 
   if (setup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED") {
@@ -1975,14 +2014,32 @@ function getScript2ContinuationState(candles, setup, currentPrice = null) {
     };
   }
 
+  if (setup.stage === "BREAK_CONFIRMED") {
+    const breakIndex = candles.findIndex(
+      (candle) => getScript2CandleKey(candle) === String(setup.breakCandleKey)
+    );
+    if (breakIndex < 0) return { status: "EXPIRE", reason: "BREAK_CANDLE_NOT_FOUND" };
+
+    const candlesSinceBreak = latestIndex - breakIndex;
+    if (candlesSinceBreak <= 0) return { status: "WAIT", latestKey, latestIndex, candlesSinceBreak };
+    if (candlesSinceBreak > SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES) {
+      return { status: "EXPIRE", reason: "RETEST_NOT_CONFIRMED" };
+    }
+
+    if (getScript2ZoneRetest(latest, setup.zone, setup.direction)) {
+      return { status: "RETEST_CONFIRMED", latestKey, latestIndex, candlesSinceBreak };
+    }
+    return { status: "WAIT", latestKey, latestIndex, candlesSinceBreak };
+  }
+
   return { status: "WAIT", latestKey, latestIndex };
 }
 
-async function processScript2Continuation(symbol, closedCandles5, now, currentPrice = null) {
+async function processScript2Continuation(symbol, closedCandles5, now, currentPrice = null, momentumRegime = "LOW_MOMENTUM") {
   const setup = script2PendingSetups[symbol];
   if (!setup || setup.setupType !== "CONTINUATION") return null;
 
-  const state = getScript2ContinuationState(closedCandles5, setup, currentPrice);
+  const state = getScript2ContinuationState(closedCandles5, setup, currentPrice, momentumRegime);
   if (!state) return null;
 
   if (state.status === "EXPIRE") {
@@ -1993,13 +2050,11 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
         `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
         `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`
       );
-    } else if (state.reason === "BOS_NOT_HIGH_MOMENTUM_OR_CANDLE_TOO_SMALL") {
+    } else if (state.reason === "RETEST_NOT_CONFIRMED") {
       awaitSendScript2Checkpoint(
-        `⛔ *CONTINUATION REJECTED* — *${symbol}*\n` +
-        `⚡ BOS did not meet the HIGH-MOMENTUM requirement\n` +
-        `📊 Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}* / required *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for BUY or *≤ -${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}* for SELL\n` +
-  
-        `🚫 No adequate/low-momentum continuation or retest path`
+        `⏳ *ADEQUATE-MOMENTUM CONTINUATION EXPIRED* — *${symbol}*
+` +
+        `🔁 Failed-reclaim retest was not confirmed within ${SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES} closed 5M candles.`
       );
     }
     delete script2PendingSetups[symbol];
@@ -2021,8 +2076,45 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
         `⚡ Candle Momentum: *${Number(state.candleMomentum).toFixed(2)}*\n` +
         `🎯 Momentum Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
   
-        `📈 Break of structure confirmed — *HIGH MOMENTUM ONLY*\n` +
+        `📈 Break of structure confirmed — *NO RETEST REQUIRED*\n` +
         `➡️ Direction: *${setup.direction}*`
+      );
+    }
+    return setup.direction;
+  }
+
+  if (state.status === "BREAK_CONFIRMED") {
+    setup.stage = "BREAK_CONFIRMED";
+    setup.continuationMode = "ADEQUATE_MOMENTUM";
+    setup.breakCandleKey = state.latestKey;
+    setup.breakConfirmedAt = now;
+    setup.breakBoundary = state.boundary;
+
+    if (!setup.breakNotified) {
+      setup.breakNotified = true;
+      awaitSendScript2Checkpoint(
+        `📈 *ADEQUATE-MOMENTUM BOS CONFIRMED* — *${symbol}*\n` +
+        `➡️ Direction: *${setup.direction}*\n` +
+        `⚡ Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}*\n` +
+        `🔁 Retest required before entry.`
+      );
+    }
+    return null;
+  }
+
+  if (state.status === "RETEST_CONFIRMED") {
+    setup.stage = "RETEST_CONFIRMED";
+    setup.continuationMode = "ADEQUATE_MOMENTUM";
+    setup.retestCandleKey = state.latestKey;
+    setup.retestConfirmedAt = now;
+    setup.confirmedAt = now;
+
+    if (!setup.retestNotified) {
+      setup.retestNotified = true;
+      awaitSendScript2Checkpoint(
+        `🔁 *FAILED-RECLAIM RETEST CONFIRMED* — *${symbol}*\n` +
+        `➡️ Direction: *${setup.direction}*\n` +
+        `✅ Adequate-momentum continuation is ready for remaining checks.`
       );
     }
     return setup.direction;
@@ -4071,9 +4163,8 @@ setInterval(async () => {
 //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
 // 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
 // 5) A direction-neutral market-activity gate must allow NEW setups.
-//    It requires high candle momentum plus at least 2 of 3 activity measures:
-//    candle momentum, ATR activity, and volume activity. This prevents new
-//    trades during dead/slow markets.
+//    Adequate momentum keeps the original 0.25 threshold and 2-of-3 activity
+//    score; high momentum is classified at 0.40. Low momentum remains blocked.
 // 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
 //
 // 1H STC flip/pressure messages, absorption, liquidity, SL and
@@ -4086,8 +4177,9 @@ if (!candles5 || candles5.length < 40) continue;
 // Only CLOSED 5M candles are used for the volume imbalance.
 const closedCandles5 = candles5.slice(0, -1);
 
-// Global market-activity regime. This gates ONLY new setup creation.
-// Existing staged setups continue through their locked high-momentum BOS confirmation.
+// Global market-activity regime. Adequate and high momentum allow new setups;
+// low momentum blocks new setup creation. Staged setups continue through their
+// corresponding BOS-only or BOS-plus-retest confirmation path.
 const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
 const script2LatestClosedCandleKey = getScript2CandleKey(
   closedCandles5[closedCandles5.length - 1],
@@ -4278,8 +4370,8 @@ if (script2Zone) {
   // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
   // ---------------------------------------------------
   // The market-regime gate is direction-neutral and applies only to NEW
-  // setup creation. A valid staged setup is still allowed to progress
-  // through high-momentum BOS confirmation after the regime changes.
+  // setup creation. A valid staged setup remains anchored while its BOS or
+  // required retest confirmation is processed.
   if (script2MomentumRegime.allowed) {
   const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
@@ -4447,16 +4539,15 @@ if (script2MomentumRegime.allowed) {
 // -----------------------------------------------------
 // STEP 3 — ADVANCE A STAGED CONTINUATION
 // -----------------------------------------------------
-// This runs even after price leaves the original zone. That is
-// intentional: once a continuation candidate exists, the bot must
-// watch for the structural break; there is no fixed BOS time limit.
-// Only high-momentum BOS confirmations can execute; there is no
-// adequate/low-momentum continuation or retest path.
+// This runs even after price leaves the original zone. Once a candidate
+// exists, the bot watches for BOS without a fixed BOS time limit. High
+// momentum can execute on BOS alone; adequate momentum requires a retest.
 const confirmedContinuationDirection = await processScript2Continuation(
   symbol,
   closedCandles5,
   now,
-  script2CurrentPrice
+  script2CurrentPrice,
+  script2MomentumRegime.regime
 );
 
 // If a continuation was confirmed, it is now executable through the
@@ -4486,11 +4577,12 @@ let direction = null;
 const pendingSetup = script2PendingSetups[symbol];
 
 if (pendingSetup) {
-  // Continuation setups are executable ONLY after a high-momentum BOS
-  // candle also passes the ATR-relative candle-size filter.
+  // Continuations are executable after high-momentum BOS or after the
+  // adequate-momentum BOS + failed-reclaim retest sequence.
   const continuationReady =
     pendingSetup.setupType !== "CONTINUATION" ||
-    pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED";
+    pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" ||
+    pendingSetup.stage === "RETEST_CONFIRMED";
 
   const setupDirection = pendingSetup.direction;
 
@@ -7175,11 +7267,14 @@ setInterval(
 
 );
 
-const ADMIN_CHAT_ID = 1718404728; // <-- Replace with your Telegram chat ID
+const ADMIN_CHAT_IDS = [
+  "1718404728", // Existing admin
+  "6907653103"  // Additional admin authorized to control the bot
+];
 
 // Helper function to check admin
 function isAdmin(msg) {
-  return msg?.chat?.id === ADMIN_CHAT_ID;
+  return ADMIN_CHAT_IDS.includes(String(msg?.chat?.id ?? ""));
 }
 
 // --- Telegram commands ---
