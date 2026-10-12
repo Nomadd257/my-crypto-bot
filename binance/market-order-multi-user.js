@@ -1,5 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// v34: 15M trade progress monitor is advisory-only; OBV + momentum + price progress + structure
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
 // Volume imbalance report uses 5M closed candles
@@ -3488,7 +3489,8 @@ function getTradeProgressBands(candles, direction) {
       status: close > bands.current.upper ? "ABOVE UPPER" : (aboveMid ? "ABOVE MID" : "BELOW MID"),
       text: close > bands.current.upper ? "above upper band" : (aboveMid ? "above EMA mid" : "below EMA mid"),
       width: bands.current.width,
-      widthChange: bands.current.width - bands.previous.width
+      widthChange: bands.current.width - bands.previous.width,
+      expanding: bands.current.width > bands.previous.width
     };
   }
 
@@ -3498,7 +3500,8 @@ function getTradeProgressBands(candles, direction) {
     status: close < bands.current.lower ? "BELOW LOWER" : (belowMid ? "BELOW MID" : "ABOVE MID"),
     text: close < bands.current.lower ? "below lower band" : (belowMid ? "below EMA mid" : "above EMA mid"),
     width: bands.current.width,
-    widthChange: bands.current.width - bands.previous.width
+    widthChange: bands.current.width - bands.previous.width,
+    expanding: bands.current.width > bands.previous.width
   };
 }
 
@@ -3607,43 +3610,87 @@ function getTradeProgressAbsorption(candles, direction) {
   };
 }
 
-function formatTradeProgressState(state) {
-  if (state === "HOLD") return "🟢 HOLD — TREND CONTINUATION";
-  if (state === "PROTECT") return "🟡 PROTECT PROFIT — TREND WEAKENING";
-  if (state === "TAKE_PROFIT") return "🟠 TAKE PROFIT — MOVE LOSING SUPPORT";
-  return "🔴 EXIT WATCH — TREND FAILURE RISK";
+function getTradeProgressOBV(candles, direction) {
+  // Informational only: use the monitor's closed 15M candles.
+  // This does NOT affect the monitor state or any trade execution/exit rule.
+  if (!candles || candles.length < OBV_EMA_LENGTH + 2) {
+    return { status: "UNAVAILABLE", text: "N/A", aligned: null };
+  }
+
+  const obvSeries = calculateOBVSeries(candles);
+  if (!obvSeries || obvSeries.length !== candles.length) {
+    return { status: "UNAVAILABLE", text: "N/A", aligned: null };
+  }
+
+  const obvCandles = obvSeries.map(value => ({ close: value }));
+  const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
+  const lastIndex = obvSeries.length - 1;
+  const current = Number(obvSeries[lastIndex]);
+  const previous = Number(obvSeries[lastIndex - 1]);
+  const average = Number(obvEMA?.[lastIndex]);
+
+  if (![current, previous, average].every(Number.isFinite)) {
+    return { status: "UNAVAILABLE", text: "N/A", aligned: null };
+  }
+
+  const aligned = direction === "BUY" ? current > average : current < average;
+  const rising = current > previous;
+  const falling = current < previous;
+  const slope = rising ? "rising" : (falling ? "falling" : "flat");
+  const position = current > average ? "above 50-EMA" : (current < average ? "below 50-EMA" : "at 50-EMA");
+  const status = aligned ? "ALIGNED" : "AGAINST";
+
+  return {
+    status,
+    aligned,
+    text: `${aligned ? "aligned" : "against trade"}; ${slope}; ${position}`,
+    current,
+    average,
+    slope
+  };
 }
 
-function evaluateTradeProgress(direction, data, previous) {
-  const hardConflict = !data.higher.aligned ||
-    data.structure.status === (direction === "BUY" ? "LH/LL" : "HH/HL");
+function formatTradeProgressState(state) {
+  if (state === "HOLD") return "🟢 HOLD — MOMENTUM / STRUCTURE SUPPORT THE TRADE";
+  if (state === "CAUTION") return "🟡 HOLD WITH CAUTION — CONFIRMATION IS WEAKENING";
+  if (state === "PROTECT_PROFIT") return "🟠 PROTECT PROFIT — REVERSAL RISK IS INCREASING";
+  return "🔴 EXIT WARNING — TRADE THESIS MAY BE FAILING";
+}
 
-  const deltaConflict = !data.delta.aligned;
+// Advisory scoring only. This function must never place, modify, or close orders.
+// OBV is combined with momentum, realized price progress, and market structure;
+// it is not treated as a standalone exit trigger.
+function evaluateTradeProgress(direction, data, previous) {
+  const momentumConflict = !data.momentum.aligned;
+  const obvConflict = data.obv.aligned === false;
+  const structureConflict = !data.structure.aligned || !data.structure5.aligned;
+  const higherConflict = !data.higher.aligned;
   const stcConflict = !data.stc.aligned;
   const bandConflict = !data.bands.aligned;
-  const structureConflict = !data.structure.aligned;
-  const weakeningSignals = [
-    !data.momentum.aligned,
-    !data.stc.movingWithTrade,
-    !data.bands.expanding,
-    !data.delta.strong,
-    data.absorption.warning
-  ].filter(Boolean).length;
+  const deltaConflict = !data.delta.aligned;
+  const losingProgress = Number.isFinite(data.progress?.averageMovePct) && data.progress.averageMovePct < 0;
+  const meaningfulProfit = Number.isFinite(data.progress?.averageMovePct) && data.progress.averageMovePct >= 1;
 
-  if (hardConflict && (deltaConflict || structureConflict || stcConflict)) {
-    return "EXIT";
+  const coreConflicts = [momentumConflict, obvConflict, structureConflict].filter(Boolean).length;
+  const supportingConflicts = [higherConflict, stcConflict, bandConflict, deltaConflict, data.absorption.warning].filter(Boolean).length;
+  const weakeningSignals = coreConflicts + supportingConflicts;
+
+  // Require multiple independent failures before issuing the strongest warning.
+  if ((structureConflict && momentumConflict && obvConflict) ||
+      (higherConflict && structureConflict && (momentumConflict || obvConflict))) {
+    return "EXIT_WARNING";
   }
 
-  if (hardConflict || (structureConflict && deltaConflict)) {
-    return "TAKE_PROFIT";
+  if ((meaningfulProfit && coreConflicts >= 2) ||
+      (structureConflict && obvConflict && (momentumConflict || deltaConflict)) ||
+      (losingProgress && coreConflicts >= 2 && supportingConflicts >= 1)) {
+    return "PROTECT_PROFIT";
   }
 
-  if (deltaConflict && bandConflict && weakeningSignals >= 2) {
-    return "TAKE_PROFIT";
-  }
-
-  if (weakeningSignals >= 3 || (previous?.state === "HOLD" && weakeningSignals >= 2)) {
-    return "PROTECT";
+  if (weakeningSignals >= 3 ||
+      (previous?.state === "HOLD" && weakeningSignals >= 2) ||
+      (losingProgress && coreConflicts >= 1)) {
+    return "CAUTION";
   }
 
   return "HOLD";
@@ -3703,6 +3750,7 @@ async function monitorTradeProgress() {
         const bands = getTradeProgressBands(closed15, side);
         const structure = getTradeProgressStructure(closed15, side, 6);
         const delta = getTradeProgressDelta(closed15, side);
+        const obv = getTradeProgressOBV(closed15, side);
         const absorption = getTradeProgressAbsorption(closed15, side);
         const structure5 = getTradeProgressStructure(closed5, side, 6);
 
@@ -3713,13 +3761,28 @@ async function monitorTradeProgress() {
           bands,
           structure,
           delta,
+          obv,
           absorption,
           structure5
         };
 
         const previous = tradeProgressPrevious[groupKey] || null;
-        const state = evaluateTradeProgress(side, data, previous);
         const currentClose = Number(closed15[closed15.length - 1].close);
+        const moveValues = group.map(({ pos }) => side === "BUY"
+          ? ((currentClose - Number(pos.entryPrice)) / Number(pos.entryPrice)) * 100
+          : ((Number(pos.entryPrice) - currentClose) / Number(pos.entryPrice)) * 100
+        ).filter(Number.isFinite);
+        const progress = {
+          averageMovePct: moveValues.length
+            ? moveValues.reduce((sum, value) => sum + value, 0) / moveValues.length
+            : null,
+          bestMovePct: moveValues.length ? Math.max(...moveValues) : null,
+          worstMovePct: moveValues.length ? Math.min(...moveValues) : null,
+          profitableCount: moveValues.filter(value => value > 0).length,
+          losingCount: moveValues.filter(value => value < 0).length
+        };
+        data.progress = progress;
+        const state = evaluateTradeProgress(side, data, previous);
 
         const qualityText = higher.quality?.status || "N/A";
         const qualityScore = Number.isFinite(higher.quality?.score) ? higher.quality.score : null;
@@ -3738,27 +3801,32 @@ async function monitorTradeProgress() {
 
         const report =
           `📡 *15M TRADE PROGRESS — ${symbol} ${side}*\n\n` +
-          `👥 *Users holding this position:* ${group.length}\n` +
+          `👥 Users holding this position: ${group.length}\n` +
           userLines + `\n` +
           `${formatTradeProgressState(state)}\n\n` +
-          `4️⃣ *4H TREND*\n` +
+          `4️⃣ 4H TREND\n` +
           `• Direction: ${higher.trend}\n` +
           `• Quality: ${qualityText}${qualityScore !== null ? ` (${qualityScore}/100)` : ""}\n` +
           `• Status: ${higher.aligned ? "✅ aligned" : "❌ conflict"}\n\n` +
-          `1️⃣ *1H MOMENTUM / STC*\n` +
+          `1️⃣ 1H MOMENTUM / STC\n` +
           `• Momentum: ${momentumData.text}\n` +
           `• STC: ${stc.text}${Number.isFinite(stc.current) ? ` (${stc.current.toFixed(1)})` : ""}\n\n` +
-          `1️⃣5️⃣ *15M STRUCTURE / ATR*\n` +
+          `1️⃣5️⃣ 15M STRUCTURE / ATR\n` +
           `• Structure: ${structure.text}\n` +
           `• ATR bands: ${bands.text}\n` +
-          `• Band expansion: ${bands.expanding ? "✅ directional" : "⚠️ not expanding"}\n\n` +
-          `📊 *15M CUMULATIVE DELTA*\n` +
+          `• Band expansion: ${bands.expanding ? "⚠️ expanding" : "⚠️ not expanding"}\n\n` +
+          `📊 15M CUMULATIVE DELTA\n` +
           `• Pressure: ${delta.text}\n` +
           `• Strength: ${Number.isFinite(delta.deltaStrength) ? delta.deltaStrength.toFixed(2) : "N/A"}\n\n` +
-          `5️⃣ *5M PRICE STRUCTURE*\n` +
+          `📈 15M ON-BALANCE VOLUME (OBV)\n` +
+          `• Confirmation: ${obv.status === "UNAVAILABLE" ? "unavailable" : (obv.aligned ? "✅ aligned with trade" : "❌ against trade")}\n` +
+          `• Trend: ${obv.slope || "N/A"}\n` +
+          `• Position vs ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.current) && Number.isFinite(obv.average) ? (obv.current > obv.average ? "above" : (obv.current < obv.average ? "below" : "at")) : "N/A"}\n` +
+          `• OBV: ${Number.isFinite(obv.current) ? obv.current.toFixed(0) : "N/A"} | ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.average) ? obv.average.toFixed(0) : "N/A"}\n\n` +
+          `5️⃣ 5M PRICE STRUCTURE\n` +
           `• ${structure5.text}\n\n` +
           `⚠️ Absorption: ${absorption.text}\n\n` +
-          `🧭 This is a *monitoring report only*. Existing SL, trailing stop and runner rules remain unchanged.`;
+          `🧭 This is a monitoring report only. Existing SL, trailing stop and runner rules remain unchanged.`;
 
         await sendMessage(report);
         tradeProgressLastReport[groupKey] = slot;
@@ -3767,7 +3835,8 @@ async function monitorTradeProgress() {
           timestamp: now,
           deltaStrength: delta.deltaStrength,
           stc: stc.current,
-          bandWidth: bands.width
+          bandWidth: bands.width,
+          averageMovePct: progress.averageMovePct
         };
       } catch (err) {
         log(`❌ 15M trade progress error ${groupKey}: ${err?.message || err}`);
