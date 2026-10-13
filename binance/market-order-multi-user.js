@@ -1,6 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// v34: 15M trade progress monitor is advisory-only; OBV + momentum + price progress + structure
+// v36: confirmed opposing 15M OBV divergence auto-closes via the shared /close SYMBOL path; other progress metrics remain advisory
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
 // Volume imbalance report uses 5M closed candles
@@ -3411,9 +3411,10 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 // =====================================================
 // 15M TRADE PROGRESS / TREND CONTINUATION MONITOR
 // =====================================================
-// Informational only. This scans every bot-opened position
-// every 15 minutes and reports whether the existing trend is
-// continuing, weakening, or showing failure risk.
+// Scans every bot-opened position and reports whether the existing trend is
+// continuing, weakening, or showing failure risk. Progress metrics are advisory;
+// a confirmed 15M OBV divergence against the open position triggers the shared
+// /close SYMBOL position-close path.
 //
 // It does NOT replace or modify the existing:
 // • SL
@@ -3430,6 +3431,7 @@ const TRADE_PROGRESS_INTERVAL_MS = 15 * 60 * 1000;
 const TRADE_PROGRESS_SCHEDULER_MS = 60 * 1000;
 const tradeProgressLastReport = {};
 const tradeProgressPrevious = {};
+const obvDivergenceCloseInProgress = new Set();
 
 function getTradeProgressStructure(candles, direction, lookback = 6) {
   if (!candles || candles.length < lookback + 2) {
@@ -3650,6 +3652,102 @@ function getTradeProgressOBV(candles, direction) {
   };
 }
 
+// Confirmed 15M OBV divergence against an open position.
+// A pivot is only accepted after two CLOSED candles have formed to its right.
+// BUY: price makes a higher high while OBV makes a lower high (bearish divergence).
+// SELL: price makes a lower low while OBV makes a higher low (bullish divergence).
+const OBV_DIVERGENCE_PIVOT_BARS = 2;
+const OBV_DIVERGENCE_LOOKBACK_CANDLES = 60;
+const OBV_DIVERGENCE_MAX_PIVOT_AGE = 8; // do not act on stale divergence (> 2 hours)
+
+function detect15MObvDivergenceAgainstTrade(candles, direction) {
+  if (!Array.isArray(candles) || candles.length < 20) {
+    return { confirmed: false, status: "UNAVAILABLE", text: "not enough closed 15M candles" };
+  }
+
+  const obv = calculateOBVSeries(candles);
+  if (!Array.isArray(obv) || obv.length !== candles.length ||
+      obv.some(value => !Number.isFinite(Number(value)))) {
+    return { confirmed: false, status: "UNAVAILABLE", text: "OBV unavailable" };
+  }
+
+  const leftRight = OBV_DIVERGENCE_PIVOT_BARS;
+  const start = Math.max(leftRight, candles.length - OBV_DIVERGENCE_LOOKBACK_CANDLES);
+  const end = candles.length - leftRight; // exclude pivots not yet confirmed by closed candles
+  const pivotIndices = [];
+  const field = direction === "BUY" ? "high" : "low";
+
+  for (let i = start; i < end; i++) {
+    const price = Number(candles[i]?.[field]);
+    if (!Number.isFinite(price)) continue;
+    let isPivot = true;
+    for (let offset = 1; offset <= leftRight; offset++) {
+      const before = Number(candles[i - offset]?.[field]);
+      const after = Number(candles[i + offset]?.[field]);
+      if (!Number.isFinite(before) || !Number.isFinite(after)) {
+        isPivot = false;
+        break;
+      }
+      // Strict pivots reduce false matches from flat/equal highs or lows.
+      if (direction === "BUY") {
+        if (!(price > before && price > after)) { isPivot = false; break; }
+      } else if (!(price < before && price < after)) {
+        isPivot = false;
+        break;
+      }
+    }
+    if (isPivot) pivotIndices.push(i);
+  }
+
+  if (pivotIndices.length < 2) {
+    return { confirmed: false, status: "NONE", text: "no two confirmed price pivots" };
+  }
+
+  const latestIndex = pivotIndices[pivotIndices.length - 1];
+  const previousIndex = [...pivotIndices].reverse().find(i => latestIndex - i >= leftRight + 1);
+  if (previousIndex === undefined) {
+    return { confirmed: false, status: "NONE", text: "confirmed pivots too close together" };
+  }
+  if ((candles.length - 1 - latestIndex) > OBV_DIVERGENCE_MAX_PIVOT_AGE) {
+    return { confirmed: false, status: "STALE", text: "latest divergence pivot is stale" };
+  }
+
+  const previousPrice = Number(candles[previousIndex][field]);
+  const latestPrice = Number(candles[latestIndex][field]);
+  const previousObv = Number(obv[previousIndex]);
+  const latestObv = Number(obv[latestIndex]);
+  if (![previousPrice, latestPrice, previousObv, latestObv].every(Number.isFinite)) {
+    return { confirmed: false, status: "UNAVAILABLE", text: "pivot values unavailable" };
+  }
+
+  const priceMovedAgainstTrade = direction === "BUY"
+    ? latestPrice > previousPrice
+    : latestPrice < previousPrice;
+  const obvMovedAgainstTrade = direction === "BUY"
+    ? latestObv < previousObv
+    : latestObv > previousObv;
+  const confirmed = priceMovedAgainstTrade && obvMovedAgainstTrade;
+  const priceChangePct = previousPrice !== 0
+    ? ((latestPrice - previousPrice) / previousPrice) * 100
+    : null;
+
+  return {
+    confirmed,
+    status: confirmed ? (direction === "BUY" ? "BEARISH" : "BULLISH") : "NONE",
+    type: direction === "BUY" ? "bearish" : "bullish",
+    previousIndex,
+    latestIndex,
+    previousPrice,
+    latestPrice,
+    previousObv,
+    latestObv,
+    priceChangePct,
+    text: confirmed
+      ? `${direction === "BUY" ? "bearish" : "bullish"} divergence confirmed on closed 15M candles`
+      : "no confirmed divergence against trade"
+  };
+}
+
 function formatTradeProgressState(state) {
   if (state === "HOLD") return "🟢 HOLD — MOMENTUM / STRUCTURE SUPPORT THE TRADE";
   if (state === "CAUTION") return "🟡 HOLD WITH CAUTION — CONFIRMATION IS WEAKENING";
@@ -3712,6 +3810,9 @@ async function monitorTradeProgress() {
     }
 
     for (const [groupKey, group] of Object.entries(positionGroups)) {
+      // /close operates on the whole symbol, so do not process a stale second
+      // side/group after an automatic divergence close has removed the symbol.
+      if (!activePositions[symbol]) break;
       if (tradeProgressLastReport[groupKey] === slot) continue;
 
       const side = group[0].pos.side;
@@ -3751,6 +3852,7 @@ async function monitorTradeProgress() {
         const structure = getTradeProgressStructure(closed15, side, 6);
         const delta = getTradeProgressDelta(closed15, side);
         const obv = getTradeProgressOBV(closed15, side);
+        const obvDivergence = detect15MObvDivergenceAgainstTrade(closed15, side);
         const absorption = getTradeProgressAbsorption(closed15, side);
         const structure5 = getTradeProgressStructure(closed5, side, 6);
 
@@ -3762,6 +3864,7 @@ async function monitorTradeProgress() {
           structure,
           delta,
           obv,
+          obvDivergence,
           absorption,
           structure5
         };
@@ -3783,6 +3886,26 @@ async function monitorTradeProgress() {
         };
         data.progress = progress;
         const state = evaluateTradeProgress(side, data, previous);
+
+        if (obvDivergence.confirmed && !obvDivergenceCloseInProgress.has(symbol)) {
+          obvDivergenceCloseInProgress.add(symbol);
+          try {
+            await sendMessage(
+              `🚨 *CONFIRMED 15M OBV DIVERGENCE — AUTO-CLOSE*\n\n` +
+              `• Symbol: *${symbol}*\n` +
+              `• Open position: *${side}*\n` +
+              `• Divergence: *${obvDivergence.status}* against the position\n` +
+              `• Price pivot: ${obvDivergence.previousPrice} → ${obvDivergence.latestPrice}` +
+              `${Number.isFinite(obvDivergence.priceChangePct) ? ` (${obvDivergence.priceChangePct >= 0 ? "+" : ""}${obvDivergence.priceChangePct.toFixed(2)}%)` : ""}\n` +
+              `• OBV at pivots: ${obvDivergence.previousObv.toFixed(0)} → ${obvDivergence.latestObv.toFixed(0)}\n\n` +
+              `Confirmed using closed 15M candles. Triggering the same tracked-position close path as /close ${symbol}.`
+            );
+            await closeTrackedSymbolPositions(symbol, `confirmed 15M OBV ${obvDivergence.status.toLowerCase()} divergence against ${side}`);
+          } finally {
+            obvDivergenceCloseInProgress.delete(symbol);
+          }
+          continue;
+        }
 
         const qualityText = higher.quality?.status || "N/A";
         const qualityScore = Number.isFinite(higher.quality?.score) ? higher.quality.score : null;
@@ -3822,11 +3945,12 @@ async function monitorTradeProgress() {
           `• Confirmation: ${obv.status === "UNAVAILABLE" ? "unavailable" : (obv.aligned ? "✅ aligned with trade" : "❌ against trade")}\n` +
           `• Trend: ${obv.slope || "N/A"}\n` +
           `• Position vs ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.current) && Number.isFinite(obv.average) ? (obv.current > obv.average ? "above" : (obv.current < obv.average ? "below" : "at")) : "N/A"}\n` +
-          `• OBV: ${Number.isFinite(obv.current) ? obv.current.toFixed(0) : "N/A"} | ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.average) ? obv.average.toFixed(0) : "N/A"}\n\n` +
+          `• OBV: ${Number.isFinite(obv.current) ? obv.current.toFixed(0) : "N/A"} | ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.average) ? obv.average.toFixed(0) : "N/A"}\n` +
+          `• Divergence against trade: ${obvDivergence.confirmed ? `🚨 CONFIRMED ${obvDivergence.status}` : obvDivergence.text}\n\n` +
           `5️⃣ 5M PRICE STRUCTURE\n` +
           `• ${structure5.text}\n\n` +
           `⚠️ Absorption: ${absorption.text}\n\n` +
-          `🧭 This is a monitoring report only. Existing SL, trailing stop and runner rules remain unchanged.`;
+          `🧭 Progress metrics are advisory. Confirmed opposing 15M OBV divergence triggers the shared /close path. Existing SL, trailing stop and runner rules remain otherwise unchanged.`;
 
         await sendMessage(report);
         tradeProgressLastReport[groupKey] = slot;
@@ -7588,27 +7712,39 @@ async function closeTrackedPositionOrder(client, symbol, pos) {
   throw new Error(`Unknown position side for ${symbol}: ${pos.side}`);
 }
 
-// Close a specific symbol for all users
-bot.onText(/\/close (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return;
-  const symbol = match[1].toUpperCase().trim();
-  if (!activePositions[symbol]) {
-    await sendMessage(`⚠️ No active position for *${symbol}*`);
-    return;
+// Shared close path for manual /close SYMBOL and automatic 15M OBV-divergence exits.
+// Both routes use the exact same tracked-position market-order helper and cleanup.
+async function closeTrackedSymbolPositions(symbol, reason = null) {
+  const normalizedSymbol = String(symbol || "").toUpperCase().trim();
+  if (!activePositions[normalizedSymbol]) {
+    if (!reason) await sendMessage(`⚠️ No active position for *${normalizedSymbol}*`);
+    return false;
   }
-  for (const [userId, pos] of Object.entries(activePositions[symbol])) {
+
+  for (const [userId, pos] of Object.entries(activePositions[normalizedSymbol])) {
     const client = userClients[userId];
     if (!client) continue;
     try {
-      await closeTrackedPositionOrder(client, symbol, pos);
-      await sendMessage(`🛑 Closed *${symbol}* for User ${userId}`);
+      await closeTrackedPositionOrder(client, normalizedSymbol, pos);
+      await sendMessage(`🛑 Closed *${normalizedSymbol}* for User ${userId}`);
     } catch (err) {
-      log(`❌ Failed to close ${symbol} for ${userId}: ${err?.message || err}`);
+      log(`❌ Failed to close ${normalizedSymbol} for ${userId}: ${err?.message || err}`);
     }
   }
-  delete activePositions[symbol];
+
+  delete activePositions[normalizedSymbol];
   saveActivePositions();
-  await sendMessage(`✅ *${symbol}* fully closed for all users`);
+  await sendMessage(reason
+    ? `✅ *${normalizedSymbol}* close routine completed. Reason: ${reason}.`
+    : `✅ *${normalizedSymbol}* fully closed for all users`);
+  return true;
+}
+
+// Close a specific symbol for all users.
+bot.onText(/\/close (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
+  const symbol = match[1].toUpperCase().trim();
+  await closeTrackedSymbolPositions(symbol);
 });
 
 // --- Global BULL/BEAR commands ---
