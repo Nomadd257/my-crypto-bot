@@ -208,6 +208,9 @@ let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zon
 let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
 let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
 let script2DeltaGateState = {}; // per-symbol 15M/5M delta alignment and confirmation state
+// Independent price-action consolidation detector; delta is measured only after phase completion.
+let priceActionDeltaPhaseState = {}; // per-symbol active consolidation phase and cooldown state
+let priceActionDeltaPhaseMonitorRunning = false;
 // Informational-only higher-timeframe absorption context. This state never gates entries.
 let higherTimeframeAbsorptionState = {}; // per-symbol active 4H absorption range and 1H confirmation status
 let higherTimeframeAbsorptionLastProcessed4H = {}; // prevents reprocessing the same closed 4H candle
@@ -589,6 +592,200 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
     return null;
   }
 }
+
+// ======================================================
+// PRICE-ACTION CONSOLIDATION PHASE + AGGRESSOR DELTA REPORT
+// ======================================================
+// This detector is independent of the 15M/5M setup-unlock logic.
+// Price action defines the consolidation; Binance taker-buy volume
+// is used to estimate aggressive buy/sell volume inside that phase.
+// A phase is reported only when a CLOSED 5M candle closes beyond the
+// established range by the breakout buffer. The breakout candle itself
+// is excluded from the phase-volume totals.
+// ======================================================
+const PA_DELTA_PHASE_MIN_CANDLES = 6;             // minimum 30 minutes
+const PA_DELTA_PHASE_MAX_RANGE_PCT = 1.20;        // initial 6-candle compression range
+const PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT = 0.15;  // close must clear range by this %
+const PA_DELTA_PHASE_COOLDOWN_MS = 15 * 60 * 1000;
+const PA_DELTA_PHASE_MONITOR_MS = 60 * 1000;
+
+function getPriceActionPhaseStats(candles) {
+  if (!Array.isArray(candles) || !candles.length) return null;
+
+  let high = -Infinity;
+  let low = Infinity;
+  let totalVolume = 0;
+  let aggressiveBuyVolume = 0;
+
+  for (const candle of candles) {
+    if (
+      !Number.isFinite(candle.high) ||
+      !Number.isFinite(candle.low) ||
+      !Number.isFinite(candle.volume) ||
+      !Number.isFinite(candle.takerBuyVolume)
+    ) return null;
+
+    high = Math.max(high, candle.high);
+    low = Math.min(low, candle.low);
+    totalVolume += Math.max(0, candle.volume);
+    aggressiveBuyVolume += Math.min(
+      Math.max(0, candle.volume),
+      Math.max(0, candle.takerBuyVolume)
+    );
+  }
+
+  const aggressiveSellVolume = Math.max(0, totalVolume - aggressiveBuyVolume);
+  const netDelta = aggressiveBuyVolume - aggressiveSellVolume;
+  const totalAggressorVolume = aggressiveBuyVolume + aggressiveSellVolume;
+
+  return {
+    high,
+    low,
+    totalVolume,
+    aggressiveBuyVolume,
+    aggressiveSellVolume,
+    netDelta,
+    buySharePct: totalAggressorVolume > 0
+      ? (aggressiveBuyVolume / totalAggressorVolume) * 100
+      : 0,
+    rangePct: low > 0 ? ((high - low) / low) * 100 : 0
+  };
+}
+
+async function monitorPriceActionDeltaPhases() {
+  if (priceActionDeltaPhaseMonitorRunning) return;
+  priceActionDeltaPhaseMonitorRunning = true;
+
+  try {
+    for (const symbol of COIN_LIST) {
+      try {
+        const rawCandles = await fetchFuturesKlines(symbol, "5m", 60);
+        if (!Array.isArray(rawCandles) || rawCandles.length < PA_DELTA_PHASE_MIN_CANDLES + 2) {
+          continue;
+        }
+
+        // Ignore the currently forming candle; decisions use closed 5M candles only.
+        const closedCandles = rawCandles.slice(0, -1);
+        const latest = closedCandles[closedCandles.length - 1];
+        if (!latest || !Number.isFinite(latest.time)) continue;
+
+        let phase = priceActionDeltaPhaseState[symbol];
+
+        if (phase && latest.time <= phase.lastCandleTime) {
+          continue; // this closed candle has already been processed
+        }
+
+        if (phase && Array.isArray(phase.candles)) {
+          const newCandles = closedCandles.filter(c => c.time > phase.lastCandleTime);
+          let ended = false;
+
+          for (const candle of newCandles) {
+            const upperBreak = phase.high * (1 + PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
+            const lowerBreak = phase.low * (1 - PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
+
+            if (candle.close > upperBreak || candle.close < lowerBreak) {
+              const direction = candle.close > upperBreak ? "UPWARD" : "DOWNWARD";
+              const stats = getPriceActionPhaseStats(phase.candles);
+              const durationMinutes = Math.max(
+                5,
+                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 5
+              );
+
+              if (stats) {
+                const fmt = n => Number(n).toLocaleString("en-US", {
+                  maximumFractionDigits: 4
+                });
+                await sendMessage(
+                  `📦 *CONSOLIDATION PHASE COMPLETED — ${symbol}*\n\n` +
+                  `Price-action breakout: *${direction}*\n` +
+                  `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 5M candles)\n` +
+                  `Range: *${fmt(stats.low)} – ${fmt(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
+                  `Total traded volume: *${fmt(stats.totalVolume)}*\n\n` +
+                  `Aggressive buy volume: *${fmt(stats.aggressiveBuyVolume)}*\n` +
+                  `Aggressive sell volume: *${fmt(stats.aggressiveSellVolume)}*\n` +
+                  `Net delta (buy − sell): *${fmt(stats.netDelta)}*\n` +
+                  `Buy share: *${stats.buySharePct.toFixed(1)}%*\n\n` +
+                  `_Measured from Binance 5M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`
+                );
+              }
+
+              priceActionDeltaPhaseState[symbol] = {
+                cooldownUntil: candle.time + PA_DELTA_PHASE_COOLDOWN_MS,
+                lastCandleTime: candle.time
+              };
+              ended = true;
+              break; // the breakout candle is not included in phase totals
+            }
+
+            // Still consolidating: add the candle and let the observed range
+            // evolve with price, while the breakout check uses the prior range.
+            phase.candles.push(candle);
+            phase.lastCandleTime = candle.time;
+            phase.high = Math.max(phase.high, candle.high);
+            phase.low = Math.min(phase.low, candle.low);
+          }
+
+          if (!ended) {
+            priceActionDeltaPhaseState[symbol] = phase;
+          }
+          continue;
+        }
+
+        // After a reported phase, wait 15 minutes before looking for a new one.
+        const existing = priceActionDeltaPhaseState[symbol];
+        if (existing?.cooldownUntil && latest.time < existing.cooldownUntil) {
+          existing.lastCandleTime = latest.time;
+          continue;
+        }
+
+        const windowCandles = closedCandles.slice(-PA_DELTA_PHASE_MIN_CANDLES);
+        const stats = getPriceActionPhaseStats(windowCandles);
+        if (!stats || stats.rangePct > PA_DELTA_PHASE_MAX_RANGE_PCT) {
+          if (existing?.cooldownUntil && latest.time >= existing.cooldownUntil) {
+            delete priceActionDeltaPhaseState[symbol];
+          }
+          continue;
+        }
+
+        // Candidate qualifies by compressed price range alone; send exactly
+        // one notification when the phase is first detected. The detailed
+        // delta/volume report is sent only when the phase ends in a breakout.
+        const fmtPhasePrice = n => Number(n).toLocaleString("en-US", {
+          maximumFractionDigits: 4
+        });
+        await sendMessage(
+          `📦 *CONSOLIDATION PHASE STARTED — ${symbol}*\n\n` +
+          `Initial range: *${fmtPhasePrice(stats.low)} – ${fmtPhasePrice(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
+          `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 5} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 5M candles)\n` +
+          `_Monitoring this phase until a confirmed price breakout. No trade entries or activation settings are changed._`
+        );
+
+        priceActionDeltaPhaseState[symbol] = {
+          startTime: windowCandles[0].time,
+          lastCandleTime: latest.time,
+          candles: windowCandles,
+          high: stats.high,
+          low: stats.low
+        };
+      } catch (err) {
+        log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
+      }
+    }
+  } finally {
+    priceActionDeltaPhaseMonitorRunning = false;
+  }
+}
+
+setInterval(() => {
+  monitorPriceActionDeltaPhases().catch(err =>
+    log(`❌ Price-action delta phase scheduler error: ${err?.message || err}`)
+  );
+}, PA_DELTA_PHASE_MONITOR_MS);
+
+// Run once on startup, then continue monitoring on the minute.
+monitorPriceActionDeltaPhases().catch(err =>
+  log(`❌ Initial price-action delta phase monitor error: ${err?.message || err}`)
+);
 
 // --- Proper Schaff Trend Cycle (STC) ---
 function calculateSTC(closes, { cycle = 4, fast = 10, slow = 20, signal = 3 } = {}) {
