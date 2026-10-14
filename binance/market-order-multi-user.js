@@ -17,7 +17,7 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8822289821:AAGEdXlXQzPdq0Czh3pcNiRCYl83ZAXBBvw";
+const TELEGRAM_BOT_TOKEN = "8947105445:AAEHyTHp6of01mng8VSN1n7KojobI0ZKXs0";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_NOTIFICATION_IDS = [
   "1718404728", // Existing admin notification recipient
