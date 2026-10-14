@@ -5036,21 +5036,10 @@ if (script2Zone) {
         `➡️ Direction: *${reversalDirection}*`
       );
 
-      // Absorption is the sole authority for reversal direction. The latest
-      // CLOSED 5M candle's imbalance is a directional confirmation gate only;
-      // it must meet the 70% threshold in the already-selected absorption
-      // direction and must never choose or flip the reversal direction.
-      const reversalImbalancePct = Number(
-        volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"]
-      );
-
-      if (
-        Number.isFinite(reversalImbalancePct) &&
-        reversalImbalancePct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT
-      ) {
+      if (volumeImbalance?.direction === reversalDirection) {
         await sendMessage(
           `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${reversalImbalancePct.toFixed(1)}%*\n` +
+          `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${Number(volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
           `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
         );
         script2PendingSetups[symbol] = {
@@ -5062,10 +5051,7 @@ if (script2Zone) {
           executionDirectionNotified: false,
           obvNotified: false,
           liquidityNotified: false,
-          volumeImbalance: {
-            ...volumeImbalance,
-            direction: reversalDirection
-          }
+          volumeImbalance
         };
       }
     }
@@ -5074,44 +5060,42 @@ if (script2Zone) {
 }
 
 // -----------------------------------------------------
-// STEP 2B — DELTA-UNLOCKED VOLUME-IMBALANCE CANDLE STRUCTURE
+// STEP 2B — STRUCTURE-BASED CONTINUATION CANDIDATE
 // -----------------------------------------------------
-// Delta must already have unlocked this symbol before this section runs.
-// The latest CLOSED 5M candle is measured for directional volume imbalance.
-// If imbalance reaches the existing 70% threshold, that SAME candle defines
-// the continuation breakout structure: BUY breaks its high; SELL breaks its low.
-// This applies only to continuation. Reversal/absorption logic is unchanged.
+// Continuation is intentionally independent of current-day ATR high/low.
+// A meaningful swing/equal high can produce BUY continuation evidence; a
+// meaningful swing/equal low can produce SELL continuation evidence.
+// Once created, the structure level is locked to the setup.
 if (script2MomentumRegime.allowed) {
   const existing = script2PendingSetups[symbol];
   const activeContinuation = existing?.setupType === "CONTINUATION";
   const activeReversal = existing?.setupType === "REVERSAL";
 
   if (!activeContinuation && !activeReversal) {
-    const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
-    const continuationDirection = volumeImbalance?.direction || null;
-    const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
-    const latestClosedCandleKey = getScript2CandleKey(
-      latestClosedCandle,
-      String(closedCandles5.length - 1)
+    const structureLevel = findScript2ContinuationStructureLevel(
+      closedCandles5,
+      script2CurrentPrice
     );
 
-    if (continuationDirection && latestClosedCandle) {
-      const structurePrice = continuationDirection === "BUY"
-        ? Number(latestClosedCandle.high)
-        : Number(latestClosedCandle.low);
+    if (structureLevel) {
+      const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
+      const continuationDirection =
+        volumeImbalance?.direction === structureLevel.direction
+          ? structureLevel.direction
+          : null;
 
-      if (Number.isFinite(structurePrice) && structurePrice > 0) {
-        const structureType = continuationDirection === "BUY"
-          ? "IMBALANCE CANDLE HIGH"
-          : "IMBALANCE CANDLE LOW";
+      if (continuationDirection) {
+        const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
+        const latestClosedCandleKey = getScript2CandleKey(
+          latestClosedCandle,
+          String(closedCandles5.length - 1)
+        );
+
         const anchoredZone = {
-          kind: "IMBALANCE_CANDLE",
-          type: structureType,
-          price: structurePrice,
-          high: Number(latestClosedCandle.high),
-          low: Number(latestClosedCandle.low),
-          direction: continuationDirection,
-          candleKey: latestClosedCandleKey
+          kind: "STRUCTURE",
+          type: structureLevel.type,
+          price: structureLevel.price,
+          direction: continuationDirection
         };
 
         script2PendingSetups[symbol] = {
@@ -5121,8 +5105,8 @@ if (script2MomentumRegime.allowed) {
           absorption: null,
           zone: anchoredZone,
           zoneLocked: true,
-          anchoredZoneKey: `${structureType}:${structurePrice}:${latestClosedCandleKey}`,
-          anchoredBoundary: structurePrice,
+          anchoredZoneKey: `${structureLevel.type}:${structureLevel.price}`,
+          anchoredBoundary: structureLevel.price,
           detectedAt: Date.now(),
           createdCandleKey: latestClosedCandleKey,
           breakCandleKey: null,
@@ -5138,17 +5122,22 @@ if (script2MomentumRegime.allowed) {
         };
 
         await sendMessage(
+          `📍 *CONTINUATION STRUCTURE REACHED* — *${symbol}*\n` +
+          `🏗️ ${structureLevel.type}\n` +
+          `🎯 Structure Level: *${Number(structureLevel.price).toPrecision(8)}*`
+        );
+
+        await sendMessage(
           `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
+          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance?.[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
           `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
         );
 
         await sendMessage(
           `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
           `Direction: *${continuationDirection}*\n` +
-          `🕯️ Structure candle: *latest closed 5M imbalance candle*\n` +
-          `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
-          `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`
+          `🔒 Structure locked at: *${Number(structureLevel.price).toPrecision(8)}*\n` +
+          `📏 Setup remains alive while price stays within *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* of the structure`
         );
       }
     }
