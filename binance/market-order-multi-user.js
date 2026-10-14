@@ -599,11 +599,11 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
 // This detector is independent of the 15M/5M setup-unlock logic.
 // Price action defines the consolidation; Binance taker-buy volume
 // is used to estimate aggressive buy/sell volume inside that phase.
-// A phase is reported only when a CLOSED 5M candle closes beyond the
+// A phase is reported only when a CLOSED 15M candle closes beyond the
 // established range by the breakout buffer. The breakout candle itself
 // is excluded from the phase-volume totals.
 // ======================================================
-const PA_DELTA_PHASE_MIN_CANDLES = 6;             // minimum 30 minutes
+const PA_DELTA_PHASE_MIN_CANDLES = 6;             // six closed 15M candles (90 minutes)
 const PA_DELTA_PHASE_MAX_RANGE_PCT = 1.20;        // initial 6-candle compression range
 const PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT = 0.15;  // close must clear range by this %
 const PA_DELTA_PHASE_COOLDOWN_MS = 15 * 60 * 1000;
@@ -659,12 +659,12 @@ async function monitorPriceActionDeltaPhases() {
   try {
     for (const symbol of COIN_LIST) {
       try {
-        const rawCandles = await fetchFuturesKlines(symbol, "5m", 60);
+        const rawCandles = await fetchFuturesKlines(symbol, "15m", 60);
         if (!Array.isArray(rawCandles) || rawCandles.length < PA_DELTA_PHASE_MIN_CANDLES + 2) {
           continue;
         }
 
-        // Ignore the currently forming candle; decisions use closed 5M candles only.
+        // Ignore the currently forming candle; decisions use closed 15M candles only.
         const closedCandles = rawCandles.slice(0, -1);
         const latest = closedCandles[closedCandles.length - 1];
         if (!latest || !Number.isFinite(latest.time)) continue;
@@ -687,8 +687,8 @@ async function monitorPriceActionDeltaPhases() {
               const direction = candle.close > upperBreak ? "UPWARD" : "DOWNWARD";
               const stats = getPriceActionPhaseStats(phase.candles);
               const durationMinutes = Math.max(
-                5,
-                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 5
+                15,
+                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 15
               );
 
               if (stats) {
@@ -698,14 +698,14 @@ async function monitorPriceActionDeltaPhases() {
                 await sendMessage(
                   `📦 *CONSOLIDATION PHASE COMPLETED — ${symbol}*\n\n` +
                   `Price-action breakout: *${direction}*\n` +
-                  `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 5M candles)\n` +
+                  `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
                   `Range: *${fmt(stats.low)} – ${fmt(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
                   `Total traded volume: *${fmt(stats.totalVolume)}*\n\n` +
                   `Aggressive buy volume: *${fmt(stats.aggressiveBuyVolume)}*\n` +
                   `Aggressive sell volume: *${fmt(stats.aggressiveSellVolume)}*\n` +
                   `Net delta (buy − sell): *${fmt(stats.netDelta)}*\n` +
                   `Buy share: *${stats.buySharePct.toFixed(1)}%*\n\n` +
-                  `_Measured from Binance 5M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`
+                  `_Measured from Binance 15M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`
                 );
               }
 
@@ -724,9 +724,9 @@ async function monitorPriceActionDeltaPhases() {
             phase.high = Math.max(phase.high, candle.high);
             phase.low = Math.min(phase.low, candle.low);
 
-            // Send a progress update every 15 minutes while the phase remains
-            // active. The monitor itself still runs every minute; notifications
-            // are paced using closed 5M candle timestamps.
+            // Send a progress update once per newly closed 15M candle while the phase remains
+            // active. The monitor still runs every minute, but only closed 15M candles
+            // advance the phase and notification schedule.
             const lastStatusTime = Number.isFinite(phase.lastStatusMessageTime)
               ? phase.lastStatusMessageTime
               : phase.startTime;
@@ -737,12 +737,12 @@ async function monitorPriceActionDeltaPhases() {
                   maximumFractionDigits: 4
                 });
                 const elapsedMinutes = Math.max(
-                  5,
-                  Math.round((candle.time - phase.startTime) / 60000) + 5
+                  15,
+                  Math.round((candle.time - phase.startTime) / 60000) + 15
                 );
                 await sendMessage(
                   `⏳ *CONSOLIDATION PHASE UPDATE — ${symbol}*\n\n` +
-                  `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 5M candles)\n` +
+                  `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
                   `Current range: *${fmtStatus(statusStats.low)} – ${fmtStatus(statusStats.high)}* (${statusStats.rangePct.toFixed(2)}%)\n` +
                   `Aggressive buy volume: *${fmtStatus(statusStats.aggressiveBuyVolume)}*\n` +
                   `Aggressive sell volume: *${fmtStatus(statusStats.aggressiveSellVolume)}*\n` +
@@ -786,7 +786,7 @@ async function monitorPriceActionDeltaPhases() {
         await sendMessage(
           `📦 *CONSOLIDATION PHASE STARTED — ${symbol}*\n\n` +
           `Initial range: *${fmtPhasePrice(stats.low)} – ${fmtPhasePrice(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
-          `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 5} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 5M candles)\n` +
+          `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 15} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 15M candles)\n` +
           `_Monitoring this phase until a confirmed price breakout. No trade entries or activation settings are changed._`
         );
 
