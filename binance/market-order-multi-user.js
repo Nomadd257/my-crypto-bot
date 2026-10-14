@@ -723,6 +723,36 @@ async function monitorPriceActionDeltaPhases() {
             phase.lastCandleTime = candle.time;
             phase.high = Math.max(phase.high, candle.high);
             phase.low = Math.min(phase.low, candle.low);
+
+            // Send a progress update every 15 minutes while the phase remains
+            // active. The monitor itself still runs every minute; notifications
+            // are paced using closed 5M candle timestamps.
+            const lastStatusTime = Number.isFinite(phase.lastStatusMessageTime)
+              ? phase.lastStatusMessageTime
+              : phase.startTime;
+            if (candle.time - lastStatusTime >= 15 * 60 * 1000) {
+              const statusStats = getPriceActionPhaseStats(phase.candles);
+              if (statusStats) {
+                const fmtStatus = n => Number(n).toLocaleString("en-US", {
+                  maximumFractionDigits: 4
+                });
+                const elapsedMinutes = Math.max(
+                  5,
+                  Math.round((candle.time - phase.startTime) / 60000) + 5
+                );
+                await sendMessage(
+                  `⏳ *CONSOLIDATION PHASE UPDATE — ${symbol}*\n\n` +
+                  `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 5M candles)\n` +
+                  `Current range: *${fmtStatus(statusStats.low)} – ${fmtStatus(statusStats.high)}* (${statusStats.rangePct.toFixed(2)}%)\n` +
+                  `Aggressive buy volume: *${fmtStatus(statusStats.aggressiveBuyVolume)}*\n` +
+                  `Aggressive sell volume: *${fmtStatus(statusStats.aggressiveSellVolume)}*\n` +
+                  `Net delta (buy − sell): *${fmtStatus(statusStats.netDelta)}*\n` +
+                  `Buy share: *${statusStats.buySharePct.toFixed(1)}%*\n\n` +
+                  `_Phase is still active. Monitoring continues; this update does not trigger or change any trade entry._`
+                );
+              }
+              phase.lastStatusMessageTime = candle.time;
+            }
           }
 
           if (!ended) {
@@ -765,7 +795,8 @@ async function monitorPriceActionDeltaPhases() {
           lastCandleTime: latest.time,
           candles: windowCandles,
           high: stats.high,
-          low: stats.low
+          low: stats.low,
+          lastStatusMessageTime: latest.time
         };
       } catch (err) {
         log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
