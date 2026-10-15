@@ -922,16 +922,16 @@ const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 const SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT = 1.0;
 // High-momentum continuation uses the breakout candle's directional momentum.
 // Candle momentum = signed body / full candle range. A directional BOS at or
-// above 0.50 can enter without waiting for a retest; regime classification is 0.40.
+// above 0.50 can enter without waiting for a retest; regime classification is informational.
 const SCRIPT2_HIGH_MOMENTUM_THRESHOLD = 0.5;
-// Adequate momentum uses the original regime threshold and requires BOS + retest.
+// Adequate directional BOS momentum uses the 0.25 candle threshold and requires BOS + retest.
 const ADEQUATE_MOMENTUM_THRESHOLD = 0.25;
 const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 // BOS candle range/ATR is intentionally not required.
 
-// Global market-activity regime gate. Adequate and high regimes can create
-// new setups; low momentum remains blocked. Direction-neutral.
-const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.40;
+// Global market-activity classification is informational only.
+// HIGH, ADEQUATE, and LOW do not block setup creation or execution.
+const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.40; // informational classification only
 const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.00;
 const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.00;
 const MARKET_REGIME_RECENT_RANGE_CANDLES = 5;
@@ -939,8 +939,8 @@ const MARKET_REGIME_BASELINE_CANDLES = 20;
 const MARKET_REGIME_RECENT_VOLUME_CANDLES = 3;
 const MARKET_REGIME_MIN_SCORE = 2;
 
-// Script 2 entry-zone settings. Price must interact with a detected
-// liquidity level or order block before the 1-candle imbalance is evaluated.
+// Script 2 zone settings are used for informational zone and absorption context.
+// Zone reach is not required before evaluating the 1-candle imbalance.
 const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.10;
 const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 
@@ -1075,13 +1075,20 @@ function getScript2MomentumRegime(closedCandles5) {
 
   const score = [candleMomentumPassed, atrPassed, volumePassed]
     .filter(Boolean).length;
-  const allowed = score >= MARKET_REGIME_MIN_SCORE;
-  const highActivity = allowed && Number.isFinite(candleMomentum) &&
+  const allowed = score >= MARKET_REGIME_MIN_SCORE; // diagnostic only; never used as an entry gate
+  const highActivity = Number.isFinite(candleMomentum) &&
     candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
+  const adequateActivity = score >= MARKET_REGIME_MIN_SCORE ||
+    (Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD);
+  const regime = highActivity
+    ? "HIGH_MOMENTUM"
+    : adequateActivity
+      ? "ADEQUATE_MOMENTUM"
+      : "LOW_MOMENTUM";
 
   return {
     allowed,
-    regime: allowed ? (highActivity ? "HIGH_MOMENTUM" : "ADEQUATE_MOMENTUM") : "LOW_MOMENTUM",
+    regime,
     score,
     candleMomentum,
     atrRatio,
@@ -1119,27 +1126,15 @@ function maybeSendScript2MomentumRegimeCheckpoint(symbol, regime, candleKey) {
     ? regime.volumeRatio.toFixed(2)
     : "N/A";
 
-  if (regime.allowed) {
-    awaitSendScript2Checkpoint(
-      `🟢 *MOMENTUM REGIME PASSED* — *${symbol}*\n` +
-      `📈 Regime: *${regime.regime}*\n` +
-      `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
-      `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
-      `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
-      `🎯 Activity Score: *${scoreText}*\n` +
-      `✅ New reversal/continuation setups allowed`
-    );
-  } else {
-    awaitSendScript2Checkpoint(
-      `⛔ *MOMENTUM GATE FAILED* — *${symbol}*\n` +
-      `📉 Regime: *LOW_MOMENTUM*\n` +
-      `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
-      `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
-      `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
-      `🎯 Activity Score: *${scoreText}* (need ${MARKET_REGIME_MIN_SCORE}/3)\n` +
-      `🚫 No new reversal/continuation setups`
-    );
-  }
+  awaitSendScript2Checkpoint(
+    `📊 *MARKET REGIME UPDATE* — *${symbol}*\n` +
+    `📈 Regime: *${regime.regime.replace(/_MOMENTUM/g, "").replace("HIGH", "HIGH").replace("ADEQUATE", "ADEQUATE").replace("LOW", "LOW")}* (informational only)\n` +
+    `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
+    `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
+    `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
+    `🎯 Activity Score: *${scoreText}/3*\n` +
+    `ℹ️ Market regime does not block setup creation or execution.`
+  );
 }
 
 // ------------------------------------------------------
@@ -2394,9 +2389,9 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
       };
     }
 
-    // Adequate regime uses a lower directional BOS threshold, but requires
-    // a later failed-reclaim retest before the continuation is executable.
-    if (momentumRegime === "ADEQUATE_MOMENTUM" && adequateMomentum) {
+    // Adequate directional BOS momentum uses the lower candle threshold, but
+    // still requires a later failed-reclaim retest before continuation entry.
+    if (adequateMomentum) {
       return {
         status: "BREAK_CONFIRMED",
         latestKey, latestIndex, boundary, candlesSinceCreation,
@@ -4889,9 +4884,8 @@ if (!candles5 || candles5.length < 40) continue;
 // Only CLOSED 5M candles are used for the volume imbalance.
 const closedCandles5 = candles5.slice(0, -1);
 
-// Global market-activity regime. Adequate and high momentum allow new setups;
-// low momentum blocks new setup creation. Staged setups continue through their
-// corresponding BOS-only or BOS-plus-retest confirmation path.
+// Global market-activity regime is informational only. All regimes may create
+// setups; continuation BOS handling uses the breakout candle's own momentum.
 const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
 const script2LatestClosedCandleKey = getScript2CandleKey(
   closedCandles5[closedCandles5.length - 1],
@@ -5067,18 +5061,11 @@ if (script2Zone) {
   // one-time ZONE REACHED Telegram checkpoint is first sent.
   script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
 
-  // If a continuation is already staged, record whether zone pressure has
-  // confirmed its existing delta-selected direction. A reversal remains
-  // governed by absorption and is deliberately not rejected by this check.
+  // Zone volume delta is observational only. Record it for an existing
+  // continuation if available, but never use it to unlock or block execution.
   const stagedSetupForZoneDelta = script2PendingSetups[symbol];
   if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
-    const expectedZoneBias = stagedSetupForZoneDelta.direction === "BUY"
-      ? "BUY-SIDE DOMINANT"
-      : "SELL-SIDE DOMINANT";
-    if (script2ZoneVolumeDelta?.bias === expectedZoneBias) {
-      stagedSetupForZoneDelta.zoneVolumeDeltaConfirmed = true;
-      stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
-    }
+    stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
   }
   const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
   if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
@@ -5091,7 +5078,7 @@ if (script2Zone) {
       `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
       `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
       `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
-      `ℹ️ Continuation requires matching zone pressure; reversals remain absorption-led.`
+      `ℹ️ Zone reach and zone volume delta are informational only; they do not block setup creation.`
     );
   }
 
@@ -5101,10 +5088,8 @@ if (script2Zone) {
   // ---------------------------------------------------
   // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
   // ---------------------------------------------------
-  // The market-regime gate is direction-neutral and applies only to NEW
-  // setup creation. A valid staged setup remains anchored while its BOS or
-  // required retest confirmation is processed.
-  if (script2MomentumRegime.allowed) {
+  // Market regime is informational only; it does not gate reversal setup creation.
+  { // Unconditional: market regime is informational only.
   const atrSide = script2Zone.atrLocation?.side;
   const absorption = detectScript2Absorption(closedCandles5, script2Zone);
   const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
@@ -5144,20 +5129,12 @@ if (script2Zone) {
       atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
       null;
 
-    // Strict order-flow gate applies to REVERSALS too: absorption selects the
-    // reversal direction, but a candidate may only be created when that
-    // direction matches the already-unlocked 15M/5M delta alignment AND the
-    // zone-volume delta supports that same direction.
-    const expectedReversalZoneBias = alignedDeltaDirection === "BUY"
-      ? "BUY-SIDE DOMINANT"
-      : alignedDeltaDirection === "SELL"
-        ? "SELL-SIDE DOMINANT"
-        : null;
+    // Absorption selects reversal direction. It must agree with the already-
+    // unlocked 15M/5M delta direction. Zone volume delta is informational only
+    // and must not delay or reject an otherwise-valid reversal candidate.
     const reversalOrderFlowConfirmed = Boolean(
       reversalDirection &&
-      reversalDirection === alignedDeltaDirection &&
-      expectedReversalZoneBias &&
-      script2ZoneVolumeDelta?.bias === expectedReversalZoneBias
+      reversalDirection === alignedDeltaDirection
     );
 
     if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
@@ -5220,10 +5197,12 @@ if (script2Zone) {
 // The latest CLOSED 5M candle is measured for directional volume imbalance.
 // If imbalance reaches the existing 70% threshold, that SAME candle defines
 // the continuation breakout structure: BUY breaks its high; SELL breaks its low.
-// Both continuation and reversal candidates require zone-volume delta to agree
-// with the unlocked 15M/5M direction. For reversals, absorption still selects
-// direction, but it must also agree with that master direction before a candidate.
-if (script2MomentumRegime.allowed) {
+// Zone reach and zone-volume delta are informational only. Continuation
+// candidates can be created away from a detected zone once the unlocked delta
+// direction and latest closed candle's imbalance agree. Reversals still require
+// their previous-day high/low absorption context.
+// Market regime is informational only; it does not gate continuation setup creation.
+{ // Unconditional: market regime is informational only.
   const existing = script2PendingSetups[symbol];
   const activeContinuation = existing?.setupType === "CONTINUATION";
   const activeReversal = existing?.setupType === "REVERSAL";
@@ -5237,24 +5216,16 @@ if (script2MomentumRegime.allowed) {
       String(closedCandles5.length - 1)
     );
 
-    // Strict sequence: the unlocked 15M/5M delta direction is authoritative;
-    // zone pressure must agree, and the 5M imbalance direction must not
-    // contradict that bias before a continuation candidate can be created.
+    // The unlocked 15M/5M delta direction is authoritative. Zone reach and
+    // zone-volume delta do not gate candidate creation; the latest closed 5M
+    // imbalance direction must simply agree with the unlocked direction.
     const deltaThresholdDirection = deltaGateState.alignmentDirection;
-    const expectedZoneBias = deltaThresholdDirection === "BUY"
-      ? "BUY-SIDE DOMINANT"
-      : deltaThresholdDirection === "SELL"
-        ? "SELL-SIDE DOMINANT"
-        : null;
-    const continuationZoneDeltaConfirmed = Boolean(
-      script2Zone &&
-      script2ZoneVolumeDelta &&
-      expectedZoneBias &&
-      continuationDirection === deltaThresholdDirection &&
-      script2ZoneVolumeDelta.bias === expectedZoneBias
+    const continuationDirectionConfirmed = Boolean(
+      deltaThresholdDirection &&
+      continuationDirection === deltaThresholdDirection
     );
 
-    if (continuationDirection && latestClosedCandle && continuationZoneDeltaConfirmed) {
+    if (continuationDirection && latestClosedCandle && continuationDirectionConfirmed) {
       const structurePrice = continuationDirection === "BUY"
         ? Number(latestClosedCandle.high)
         : Number(latestClosedCandle.low);
@@ -5320,8 +5291,8 @@ if (script2MomentumRegime.allowed) {
 // STEP 3 — ADVANCE A STAGED CONTINUATION
 // -----------------------------------------------------
 // This runs even after price leaves the original zone. Once a candidate
-// exists, the bot watches for BOS without a fixed BOS time limit. High
-// momentum can execute on BOS alone; adequate momentum requires a retest.
+// exists, the bot watches for BOS without a fixed BOS time limit. A BOS candle
+// with directional momentum >= 0.50 can execute directly; >= 0.25 requires retest.
 const confirmedContinuationDirection = await processScript2Continuation(
   symbol,
   closedCandles5,
@@ -5462,7 +5433,7 @@ if (pendingSetup) {
           await sendMessage(
             `🚀 *${modeText} ENTRY EXECUTED* — *${symbol}*\n` +
             `${direction === "BUY" ? "🟢" : "🔴"} *${symbol} ${direction}*\n` +
-            `📈 Market Regime: *${script2MomentumRegime.regime}*\n` +
+            `📈 Market Regime (info only): *${script2MomentumRegime.regime.replace("_MOMENTUM", "")}*\n` +
             `👥 Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
             (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
             (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : "")
