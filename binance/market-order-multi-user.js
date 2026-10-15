@@ -1,5 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// v45: strict order-flow gate — 15M/5M alignment + delta threshold + matching zone-volume delta before any reversal/continuation candidate
 // v36: confirmed opposing 15M OBV divergence auto-closes via the shared /close SYMBOL path; other progress metrics remain advisory
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
@@ -17,7 +18,7 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8627544792:AAHTxmVgoS6xJqSBzBfmAf3wsIDqlzOBWbM";
+const TELEGRAM_BOT_TOKEN = "8853775262:AAHanH1v9ewMRNB4Ek6GfzF9ODtimp6L6_g";
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_NOTIFICATION_IDS = [
   "1718404728", // Existing admin notification recipient
@@ -2708,6 +2709,109 @@ function formatScript2Zone(zone) {
   return `${zone.type}: ${Number(zone.price).toPrecision(8)}`;
 }
 
+// Flux Charts-style volume-delta estimate, applied ONLY to Script 2's
+// already-detected liquidity/order-block zone. Uses closed 5M candles so it
+// does not add Binance requests or change the existing 15M/5M delta unlock.
+// Candle volume is classified by candle direction, matching the indicator's
+// documented chart-timeframe method (not true exchange aggressor-side volume).
+const SCRIPT2_ZONE_DELTA_DOMINANCE_PCT = 55;
+
+function calculateScript2ZoneVolumeDelta(candles, zone) {
+  if (!Array.isArray(candles) || !candles.length || !zone) return null;
+
+  let zoneLow;
+  let zoneHigh;
+
+  if (zone.kind === "ORDER_BLOCK") {
+    zoneLow = Number(zone.low);
+    zoneHigh = Number(zone.high);
+  } else {
+    const level = Number(zone.price);
+    if (!Number.isFinite(level) || level <= 0) return null;
+    const tolerance = level * (SCRIPT2_ZONE_TOLERANCE_PERCENT / 100);
+    zoneLow = level - tolerance;
+    zoneHigh = level + tolerance;
+  }
+
+  if (!Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh) || zoneHigh < zoneLow) {
+    return null;
+  }
+
+  let bullishVolume = 0;
+  let bearishVolume = 0;
+  let touchedCandles = 0;
+
+  // Use the same recent closed 5M candle window used by zone discovery.
+  for (const candle of candles.slice(-SCRIPT2_ZONE_LOOKBACK_CANDLES)) {
+    const open = Number(candle?.open);
+    const close = Number(candle?.close);
+    const high = Number(candle?.high);
+    const low = Number(candle?.low);
+    const volume = Number(candle?.volume);
+
+    if (![open, close, high, low, volume].every(Number.isFinite) || volume < 0) continue;
+    // A candle contributes when its traded range overlaps the active zone band.
+    if (high < zoneLow || low > zoneHigh) continue;
+
+    touchedCandles += 1;
+    if (close > open) bullishVolume += volume;
+    else if (close < open) bearishVolume += volume;
+    else {
+      bullishVolume += volume / 2;
+      bearishVolume += volume / 2;
+    }
+  }
+
+  const totalVolume = bullishVolume + bearishVolume;
+  if (touchedCandles === 0 || totalVolume <= 0) {
+    return {
+      bullishVolume,
+      bearishVolume,
+      totalVolume,
+      touchedCandles,
+      bullishPct: 0,
+      bearishPct: 0,
+      bias: "MIXED",
+      dominantPct: 0
+    };
+  }
+
+  const bullishPct = (bullishVolume / totalVolume) * 100;
+  const bearishPct = (bearishVolume / totalVolume) * 100;
+  const dominantPct = Math.max(bullishPct, bearishPct);
+  const bias = dominantPct < SCRIPT2_ZONE_DELTA_DOMINANCE_PCT
+    ? "MIXED"
+    : bullishPct > bearishPct ? "BUY-SIDE DOMINANT" : "SELL-SIDE DOMINANT";
+
+  return {
+    bullishVolume,
+    bearishVolume,
+    totalVolume,
+    touchedCandles,
+    bullishPct,
+    bearishPct,
+    bias,
+    dominantPct
+  };
+}
+
+function formatScript2ZoneVolumeDelta(delta) {
+  if (!delta) return "📊 Zone volume delta: unavailable";
+  if (delta.touchedCandles === 0 || delta.totalVolume <= 0) {
+    return "📊 Zone volume delta: no recent closed 5M candles overlapped this zone";
+  }
+
+  const biasText = delta.bias === "MIXED"
+    ? `MIXED (no side reached ${SCRIPT2_ZONE_DELTA_DOMINANCE_PCT}%)`
+    : `${delta.bias} (${delta.dominantPct.toFixed(1)}%)`;
+
+  return `📊 *ZONE VOLUME DELTA — 5M*\n` +
+    `🟢 Bullish volume: *${delta.bullishPct.toFixed(1)}%*\n` +
+    `🔴 Bearish volume: *${delta.bearishPct.toFixed(1)}%*\n` +
+    `🧭 Pressure: *${biasText}*\n` +
+    `🕯️ Zone-overlapping candles: *${delta.touchedCandles}*`;
+}
+
 function hasEntryVolumeImbalance(candles, direction) {
   if (!candles || candles.length < 1) return false;
 
@@ -4956,8 +5060,26 @@ const script2Zone = findScript2Zone(
   previousDayHigh,
   previousDayLow
 );
+let script2ZoneVolumeDelta = null;
 
 if (script2Zone) {
+  // Recalculate on every scan while the zone is active, not only when the
+  // one-time ZONE REACHED Telegram checkpoint is first sent.
+  script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
+
+  // If a continuation is already staged, record whether zone pressure has
+  // confirmed its existing delta-selected direction. A reversal remains
+  // governed by absorption and is deliberately not rejected by this check.
+  const stagedSetupForZoneDelta = script2PendingSetups[symbol];
+  if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
+    const expectedZoneBias = stagedSetupForZoneDelta.direction === "BUY"
+      ? "BUY-SIDE DOMINANT"
+      : "SELL-SIDE DOMINANT";
+    if (script2ZoneVolumeDelta?.bias === expectedZoneBias) {
+      stagedSetupForZoneDelta.zoneVolumeDeltaConfirmed = true;
+      stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
+    }
+  }
   const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
   if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
     script2CheckpointState[symbol] = { zoneKey: zoneCheckpointKey, zoneNotified: false };
@@ -4967,7 +5089,9 @@ if (script2Zone) {
     await sendMessage(
       `📍 *ZONE REACHED* — *${symbol}*\n` +
       `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
-      `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}`
+      `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
+      `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
+      `ℹ️ Continuation requires matching zone pressure; reversals remain absorption-led.`
     );
   }
 
@@ -5020,7 +5144,23 @@ if (script2Zone) {
       atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
       null;
 
-    if (reversalDirection && !activeContinuationSetup) {
+    // Strict order-flow gate applies to REVERSALS too: absorption selects the
+    // reversal direction, but a candidate may only be created when that
+    // direction matches the already-unlocked 15M/5M delta alignment AND the
+    // zone-volume delta supports that same direction.
+    const expectedReversalZoneBias = alignedDeltaDirection === "BUY"
+      ? "BUY-SIDE DOMINANT"
+      : alignedDeltaDirection === "SELL"
+        ? "SELL-SIDE DOMINANT"
+        : null;
+    const reversalOrderFlowConfirmed = Boolean(
+      reversalDirection &&
+      reversalDirection === alignedDeltaDirection &&
+      expectedReversalZoneBias &&
+      script2ZoneVolumeDelta?.bias === expectedReversalZoneBias
+    );
+
+    if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
       const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
 
       await sendMessage(
@@ -5080,7 +5220,9 @@ if (script2Zone) {
 // The latest CLOSED 5M candle is measured for directional volume imbalance.
 // If imbalance reaches the existing 70% threshold, that SAME candle defines
 // the continuation breakout structure: BUY breaks its high; SELL breaks its low.
-// This applies only to continuation. Reversal/absorption logic is unchanged.
+// Both continuation and reversal candidates require zone-volume delta to agree
+// with the unlocked 15M/5M direction. For reversals, absorption still selects
+// direction, but it must also agree with that master direction before a candidate.
 if (script2MomentumRegime.allowed) {
   const existing = script2PendingSetups[symbol];
   const activeContinuation = existing?.setupType === "CONTINUATION";
@@ -5095,7 +5237,24 @@ if (script2MomentumRegime.allowed) {
       String(closedCandles5.length - 1)
     );
 
-    if (continuationDirection && latestClosedCandle) {
+    // Strict sequence: the unlocked 15M/5M delta direction is authoritative;
+    // zone pressure must agree, and the 5M imbalance direction must not
+    // contradict that bias before a continuation candidate can be created.
+    const deltaThresholdDirection = deltaGateState.alignmentDirection;
+    const expectedZoneBias = deltaThresholdDirection === "BUY"
+      ? "BUY-SIDE DOMINANT"
+      : deltaThresholdDirection === "SELL"
+        ? "SELL-SIDE DOMINANT"
+        : null;
+    const continuationZoneDeltaConfirmed = Boolean(
+      script2Zone &&
+      script2ZoneVolumeDelta &&
+      expectedZoneBias &&
+      continuationDirection === deltaThresholdDirection &&
+      script2ZoneVolumeDelta.bias === expectedZoneBias
+    );
+
+    if (continuationDirection && latestClosedCandle && continuationZoneDeltaConfirmed) {
       const structurePrice = continuationDirection === "BUY"
         ? Number(latestClosedCandle.high)
         : Number(latestClosedCandle.low);
@@ -5134,6 +5293,8 @@ if (script2MomentumRegime.allowed) {
           liquidityNotified: false,
           volumeImbalanceNotified: false,
           candidateNotified: false,
+          zoneVolumeDeltaConfirmed: true,
+          zoneVolumeDelta: script2ZoneVolumeDelta,
           volumeImbalance
         };
 
@@ -5198,10 +5359,15 @@ const pendingSetup = script2PendingSetups[symbol];
 if (pendingSetup) {
   // Continuations are executable after high-momentum BOS or after the
   // adequate-momentum BOS + failed-reclaim retest sequence.
-  const continuationReady =
+  const continuationZoneDeltaReady =
     pendingSetup.setupType !== "CONTINUATION" ||
-    pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" ||
-    pendingSetup.stage === "RETEST_CONFIRMED";
+    pendingSetup.zoneVolumeDeltaConfirmed === true;
+  const continuationReady =
+    continuationZoneDeltaReady && (
+      pendingSetup.setupType !== "CONTINUATION" ||
+      pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" ||
+      pendingSetup.stage === "RETEST_CONFIRMED"
+    );
 
   const setupDirection = pendingSetup.direction;
 
