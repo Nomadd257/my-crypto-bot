@@ -10,6 +10,9 @@
 // =====================================================
 
 const config = require("../config");
+// Load secrets from the project-root .env file (one directory above this script).
+// Keep .env out of version control and never log its contents.
+require("dotenv").config({ path: require("path").resolve(__dirname, "../.env") });
 const Binance = require("node-binance-api");
 const TelegramBot = require("node-telegram-bot-api");
 const { ADX } = require("technicalindicators");
@@ -18,7 +21,10 @@ const fetch = require("node-fetch");
 globalThis.fetch = fetch;
 
 // --- TELEGRAM DETAILS ---
-const TELEGRAM_BOT_TOKEN = "8853775262:AAHanH1v9ewMRNB4Ek6GfzF9ODtimp6L6_g";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_BOT_TOKEN.trim()) {
+  throw new Error("TELEGRAM_BOT_TOKEN is missing. Set it in the project-root .env file.");
+}
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_NOTIFICATION_IDS = [
   "1718404728", // Existing admin notification recipient
