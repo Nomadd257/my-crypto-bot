@@ -4668,10 +4668,12 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 // Stage 1: 15M and 5M Delta must agree directionally relative to their own
 // Delta MAs. Send one Telegram message when a new alignment event begins.
 // Stage 2: the existing adaptive strength threshold must be met by the 5M
-// Delta before Script 2 setup creation/execution is unlocked.
-// If alignment breaks before confirmation, cancel the pending confirmation.
-// Once confirmed, the unlock remains valid only while the two timeframes
-// continue to align. All inputs below use CLOSED candles only.
+// Delta before creating NEW Script 2 setups. Once a continuation candidate
+// exists, keep monitoring its anchored BOS/retest state even if alignment
+// later weakens; delta unlock must not interrupt an already-staged candidate.
+// All delta inputs below use CLOSED candles only.
+const activeContinuationBeforeDeltaGate =
+  script2PendingSetups[symbol]?.setupType === "CONTINUATION";
 const closedCandles15ForDelta =
   candles15ForAbsorption && candles15ForAbsorption.length > 1
     ? candles15ForAbsorption.slice(0, -1)
@@ -4679,15 +4681,19 @@ const closedCandles15ForDelta =
 
 if (!closedCandles15ForDelta || closedCandles15ForDelta.length < 30) {
   script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  continue;
+  if (!activeContinuationBeforeDeltaGate) continue;
+  log(`ℹ️ ${symbol}: 15M delta data unavailable; continuing monitoring of existing continuation setup.`);
 }
 
-const delta15ForGate = calculateTrendResetCumulativeDelta(closedCandles15ForDelta);
+const delta15ForGate = closedCandles15ForDelta && closedCandles15ForDelta.length >= 30
+  ? calculateTrendResetCumulativeDelta(closedCandles15ForDelta)
+  : null;
 const delta5ForGate = calculateTrendResetCumulativeDelta(closedCandles5);
 
 if (!delta15ForGate || !delta5ForGate) {
   script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  continue;
+  if (!activeContinuationBeforeDeltaGate) continue;
+  log(`ℹ️ ${symbol}: delta unavailable; continuing monitoring of existing continuation setup.`);
 }
 
 const getDeltaPositionDirection = (delta) => {
@@ -4696,8 +4702,8 @@ const getDeltaPositionDirection = (delta) => {
   return null;
 };
 
-const delta15Direction = getDeltaPositionDirection(delta15ForGate);
-const delta5Direction = getDeltaPositionDirection(delta5ForGate);
+const delta15Direction = delta15ForGate ? getDeltaPositionDirection(delta15ForGate) : null;
+const delta5Direction = delta5ForGate ? getDeltaPositionDirection(delta5ForGate) : null;
 const alignedDeltaDirection =
   delta15Direction && delta15Direction === delta5Direction
     ? delta15Direction
@@ -4710,16 +4716,18 @@ let deltaGateState = script2DeltaGateState[symbol] || {
 
 if (!alignedDeltaDirection) {
   if (deltaGateState.alignmentDirection && !deltaGateState.confirmed) {
-    log(`⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending confirmation cancelled.`);
+    log(`⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending NEW-SETUP confirmation cancelled.`);
   }
   script2DeltaGateState[symbol] = {
     alignmentDirection: null,
     confirmed: false
   };
-  continue;
+  deltaGateState = script2DeltaGateState[symbol];
+  if (!activeContinuationBeforeDeltaGate) continue;
+  log(`ℹ️ ${symbol}: 15M/5M delta alignment is currently absent; monitoring existing continuation BOS/retest anyway.`);
 }
 
-if (deltaGateState.alignmentDirection !== alignedDeltaDirection) {
+if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaDirection) {
   deltaGateState = {
     alignmentDirection: alignedDeltaDirection,
     confirmed: false,
@@ -4731,6 +4739,7 @@ if (deltaGateState.alignmentDirection !== alignedDeltaDirection) {
   // directional Delta alignment event.
   if (
     script2PendingSetups[symbol] &&
+    script2PendingSetups[symbol].setupType !== "CONTINUATION" &&
     script2PendingSetups[symbol].direction !== alignedDeltaDirection
   ) {
     delete script2PendingSetups[symbol];
@@ -4748,9 +4757,11 @@ if (deltaGateState.alignmentDirection !== alignedDeltaDirection) {
 
 // The 5M threshold is the second-stage confirmation. It is evaluated only
 // after directional 15M/5M alignment has been established.
-const delta5StrengthConfirmed = alignedDeltaDirection === "BUY"
-  ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-  : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
+const delta5StrengthConfirmed = Boolean(delta5ForGate && alignedDeltaDirection) && (
+  alignedDeltaDirection === "BUY"
+    ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+    : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
+);
 
 if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
   deltaGateState.confirmed = true;
@@ -4766,10 +4777,17 @@ if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
   );
 }
 
-if (!deltaGateState.confirmed) {
+if (!deltaGateState.confirmed && !activeContinuationBeforeDeltaGate) {
   continue;
 }
 
+if (!deltaGateState.confirmed && activeContinuationBeforeDeltaGate) {
+  log(`ℹ️ ${symbol}: delta gate is not currently confirmed; new setup creation remains locked, existing continuation monitoring stays active.`);
+}
+
+// Existing candidates may be monitored without a live delta unlock, but
+// new reversal/continuation candidates must still pass the master delta gate.
+if (deltaGateState.confirmed) {
 // -----------------------------------------------------
 // STEP 1 — ZONE REACH
 // -----------------------------------------------------
@@ -5022,6 +5040,8 @@ if (script2Zone) {
   }
 }
 
+} // End new-setup creation gate. Existing staged continuation still advances below.
+
 // -----------------------------------------------------
 // STEP 3 — ADVANCE A STAGED CONTINUATION
 // -----------------------------------------------------
@@ -5175,8 +5195,21 @@ if (pendingSetup) {
           );
         }
 
-        delete script2PendingSetups[symbol];
-        symbolCooldowns[symbol] = now;
+        if (executionResult.executed > 0) {
+          delete script2PendingSetups[symbol];
+          symbolCooldowns[symbol] = now;
+        } else {
+          log(`⚠️ ${symbol}: no user order executed (${executionResult.attempted || 0} attempted, ${executionResult.failed || 0} failed, ${executionResult.skipped || 0} skipped). Keeping setup active and not starting cooldown so the opportunity is not silently consumed.`);
+          if (!setupForReport.orderFailureNotified) {
+            setupForReport.orderFailureNotified = true;
+            await sendMessage(
+              `⚠️ *ENTRY NOT COMPLETED — SETUP RETAINED* — *${symbol}*\n` +
+              `Direction: *${direction}*\n` +
+              `👥 Attempted: ${executionResult.attempted || 0} | Failed: ${executionResult.failed || 0} | Skipped: ${executionResult.skipped || 0}\n` +
+              `🔁 Setup retained; cooldown not started. Check the user/order error logs.`
+            );
+          }
+        }
       }
     } catch (err) {
       log(`❌ Script 2 scan error ${symbol}: ${err?.message || err}`);
