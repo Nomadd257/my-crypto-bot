@@ -1,5 +1,7 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// v51: adds admin-only /manualtrade SYMBOL command — aligned 15M/5M delta direction → 5M OBV → liquidity → normal multi-user execution
+// v50: keeps monitoring staged continuation BOS/retest candidates when delta alignment weakens; retains setup if no user order executes
 // v45: strict order-flow gate — 15M/5M alignment + delta threshold + matching zone-volume delta before any reversal/continuation candidate
 // v36: confirmed opposing 15M OBV divergence auto-closes via the shared /close SYMBOL path; other progress metrics remain advisory
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
@@ -7802,6 +7804,146 @@ function isAdmin(msg) {
 }
 
 // --- Telegram commands ---
+
+// Manual recovery entry for a setup that was already unlocked but missed
+// automatic execution. Direction is derived ONLY from current CLOSED 15M/5M
+// trend-reset cumulative-delta alignment. Then run 5M OBV, public liquidity,
+// and the existing normal multi-user order execution in that order.
+// Usage: /manualtrade BTCUSDT
+bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match) => {
+  if (!isAdmin(msg)) return;
+
+  const reply = async (text) => {
+    try {
+      await bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+    } catch (err) {
+      log(`Manual-trade reply failed: ${err?.message || err}`);
+    }
+  };
+
+  const symbol = String(match?.[1] || "").toUpperCase();
+  if (!symbol.endsWith("USDT")) {
+    await reply("⚠️ Use a USDT perpetual symbol, for example `/manualtrade BTCUSDT`.");
+    return;
+  }
+
+  // Avoid opening a duplicate exposure or overwriting a currently tracked
+  // position for this symbol. The normal executor persists positions by symbol.
+  if (activePositions[symbol] && Object.keys(activePositions[symbol]).length > 0) {
+    await reply(`⛔ *${symbol}* already has a tracked open position. Manual entry cancelled to avoid duplicate exposure.`);
+    return;
+  }
+
+  await reply(`🛠️ *Manual trade check started — ${symbol}*\n1️⃣ Checking closed 15M/5M Delta alignment…`);
+
+  try {
+    const [candles15, candles5] = await Promise.all([
+      fetchFuturesKlines(symbol, "15m", 60),
+      fetchFuturesKlines(symbol, "5m", 150),
+    ]);
+
+    if (!candles15 || candles15.length < 31 || !candles5 || candles5.length < 31) {
+      await reply(`⛔ *${symbol}* manual trade cancelled: insufficient candle data to confirm 15M/5M Delta alignment.`);
+      return;
+    }
+
+    const closed15 = candles15.slice(0, -1);
+    const closed5 = candles5.slice(0, -1);
+    const delta15 = calculateTrendResetCumulativeDelta(closed15);
+    const delta5 = calculateTrendResetCumulativeDelta(closed5);
+
+    if (!delta15 || !delta5) {
+      await reply(`⛔ *${symbol}* manual trade cancelled: Delta calculation is unavailable on 15M or 5M.`);
+      return;
+    }
+
+    const getPositionDirection = (delta) => {
+      if (delta.cumDelta > 0 && delta.cumDelta > delta.deltaMA) return "BUY";
+      if (delta.cumDelta < 0 && delta.cumDelta < delta.deltaMA) return "SELL";
+      return null;
+    };
+
+    const direction15 = getPositionDirection(delta15);
+    const direction5 = getPositionDirection(delta5);
+    if (!direction15 || direction15 !== direction5) {
+      await reply(
+        `⛔ *${symbol}* manual trade cancelled: 15M/5M Delta are not aligned.\n` +
+        `• 15M: ${direction15 || "NEUTRAL"}\n• 5M: ${direction5 || "NEUTRAL"}`
+      );
+      return;
+    }
+
+    const direction = direction15;
+    await reply(
+      `✅ *${symbol} — Delta alignment confirmed: ${direction}*\n` +
+      `• 15M CumDelta: ${delta15.cumDelta.toFixed(2)} | MA: ${delta15.deltaMA.toFixed(2)}\n` +
+      `• 5M CumDelta: ${delta5.cumDelta.toFixed(2)} | MA: ${delta5.deltaMA.toFixed(2)}\n` +
+      `2️⃣ Checking 5M OBV in the aligned direction…`
+    );
+
+    // The manual command intentionally skips the automatic setup/BOS/retest,
+    // volume-imbalance and delta-strength triggers. OBV must still agree.
+    if (!calculateOBVConfirmation(closed5, direction)) {
+      await reply(
+        `⛔ *${symbol}* manual trade cancelled: 5M OBV does not confirm *${direction}*.\n` +
+        `Expected OBV ${direction === "BUY" ? "above" : "below"} its ${OBV_EMA_LENGTH}-EMA.`
+      );
+      return;
+    }
+
+    await reply(`✅ *${symbol} — 5M OBV passed.*\n3️⃣ Checking market liquidity…`);
+
+    // Match the normal liquidity gate's estimate of aggregate user order size.
+    let estimatedTradeNotional = 0;
+    for (const client of Object.values(userClients)) {
+      try {
+        const balances = await client.futuresBalance();
+        const usdtBal = balances.find((b) => b.asset === "USDT");
+        const balance = usdtBal ? Number(usdtBal.balance) : 0;
+        if (Number.isFinite(balance) && balance > 0) {
+          estimatedTradeNotional += balance * TRADE_PERCENT;
+        }
+      } catch (err) {
+        log(`Manual-trade liquidity size estimate failed for one account: ${err?.message || err}`);
+      }
+    }
+
+    const liquidity = await checkLiquidity(symbol, direction, estimatedTradeNotional);
+    if (!liquidity.passed) {
+      await reply(
+        `⛔ *${symbol}* manual trade cancelled: liquidity check failed.\n` +
+        `Reason: ${liquidity.reason}\n` +
+        `Spread: ${Number.isFinite(liquidity.spreadPct) ? `${liquidity.spreadPct.toFixed(3)}%` : "N/A"}\n` +
+        `24H volume: ${Number.isFinite(liquidity.quoteVolume24h) ? `${liquidity.quoteVolume24h.toLocaleString()} USDT` : "N/A"}`
+      );
+      return;
+    }
+
+    await reply(`✅ *${symbol} — liquidity passed.*\n4️⃣ Executing using the normal multi-user order function…`);
+    const executionResult = await executeMarketOrderForAllUsers(symbol, direction);
+
+    if (executionResult.executed > 0) {
+      const resultText =
+        `🚀 *MANUAL TRADE EXECUTED — ${symbol}*\n` +
+        `Direction: *${direction}*\n` +
+        `Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
+        (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
+        (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : "") +
+        `\n\nChecks passed in order: 15M/5M Delta alignment → 5M OBV → liquidity.`;
+      await reply(resultText);
+      await sendMessage(resultText);
+    } else {
+      await reply(
+        `⚠️ *${symbol} ${direction}: no orders were executed.*\n` +
+        `Attempted: ${executionResult.attempted} | Failed: ${executionResult.failed} | Skipped: ${executionResult.skipped}.\n` +
+        `Check the bot logs and user balances/limits before retrying.`
+      );
+    }
+  } catch (err) {
+    log(`Manual trade command failed for ${symbol}: ${err?.message || err}`);
+    await reply(`❌ *${symbol}* manual trade failed safely: ${err?.message || "unexpected error"}. No further execution was attempted.`);
+  }
+});
 
 // Pause bot completely
 bot.onText(/\/pause/, async (msg) => {
