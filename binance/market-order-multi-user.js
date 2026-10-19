@@ -1,5 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// v52: classifies post-consolidation breakouts as REAL EXPANSION or MARKET NOISE with Telegram alerts; preserves the consolidation detector and v51 manual trade command
 // v51: adds admin-only /manualtrade SYMBOL command — aligned 15M/5M delta direction → 5M OBV → liquidity → normal multi-user execution
 // v50: keeps monitoring staged continuation BOS/retest candidates when delta alignment weakens; retains setup if no user order executes
 // v45: strict order-flow gate — 15M/5M alignment + delta threshold + matching zone-volume delta before any reversal/continuation candidate
@@ -30,7 +31,7 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_BOT_TOKEN.trim()) {
 const GROUP_CHAT_ID = "-1003419090746";
 const ADMIN_NOTIFICATION_IDS = [
   "1718404728", // Existing admin notification recipient
-  "6907653103"  // Additional admin: receives bot information and alerts
+  "6907653103", // Additional admin: receives bot information and alerts
 ];
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
@@ -62,14 +63,14 @@ const LIQUIDITY_MIN_BOOK_DEPTH_USDT = 25_000;
 const SL_LIQUIDITY_LOOKBACK_CANDLES = 48;
 const SL_LIQUIDITY_SWING_STRENGTH = 2;
 const SL_LIQUIDITY_NEAR_PERCENT = 0.25;
-const SL_LIQUIDITY_INSIDE_PERCENT = 0.10;
-const SL_LIQUIDITY_EQUAL_LEVEL_PERCENT = 0.10;
+const SL_LIQUIDITY_INSIDE_PERCENT = 0.1;
+const SL_LIQUIDITY_EQUAL_LEVEL_PERCENT = 0.1;
 const SL_LIQUIDITY_ORDER_BOOK_LEVELS = 20;
-const SL_LIQUIDITY_ORDER_BOOK_NEAR_PERCENT = 0.20;
+const SL_LIQUIDITY_ORDER_BOOK_NEAR_PERCENT = 0.2;
 const SL_ORDER_BLOCK_LOOKBACK_CANDLES = 36;
 const SL_ORDER_BLOCK_DISPLACEMENT_MULTIPLIER = 1.5;
 const SL_ORDER_BLOCK_NEAR_PERCENT = 0.25;
-const SL_ORDER_BLOCK_INSIDE_PERCENT = 0.10;
+const SL_ORDER_BLOCK_INSIDE_PERCENT = 0.1;
 
 // --- Absorption warnings ---
 // Absorption threshold for reversal setups. A reversal cannot proceed until
@@ -183,7 +184,9 @@ function loadActivePositions() {
 
     log(`♻️ Restored ${restored} active trade record(s) from ${ACTIVE_TRADES_FILE}.`);
     if (restored > 0) {
-      sendMessage(`♻️ *TRADE STATE RESTORED*\n\nRecovered *${restored}* active trade record(s) from local JSON after restart.`).catch(() => {});
+      sendMessage(
+        `♻️ *TRADE STATE RESTORED*\n\nRecovered *${restored}* active trade record(s) from local JSON after restart.`,
+      ).catch(() => {});
     }
   } catch (err) {
     log(`❌ loadActivePositions error: ${err?.message || err}`);
@@ -195,7 +198,7 @@ function getTradeHistoryDate() {
     timeZone: "Africa/Lagos",
     year: "numeric",
     month: "2-digit",
-    day: "2-digit"
+    day: "2-digit",
   }).format(new Date());
 }
 
@@ -207,7 +210,7 @@ function getTradeHistoryDate() {
 // session. This is separate from /activate and /deactivate.
 // =====================================================
 let priceActivationLevels = {}; // { BTCUSDT: 105000 }
-let priceActivated = {};         // { BTCUSDT: true }
+let priceActivated = {}; // { BTCUSDT: true }
 let priceActivationPreviousPrice = {}; // { BTCUSDT: 104900 }
 
 // --- STC cycle trackers ---
@@ -227,9 +230,9 @@ const HTF_ABSORPTION_LOOKBACK_CANDLES = 4;
 const HTF_ABSORPTION_BASELINE_VOLUME_CANDLES = 20;
 const HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES = 3;
 const HTF_ABSORPTION_MIN_PRESSURE_RATIO = 0.25;
-const HTF_ABSORPTION_MIN_RELATIVE_VOLUME = 0.80;
+const HTF_ABSORPTION_MIN_RELATIVE_VOLUME = 0.8;
 const HTF_ABSORPTION_MAX_NET_MOVE_ATR = 0.75;
-const HTF_ABSORPTION_MAX_RANGE_ATR = 2.50;
+const HTF_ABSORPTION_MAX_RANGE_ATR = 2.5;
 const HTF_ABSORPTION_CONTEXT_TTL_MS = 48 * 60 * 60 * 1000;
 let MANUAL_CYCLE = null; // "BULL" | "BEAR" | null
 
@@ -323,7 +326,7 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
       volume: +c[5],
       quoteVolume: +c[7],
       takerBuyVolume: +c[9],
-      takerBuyQuoteVolume: +c[10]
+      takerBuyQuoteVolume: +c[10],
     }));
   } catch (err) {
     log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message || err}`);
@@ -341,11 +344,129 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
 // established range by the breakout buffer. The breakout candle itself
 // is excluded from the phase-volume totals.
 // ======================================================
-const PA_DELTA_PHASE_MIN_CANDLES = 6;             // six closed 15M candles (90 minutes)
-const PA_DELTA_PHASE_MAX_RANGE_PCT = 1.20;        // initial 6-candle compression range
-const PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT = 0.15;  // close must clear range by this %
+const PA_DELTA_PHASE_MIN_CANDLES = 6; // six closed 15M candles (90 minutes)
+const PA_DELTA_PHASE_MAX_RANGE_PCT = 1.2; // initial 6-candle compression range
+const PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT = 0.15; // close must clear range by this %
 const PA_DELTA_PHASE_COOLDOWN_MS = 15 * 60 * 1000;
 const PA_DELTA_PHASE_MONITOR_MS = 60 * 1000;
+
+// ======================================================
+// POST-CONSOLIDATION EXPANSION VS NOISE CLASSIFIER
+// Informational only: does not change consolidation detection or trade entries.
+// Uses the closed 5M candle inside the 15M breakout candle and compares it
+// with the prior 20 closed 5M candles for volatility and volume baselines.
+// ======================================================
+const EXPANSION_BASELINE_CANDLES = 20;
+const EXPANSION_MIN_RANGE_TO_ATR = 1.2;
+const EXPANSION_MIN_VOLUME_MULTIPLE = 1.5;
+const EXPANSION_MIN_BODY_TO_RANGE = 0.55;
+const EXPANSION_CLOSE_EDGE_FRACTION = 0.25;
+const EXPANSION_MIN_SCORE = 3;
+
+function getCandleTrueRange(candle, previousClose) {
+  if (!candle || !Number.isFinite(candle.high) || !Number.isFinite(candle.low) || !Number.isFinite(previousClose))
+    return null;
+  return Math.max(
+    candle.high - candle.low,
+    Math.abs(candle.high - previousClose),
+    Math.abs(candle.low - previousClose),
+  );
+}
+
+async function classifyPostConsolidationExpansion(symbol, breakout15mCandle, direction, phaseStats) {
+  const raw5m = await fetchFuturesKlines(symbol, "5m", 100);
+  if (!Array.isArray(raw5m) || raw5m.length < EXPANSION_BASELINE_CANDLES + 5) {
+    await sendMessage(
+      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
+        `The consolidation breakout was detected as *${direction}*, but there was insufficient 5M candle data to separate expansion from noise.\n` +
+        `_The consolidation detector is unchanged; no trade was triggered by this classifier._`,
+    );
+    return null;
+  }
+
+  const closed5m = raw5m.slice(0, -1); // never classify with a forming candle
+  const breakoutStart = breakout15mCandle.time;
+  const breakoutEnd = breakoutStart + 15 * 60 * 1000;
+  const windowCandles = closed5m.filter((c) => c.time >= breakoutStart && c.time < breakoutEnd);
+  const breakoutCandle = windowCandles[windowCandles.length - 1];
+
+  if (!breakoutCandle || !Number.isFinite(breakoutCandle.close)) {
+    await sendMessage(
+      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
+        `Could not identify a closed 5M candle inside the detected 15M breakout window. No classification was guessed.`,
+    );
+    return null;
+  }
+
+  const prior = closed5m.filter((c) => c.time < breakoutCandle.time).slice(-EXPANSION_BASELINE_CANDLES);
+  if (prior.length < EXPANSION_BASELINE_CANDLES) {
+    await sendMessage(
+      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
+        `The consolidation breakout was detected as *${direction}*, but only ${prior.length}/${EXPANSION_BASELINE_CANDLES} prior closed 5M candles were available for the baseline. No classification was guessed.\n` +
+        `_The consolidation detector and trade-entry logic are unchanged._`,
+    );
+    return null;
+  }
+
+  const priorRanges = [];
+  for (let i = 0; i < prior.length; i++) {
+    const priorIndex = closed5m.indexOf(prior[i]);
+    const prevClose = i > 0 ? prior[i - 1].close : closed5m[priorIndex - 1]?.close;
+    const tr = getCandleTrueRange(prior[i], prevClose);
+    if (Number.isFinite(tr)) priorRanges.push(tr);
+  }
+  if (priorRanges.length < EXPANSION_BASELINE_CANDLES - 1) {
+    await sendMessage(
+      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
+        `The consolidation breakout was detected as *${direction}*, but only ${priorRanges.length}/${EXPANSION_BASELINE_CANDLES - 1} valid prior true-range values were available for the baseline. No classification was guessed.\n` +
+        `_The consolidation detector and trade-entry logic are unchanged._`,
+    );
+    return null;
+  }
+
+  const baselineAtr = priorRanges.reduce((sum, value) => sum + value, 0) / priorRanges.length;
+  const breakoutTrueRange = getCandleTrueRange(breakoutCandle, prior[prior.length - 1].close);
+  const atrMultiple = baselineAtr > 0 && Number.isFinite(breakoutTrueRange) ? breakoutTrueRange / baselineAtr : 0;
+  const averageVolume = prior.reduce((sum, c) => sum + Math.max(0, c.volume || 0), 0) / prior.length;
+  const volumeMultiple = averageVolume > 0 ? breakoutCandle.volume / averageVolume : 0;
+  const candleRange = breakoutCandle.high - breakoutCandle.low;
+  const bodyToRange = candleRange > 0 ? Math.abs(breakoutCandle.close - breakoutCandle.open) / candleRange : 0;
+  const closePosition = candleRange > 0 ? (breakoutCandle.close - breakoutCandle.low) / candleRange : 0.5;
+  const directionalClosePassed =
+    direction === "UPWARD"
+      ? closePosition >= 1 - EXPANSION_CLOSE_EDGE_FRACTION
+      : closePosition <= EXPANSION_CLOSE_EDGE_FRACTION;
+  const rangePassed = atrMultiple >= EXPANSION_MIN_RANGE_TO_ATR;
+  const volumePassed = volumeMultiple >= EXPANSION_MIN_VOLUME_MULTIPLE;
+  const bodyPassed = bodyToRange >= EXPANSION_MIN_BODY_TO_RANGE;
+  const checksPassed = [rangePassed, volumePassed, bodyPassed, directionalClosePassed].filter(Boolean).length;
+  // Require 3 of 4 confirmations and at least one of the two activity measures.
+  const isRealExpansion = checksPassed >= EXPANSION_MIN_SCORE && (rangePassed || volumePassed);
+  const classification = isRealExpansion ? "REAL EXPANSION" : "MARKET NOISE / UNCONFIRMED BREAKOUT";
+  const emoji = isRealExpansion ? "🚀" : "⚠️";
+  const fmt = (value) => (Number.isFinite(value) ? value.toFixed(2) : "N/A");
+  const rangeText =
+    phaseStats && Number.isFinite(phaseStats.low) && Number.isFinite(phaseStats.high)
+      ? `${phaseStats.low} – ${phaseStats.high}`
+      : "N/A";
+
+  await sendMessage(
+    `${emoji} *${classification} — ${symbol}*\n\n` +
+      `15M breakout direction: *${direction}*\n` +
+      `Breakout candle close: *${breakoutCandle.close}*\n` +
+      `Prior consolidation range: *${rangeText}*\n\n` +
+      `• 5M range / baseline ATR: *${fmt(atrMultiple)}x* ${rangePassed ? "✅" : "❌"} (need ≥ ${EXPANSION_MIN_RANGE_TO_ATR.toFixed(2)}x)\n` +
+      `• 5M volume / prior average: *${fmt(volumeMultiple)}x* ${volumePassed ? "✅" : "❌"} (need ≥ ${EXPANSION_MIN_VOLUME_MULTIPLE.toFixed(2)}x)\n` +
+      `• Candle body / range: *${(bodyToRange * 100).toFixed(1)}%* ${bodyPassed ? "✅" : "❌"} (need ≥ ${(EXPANSION_MIN_BODY_TO_RANGE * 100).toFixed(0)}%)\n` +
+      `• Close near ${direction === "UPWARD" ? "high" : "low"}: *${(closePosition * 100).toFixed(1)}% from candle low* ${directionalClosePassed ? "✅" : "❌"}\n` +
+      `• Confirmations: *${checksPassed}/4*\n\n` +
+      (isRealExpansion
+        ? `_Volatility, participation and candle structure support genuine expansion. This is a classifier, not a guarantee of continuation._`
+        : `_The move lacks enough confirmation and is classified as noise/unconfirmed. Avoid treating this alert alone as an entry signal._`),
+  );
+
+  return { isRealExpansion, checksPassed, atrMultiple, volumeMultiple, bodyToRange, directionalClosePassed };
+}
 
 function getPriceActionPhaseStats(candles) {
   if (!Array.isArray(candles) || !candles.length) return null;
@@ -361,15 +482,13 @@ function getPriceActionPhaseStats(candles) {
       !Number.isFinite(candle.low) ||
       !Number.isFinite(candle.volume) ||
       !Number.isFinite(candle.takerBuyVolume)
-    ) return null;
+    )
+      return null;
 
     high = Math.max(high, candle.high);
     low = Math.min(low, candle.low);
     totalVolume += Math.max(0, candle.volume);
-    aggressiveBuyVolume += Math.min(
-      Math.max(0, candle.volume),
-      Math.max(0, candle.takerBuyVolume)
-    );
+    aggressiveBuyVolume += Math.min(Math.max(0, candle.volume), Math.max(0, candle.takerBuyVolume));
   }
 
   const aggressiveSellVolume = Math.max(0, totalVolume - aggressiveBuyVolume);
@@ -383,10 +502,8 @@ function getPriceActionPhaseStats(candles) {
     aggressiveBuyVolume,
     aggressiveSellVolume,
     netDelta,
-    buySharePct: totalAggressorVolume > 0
-      ? (aggressiveBuyVolume / totalAggressorVolume) * 100
-      : 0,
-    rangePct: low > 0 ? ((high - low) / low) * 100 : 0
+    buySharePct: totalAggressorVolume > 0 ? (aggressiveBuyVolume / totalAggressorVolume) * 100 : 0,
+    rangePct: low > 0 ? ((high - low) / low) * 100 : 0,
   };
 }
 
@@ -414,7 +531,7 @@ async function monitorPriceActionDeltaPhases() {
         }
 
         if (phase && Array.isArray(phase.candles)) {
-          const newCandles = closedCandles.filter(c => c.time > phase.lastCandleTime);
+          const newCandles = closedCandles.filter((c) => c.time > phase.lastCandleTime);
           let ended = false;
 
           for (const candle of newCandles) {
@@ -426,30 +543,45 @@ async function monitorPriceActionDeltaPhases() {
               const stats = getPriceActionPhaseStats(phase.candles);
               const durationMinutes = Math.max(
                 15,
-                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 15
+                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 15,
               );
 
               if (stats) {
-                const fmt = n => Number(n).toLocaleString("en-US", {
-                  maximumFractionDigits: 4
-                });
+                const fmt = (n) =>
+                  Number(n).toLocaleString("en-US", {
+                    maximumFractionDigits: 4,
+                  });
                 await sendMessage(
                   `📦 *CONSOLIDATION PHASE COMPLETED — ${symbol}*\n\n` +
-                  `Price-action breakout: *${direction}*\n` +
-                  `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
-                  `Range: *${fmt(stats.low)} – ${fmt(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
-                  `Total traded volume: *${fmt(stats.totalVolume)}*\n\n` +
-                  `Aggressive buy volume: *${fmt(stats.aggressiveBuyVolume)}*\n` +
-                  `Aggressive sell volume: *${fmt(stats.aggressiveSellVolume)}*\n` +
-                  `Net delta (buy − sell): *${fmt(stats.netDelta)}*\n` +
-                  `Buy share: *${stats.buySharePct.toFixed(1)}%*\n\n` +
-                  `_Measured from Binance 15M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`
+                    `Price-action breakout: *${direction}*\n` +
+                    `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
+                    `Range: *${fmt(stats.low)} – ${fmt(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
+                    `Total traded volume: *${fmt(stats.totalVolume)}*\n\n` +
+                    `Aggressive buy volume: *${fmt(stats.aggressiveBuyVolume)}*\n` +
+                    `Aggressive sell volume: *${fmt(stats.aggressiveSellVolume)}*\n` +
+                    `Net delta (buy − sell): *${fmt(stats.netDelta)}*\n` +
+                    `Buy share: *${stats.buySharePct.toFixed(1)}%*\n\n` +
+                    `_Measured from Binance 15M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`,
+                );
+              }
+
+              // Classify the breakout separately. This is informational only and
+              // deliberately does not modify the consolidation detector or entries.
+              try {
+                await classifyPostConsolidationExpansion(symbol, candle, direction, stats);
+              } catch (classificationError) {
+                log(
+                  `❌ Expansion/noise classification failed for ${symbol}: ${classificationError?.message || classificationError}`,
+                );
+                await sendMessage(
+                  `⚠️ *EXPANSION CLASSIFICATION ERROR — ${symbol}*\n\n` +
+                    `The consolidation breakout was detected as *${direction}*, but the expansion/noise classifier encountered an error. The consolidation detector remains unchanged.`,
                 );
               }
 
               priceActionDeltaPhaseState[symbol] = {
                 cooldownUntil: candle.time + PA_DELTA_PHASE_COOLDOWN_MS,
-                lastCandleTime: candle.time
+                lastCandleTime: candle.time,
               };
               ended = true;
               break; // the breakout candle is not included in phase totals
@@ -471,22 +603,20 @@ async function monitorPriceActionDeltaPhases() {
             if (candle.time - lastStatusTime >= 15 * 60 * 1000) {
               const statusStats = getPriceActionPhaseStats(phase.candles);
               if (statusStats) {
-                const fmtStatus = n => Number(n).toLocaleString("en-US", {
-                  maximumFractionDigits: 4
-                });
-                const elapsedMinutes = Math.max(
-                  15,
-                  Math.round((candle.time - phase.startTime) / 60000) + 15
-                );
+                const fmtStatus = (n) =>
+                  Number(n).toLocaleString("en-US", {
+                    maximumFractionDigits: 4,
+                  });
+                const elapsedMinutes = Math.max(15, Math.round((candle.time - phase.startTime) / 60000) + 15);
                 await sendMessage(
                   `⏳ *CONSOLIDATION PHASE UPDATE — ${symbol}*\n\n` +
-                  `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
-                  `Current range: *${fmtStatus(statusStats.low)} – ${fmtStatus(statusStats.high)}* (${statusStats.rangePct.toFixed(2)}%)\n` +
-                  `Aggressive buy volume: *${fmtStatus(statusStats.aggressiveBuyVolume)}*\n` +
-                  `Aggressive sell volume: *${fmtStatus(statusStats.aggressiveSellVolume)}*\n` +
-                  `Net delta (buy − sell): *${fmtStatus(statusStats.netDelta)}*\n` +
-                  `Buy share: *${statusStats.buySharePct.toFixed(1)}%*\n\n` +
-                  `_Phase is still active. Monitoring continues; this update does not trigger or change any trade entry._`
+                    `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
+                    `Current range: *${fmtStatus(statusStats.low)} – ${fmtStatus(statusStats.high)}* (${statusStats.rangePct.toFixed(2)}%)\n` +
+                    `Aggressive buy volume: *${fmtStatus(statusStats.aggressiveBuyVolume)}*\n` +
+                    `Aggressive sell volume: *${fmtStatus(statusStats.aggressiveSellVolume)}*\n` +
+                    `Net delta (buy − sell): *${fmtStatus(statusStats.netDelta)}*\n` +
+                    `Buy share: *${statusStats.buySharePct.toFixed(1)}%*\n\n` +
+                    `_Phase is still active. Monitoring continues; this update does not trigger or change any trade entry._`,
                 );
               }
               phase.lastStatusMessageTime = candle.time;
@@ -518,14 +648,15 @@ async function monitorPriceActionDeltaPhases() {
         // Candidate qualifies by compressed price range alone; send exactly
         // one notification when the phase is first detected. The detailed
         // delta/volume report is sent only when the phase ends in a breakout.
-        const fmtPhasePrice = n => Number(n).toLocaleString("en-US", {
-          maximumFractionDigits: 4
-        });
+        const fmtPhasePrice = (n) =>
+          Number(n).toLocaleString("en-US", {
+            maximumFractionDigits: 4,
+          });
         await sendMessage(
           `📦 *CONSOLIDATION PHASE STARTED — ${symbol}*\n\n` +
-          `Initial range: *${fmtPhasePrice(stats.low)} – ${fmtPhasePrice(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
-          `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 15} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 15M candles)\n` +
-          `_Monitoring this phase until a confirmed price breakout. No trade entries or activation settings are changed._`
+            `Initial range: *${fmtPhasePrice(stats.low)} – ${fmtPhasePrice(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
+            `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 15} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 15M candles)\n` +
+            `_Monitoring this phase until a confirmed price breakout. No trade entries or activation settings are changed._`,
         );
 
         priceActionDeltaPhaseState[symbol] = {
@@ -534,7 +665,7 @@ async function monitorPriceActionDeltaPhases() {
           candles: windowCandles,
           high: stats.high,
           low: stats.low,
-          lastStatusMessageTime: latest.time
+          lastStatusMessageTime: latest.time,
         };
       } catch (err) {
         log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
@@ -546,14 +677,14 @@ async function monitorPriceActionDeltaPhases() {
 }
 
 setInterval(() => {
-  monitorPriceActionDeltaPhases().catch(err =>
-    log(`❌ Price-action delta phase scheduler error: ${err?.message || err}`)
+  monitorPriceActionDeltaPhases().catch((err) =>
+    log(`❌ Price-action delta phase scheduler error: ${err?.message || err}`),
   );
 }, PA_DELTA_PHASE_MONITOR_MS);
 
 // Run once on startup, then continue monitoring on the minute.
-monitorPriceActionDeltaPhases().catch(err =>
-  log(`❌ Initial price-action delta phase monitor error: ${err?.message || err}`)
+monitorPriceActionDeltaPhases().catch((err) =>
+  log(`❌ Initial price-action delta phase monitor error: ${err?.message || err}`),
 );
 
 // --- Proper Schaff Trend Cycle (STC) ---
@@ -668,9 +799,9 @@ const SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES = 3;
 
 // Global market-activity classification is informational only.
 // HIGH, ADEQUATE, and LOW do not block setup creation or execution.
-const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.40; // informational classification only
-const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.00;
-const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.00;
+const MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD = 0.4; // informational classification only
+const MARKET_REGIME_ATR_EXPANSION_MIN_RATIO = 1.0;
+const MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO = 1.0;
 const MARKET_REGIME_RECENT_RANGE_CANDLES = 5;
 const MARKET_REGIME_BASELINE_CANDLES = 20;
 const MARKET_REGIME_RECENT_VOLUME_CANDLES = 3;
@@ -678,20 +809,19 @@ const MARKET_REGIME_MIN_SCORE = 2;
 
 // Script 2 zone settings are used for informational zone and absorption context.
 // Zone reach is not required before evaluating the 1-candle imbalance.
-const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.10;
+const SCRIPT2_ZONE_TOLERANCE_PERCENT = 0.1;
 const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 
 // Script 2 location filter. A liquidity/order-block zone qualifies only
 // when it is located at/near an ATR high or ATR low area. The ATR location
 // is measured against either the current-day or previous-day high/low.
-const SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR = 0.20;
+const SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR = 0.2;
 
 // 5M ATR-band calculations are retained only for existing trade-progress context.
 // ATR contraction/expansion is NOT an entry condition.
 const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
-
 
 // ======================================================
 // MARKET MOMENTUM / ACTIVITY REGIME
@@ -721,7 +851,7 @@ function getScript2MomentumRegime(closedCandles5) {
       volumeRatio: null,
       candleMomentumPassed: false,
       atrPassed: false,
-      volumePassed: false
+      volumePassed: false,
     };
   }
 
@@ -732,7 +862,7 @@ function getScript2MomentumRegime(closedCandles5) {
   const recentVolumeCandles = closedCandles5.slice(-MARKET_REGIME_RECENT_VOLUME_CANDLES);
   const volumeBaselineCandles = closedCandles5.slice(
     -(MARKET_REGIME_RECENT_VOLUME_CANDLES + MARKET_REGIME_BASELINE_CANDLES),
-    -MARKET_REGIME_RECENT_VOLUME_CANDLES
+    -MARKET_REGIME_RECENT_VOLUME_CANDLES,
   );
 
   const momentumValues = recentCandles
@@ -742,8 +872,11 @@ function getScript2MomentumRegime(closedCandles5) {
       const low = Number(candle.low);
       const close = Number(candle.close);
       const range = high - low;
-      return Number.isFinite(open) && Number.isFinite(high) &&
-        Number.isFinite(low) && Number.isFinite(close) && range > 0
+      return Number.isFinite(open) &&
+        Number.isFinite(high) &&
+        Number.isFinite(low) &&
+        Number.isFinite(close) &&
+        range > 0
         ? Math.abs((close - open) / range)
         : null;
     })
@@ -769,7 +902,8 @@ function getScript2MomentumRegime(closedCandles5) {
   }
 
   const baselineAtrValues = [];
-  const baselineStartIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES - MARKET_REGIME_BASELINE_CANDLES;
+  const baselineStartIndex =
+    closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES - MARKET_REGIME_BASELINE_CANDLES;
   const baselineEndIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
   for (let i = baselineStartIndex; i < baselineEndIndex; i++) {
     const tr = trueRange(closedCandles5[i], closedCandles5[i - 1]?.close);
@@ -782,9 +916,8 @@ function getScript2MomentumRegime(closedCandles5) {
   const baselineAtr = baselineAtrValues.length
     ? baselineAtrValues.reduce((sum, value) => sum + value, 0) / baselineAtrValues.length
     : null;
-  const atrRatio = Number.isFinite(recentAtr) && Number.isFinite(baselineAtr) && baselineAtr > 0
-    ? recentAtr / baselineAtr
-    : null;
+  const atrRatio =
+    Number.isFinite(recentAtr) && Number.isFinite(baselineAtr) && baselineAtr > 0 ? recentAtr / baselineAtr : null;
 
   const recentVolumes = recentVolumeCandles
     .map((candle) => Number(candle.volume))
@@ -799,29 +932,22 @@ function getScript2MomentumRegime(closedCandles5) {
   const baselineVolume = baselineVolumes.length
     ? baselineVolumes.reduce((sum, value) => sum + value, 0) / baselineVolumes.length
     : null;
-  const volumeRatio = Number.isFinite(recentVolume) && Number.isFinite(baselineVolume) && baselineVolume > 0
-    ? recentVolume / baselineVolume
-    : null;
+  const volumeRatio =
+    Number.isFinite(recentVolume) && Number.isFinite(baselineVolume) && baselineVolume > 0
+      ? recentVolume / baselineVolume
+      : null;
 
-  const candleMomentumPassed = Number.isFinite(candleMomentum) &&
-    candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD;
-  const atrPassed = Number.isFinite(atrRatio) &&
-    atrRatio >= MARKET_REGIME_ATR_EXPANSION_MIN_RATIO;
-  const volumePassed = Number.isFinite(volumeRatio) &&
-    volumeRatio >= MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO;
+  const candleMomentumPassed = Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD;
+  const atrPassed = Number.isFinite(atrRatio) && atrRatio >= MARKET_REGIME_ATR_EXPANSION_MIN_RATIO;
+  const volumePassed = Number.isFinite(volumeRatio) && volumeRatio >= MARKET_REGIME_VOLUME_EXPANSION_MIN_RATIO;
 
-  const score = [candleMomentumPassed, atrPassed, volumePassed]
-    .filter(Boolean).length;
+  const score = [candleMomentumPassed, atrPassed, volumePassed].filter(Boolean).length;
   const allowed = score >= MARKET_REGIME_MIN_SCORE; // diagnostic only; never used as an entry gate
-  const highActivity = Number.isFinite(candleMomentum) &&
-    candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
-  const adequateActivity = score >= MARKET_REGIME_MIN_SCORE ||
+  const highActivity = Number.isFinite(candleMomentum) && candleMomentum >= MARKET_REGIME_HIGH_MOMENTUM_THRESHOLD;
+  const adequateActivity =
+    score >= MARKET_REGIME_MIN_SCORE ||
     (Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD);
-  const regime = highActivity
-    ? "HIGH_MOMENTUM"
-    : adequateActivity
-      ? "ADEQUATE_MOMENTUM"
-      : "LOW_MOMENTUM";
+  const regime = highActivity ? "HIGH_MOMENTUM" : adequateActivity ? "ADEQUATE_MOMENTUM" : "LOW_MOMENTUM";
 
   return {
     allowed,
@@ -832,7 +958,7 @@ function getScript2MomentumRegime(closedCandles5) {
     volumeRatio,
     candleMomentumPassed,
     atrPassed,
-    volumePassed
+    volumePassed,
   };
 }
 
@@ -849,28 +975,26 @@ function maybeSendScript2MomentumRegimeCheckpoint(symbol, regime, candleKey) {
 
   script2MomentumRegimeState[symbol] = {
     regime: regime.regime,
-    candleKey
+    candleKey,
   };
 
   const scoreText = `${regime.score}/${3}`;
-  const candleMomentumText = Number.isFinite(regime.candleMomentum)
-    ? regime.candleMomentum.toFixed(2)
-    : "N/A";
-  const atrRatioText = Number.isFinite(regime.atrRatio)
-    ? regime.atrRatio.toFixed(2)
-    : "N/A";
-  const volumeRatioText = Number.isFinite(regime.volumeRatio)
-    ? regime.volumeRatio.toFixed(2)
-    : "N/A";
+  const candleMomentumText = Number.isFinite(regime.candleMomentum) ? regime.candleMomentum.toFixed(2) : "N/A";
+  const atrRatioText = Number.isFinite(regime.atrRatio) ? regime.atrRatio.toFixed(2) : "N/A";
+  const volumeRatioText = Number.isFinite(regime.volumeRatio) ? regime.volumeRatio.toFixed(2) : "N/A";
 
   awaitSendScript2Checkpoint(
     `📊 *MARKET REGIME UPDATE* — *${symbol}*\n` +
-    `📈 Regime: *${regime.regime.replace(/_MOMENTUM/g, "").replace("HIGH", "HIGH").replace("ADEQUATE", "ADEQUATE").replace("LOW", "LOW")}* (informational only)\n` +
-    `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
-    `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
-    `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
-    `🎯 Activity Score: *${scoreText}/3*\n` +
-    `ℹ️ Market regime does not block setup creation or execution.`
+      `📈 Regime: *${regime.regime
+        .replace(/_MOMENTUM/g, "")
+        .replace("HIGH", "HIGH")
+        .replace("ADEQUATE", "ADEQUATE")
+        .replace("LOW", "LOW")}* (informational only)\n` +
+      `⚡ Avg |Candle Momentum|: *${candleMomentumText}*\n` +
+      `📏 ATR Activity Ratio: *${atrRatioText}*\n` +
+      `📊 Volume Activity Ratio: *${volumeRatioText}*\n` +
+      `🎯 Activity Score: *${scoreText}/3*\n` +
+      `ℹ️ Market regime does not block setup creation or execution.`,
   );
 }
 
@@ -879,7 +1003,6 @@ function maybeSendScript2MomentumRegimeCheckpoint(symbol, regime, candleKey) {
 // ------------------------------------------------------
 
 function calculateEMASeries(candles, period) {
-
   if (!candles || candles.length < period) {
     return [];
   }
@@ -889,7 +1012,6 @@ function calculateEMASeries(candles, period) {
   let sum = 0;
 
   for (let i = 0; i < period; i++) {
-
     const close = Number(candles[i].close);
 
     if (!Number.isFinite(close)) {
@@ -902,7 +1024,6 @@ function calculateEMASeries(candles, period) {
   let ema = sum / period;
 
   for (let i = 0; i < candles.length; i++) {
-
     const close = Number(candles[i].close);
 
     if (!Number.isFinite(close)) {
@@ -920,12 +1041,9 @@ function calculateEMASeries(candles, period) {
       continue;
     }
 
-    const multiplier =
-      2 / (period + 1);
+    const multiplier = 2 / (period + 1);
 
-    ema =
-      (close - ema) * multiplier +
-      ema;
+    ema = (close - ema) * multiplier + ema;
 
     result.push(ema);
   }
@@ -933,13 +1051,11 @@ function calculateEMASeries(candles, period) {
   return result;
 }
 
-
 // ------------------------------------------------------
 // WILDER ATR SERIES
 // ------------------------------------------------------
 
 function calculateATRSeries(candles, period) {
-
   if (!candles || candles.length <= period) {
     return [];
   }
@@ -949,53 +1065,33 @@ function calculateATRSeries(candles, period) {
   const trueRanges = new Array(candles.length).fill(null);
 
   for (let i = 0; i < candles.length; i++) {
-
     const high = Number(candles[i].high);
     const low = Number(candles[i].low);
 
-    if (
-      !Number.isFinite(high) ||
-      !Number.isFinite(low)
-    ) {
+    if (!Number.isFinite(high) || !Number.isFinite(low)) {
       return [];
     }
 
     if (i === 0) {
-
-      trueRanges[i] =
-        high - low;
+      trueRanges[i] = high - low;
 
       continue;
     }
 
-    const previousClose =
-      Number(candles[i - 1].close);
+    const previousClose = Number(candles[i - 1].close);
 
     if (!Number.isFinite(previousClose)) {
       return [];
     }
 
-    const range1 =
-      high - low;
+    const range1 = high - low;
 
-    const range2 =
-      Math.abs(
-        high - previousClose
-      );
+    const range2 = Math.abs(high - previousClose);
 
-    const range3 =
-      Math.abs(
-        low - previousClose
-      );
+    const range3 = Math.abs(low - previousClose);
 
-    trueRanges[i] =
-      Math.max(
-        range1,
-        range2,
-        range3
-      );
+    trueRanges[i] = Math.max(range1, range2, range3);
   }
-
 
   // -----------------------------------------------
   // Initial Wilder ATR
@@ -1004,12 +1100,7 @@ function calculateATRSeries(candles, period) {
 
   let atr = 0;
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
+  for (let i = 1; i <= period; i++) {
     atr += trueRanges[i];
   }
 
@@ -1017,22 +1108,12 @@ function calculateATRSeries(candles, period) {
 
   result[period] = atr;
 
-
   // -----------------------------------------------
   // Wilder smoothing
   // -----------------------------------------------
 
-  for (
-    let i = period + 1;
-    i < candles.length;
-    i++
-  ) {
-
-    atr =
-      (
-        atr * (period - 1) +
-        trueRanges[i]
-      ) / period;
+  for (let i = period + 1; i < candles.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
 
     result[i] = atr;
   }
@@ -1057,44 +1138,18 @@ function calculateATRSeries(candles, period) {
 //
 // ======================================================
 
-function calculateTrendResetCumulativeDelta(
-  candles
-) {
-
-  if (
-    !candles ||
-    candles.length <
-    Math.max(
-      TR_DELTA_EMA_LENGTH,
-      TR_DELTA_ATR_LENGTH
-    ) + TR_DELTA_MA_LENGTH
-  ) {
-
+function calculateTrendResetCumulativeDelta(candles) {
+  if (!candles || candles.length < Math.max(TR_DELTA_EMA_LENGTH, TR_DELTA_ATR_LENGTH) + TR_DELTA_MA_LENGTH) {
     return null;
   }
 
+  const emaSeries = calculateEMASeries(candles, TR_DELTA_EMA_LENGTH);
 
-  const emaSeries =
-    calculateEMASeries(
-      candles,
-      TR_DELTA_EMA_LENGTH
-    );
+  const atrSeries = calculateATRSeries(candles, TR_DELTA_ATR_LENGTH);
 
-  const atrSeries =
-    calculateATRSeries(
-      candles,
-      TR_DELTA_ATR_LENGTH
-    );
-
-
-  if (
-    !emaSeries.length ||
-    !atrSeries.length
-  ) {
-
+  if (!emaSeries.length || !atrSeries.length) {
     return null;
   }
-
 
   let trendState = 0;
 
@@ -1102,135 +1157,70 @@ function calculateTrendResetCumulativeDelta(
 
   const deltaSeries = [];
 
+  for (let i = 0; i < candles.length; i++) {
+    const close = Number(candles[i].close);
 
-  for (
-    let i = 0;
-    i < candles.length;
-    i++
-  ) {
+    const open = Number(candles[i].open);
 
-    const close =
-      Number(candles[i].close);
+    const volume = Number(candles[i].volume);
 
-    const open =
-      Number(candles[i].open);
-
-    const volume =
-      Number(candles[i].volume);
-
-    if (
-      !Number.isFinite(close) ||
-      !Number.isFinite(open) ||
-      !Number.isFinite(volume)
-    ) {
-
+    if (!Number.isFinite(close) || !Number.isFinite(open) || !Number.isFinite(volume)) {
       continue;
     }
-
 
     // ---------------------------------------------
     // ChartPrime barDelta
     // ---------------------------------------------
 
-    const barDelta =
-      close > open
-        ? volume
-        : -volume;
+    const barDelta = close > open ? volume : -volume;
 
+    let newTrendState = trendState;
 
-    let newTrendState =
-      trendState;
+    const ema = emaSeries[i];
 
-
-    const ema =
-      emaSeries[i];
-
-    const atr =
-      atrSeries[i];
-
+    const atr = atrSeries[i];
 
     // ---------------------------------------------
     // ChartPrime trend calculation
     // ---------------------------------------------
 
-    if (
-      ema !== null &&
-      atr !== null
-    ) {
+    if (ema !== null && atr !== null) {
+      const upperBand = ema + atr * TR_DELTA_ATR_MULTIPLIER;
 
-      const upperBand =
-        ema +
-        atr *
-        TR_DELTA_ATR_MULTIPLIER;
+      const lowerBand = ema - atr * TR_DELTA_ATR_MULTIPLIER;
 
-      const lowerBand =
-        ema -
-        atr *
-        TR_DELTA_ATR_MULTIPLIER;
-
-
-      if (
-        close > upperBand
-      ) {
-
+      if (close > upperBand) {
         newTrendState = 1;
-
-      }
-
-      else if (
-        close < lowerBand
-      ) {
-
+      } else if (close < lowerBand) {
         newTrendState = -1;
-
       }
     }
 
+    const trendChanged = newTrendState !== trendState;
 
-    const trendChanged =
-      newTrendState !== trendState;
-
-
-    trendState =
-      newTrendState;
-
+    trendState = newTrendState;
 
     // ---------------------------------------------
     // ChartPrime cumulative delta reset
     // ---------------------------------------------
 
     if (trendChanged) {
-
-      cumDelta =
-        barDelta;
-
+      cumDelta = barDelta;
+    } else {
+      cumDelta += barDelta;
     }
-
-    else {
-
-      cumDelta +=
-        barDelta;
-
-    }
-
 
     deltaSeries.push({
       index: i,
       cumDelta,
       trendState,
-      trendChanged
+      trendChanged,
     });
   }
 
-
-  if (
-    deltaSeries.length <
-    TR_DELTA_MA_LENGTH
-  ) {
-
+  if (deltaSeries.length < TR_DELTA_MA_LENGTH) {
     return null;
   }
-
 
   // -----------------------------------------------
   // SMA(10) of cumulative delta
@@ -1239,23 +1229,9 @@ function calculateTrendResetCumulativeDelta(
   // ta.sma(cumDelta, 10)
   // -----------------------------------------------
 
-  const recentDeltaValues =
-    deltaSeries
-      .slice(
-        -TR_DELTA_MA_LENGTH
-      )
-      .map(
-        item => item.cumDelta
-      );
+  const recentDeltaValues = deltaSeries.slice(-TR_DELTA_MA_LENGTH).map((item) => item.cumDelta);
 
-
-  const deltaMA =
-    recentDeltaValues.reduce(
-      (sum, value) =>
-        sum + value,
-      0
-    ) /
-    TR_DELTA_MA_LENGTH;
+  const deltaMA = recentDeltaValues.reduce((sum, value) => sum + value, 0) / TR_DELTA_MA_LENGTH;
 
   // -----------------------------------------------------
   // Adaptive Delta strength
@@ -1264,57 +1240,32 @@ function calculateTrendResetCumulativeDelta(
   // This prevents weak readings that are only slightly
   // above/below the MA from qualifying as entries.
   // -----------------------------------------------------
-  const strengthWindow =
-    deltaSeries.slice(
-      -Math.min(DELTA_STRENGTH_LOOKBACK, deltaSeries.length)
-    );
+  const strengthWindow = deltaSeries.slice(-Math.min(DELTA_STRENGTH_LOOKBACK, deltaSeries.length));
 
   const recentBarDeltaMoves = [];
 
   for (let i = 1; i < strengthWindow.length; i++) {
-    recentBarDeltaMoves.push(
-      Math.abs(
-        strengthWindow[i].cumDelta -
-        strengthWindow[i - 1].cumDelta
-      )
-    );
+    recentBarDeltaMoves.push(Math.abs(strengthWindow[i].cumDelta - strengthWindow[i - 1].cumDelta));
   }
 
-  const avgAbsBarDelta =
-    recentBarDeltaMoves.length
-      ? recentBarDeltaMoves.reduce(
-          (sum, value) => sum + value,
-          0
-        ) / recentBarDeltaMoves.length
-      : 0;
+  const avgAbsBarDelta = recentBarDeltaMoves.length
+    ? recentBarDeltaMoves.reduce((sum, value) => sum + value, 0) / recentBarDeltaMoves.length
+    : 0;
 
-
-  const latest =
-    deltaSeries[
-      deltaSeries.length - 1
-    ];
-
+  const latest = deltaSeries[deltaSeries.length - 1];
 
   return {
-
-    cumDelta:
-      latest.cumDelta,
+    cumDelta: latest.cumDelta,
 
     deltaMA,
 
-    trendState:
-      latest.trendState,
+    trendState: latest.trendState,
 
-    trendChanged:
-      latest.trendChanged,
+    trendChanged: latest.trendChanged,
 
-    deltaDistance:
-      latest.cumDelta - deltaMA,
+    deltaDistance: latest.cumDelta - deltaMA,
 
-    deltaStrength:
-      avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0,
+    deltaStrength: avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0,
 
     avgAbsBarDelta,
 
@@ -1324,16 +1275,12 @@ function calculateTrendResetCumulativeDelta(
     bullish:
       latest.cumDelta > 0 &&
       latest.cumDelta > deltaMA &&
-      (avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0) >= DELTA_STRENGTH_THRESHOLD,
+      (avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0) >= DELTA_STRENGTH_THRESHOLD,
 
     bearish:
       latest.cumDelta < 0 &&
       latest.cumDelta < deltaMA &&
-      (avgAbsBarDelta > 0
-        ? (latest.cumDelta - deltaMA) / avgAbsBarDelta
-        : 0) <= -DELTA_STRENGTH_THRESHOLD
+      (avgAbsBarDelta > 0 ? (latest.cumDelta - deltaMA) / avgAbsBarDelta : 0) <= -DELTA_STRENGTH_THRESHOLD,
   };
 }
 
@@ -1360,7 +1307,8 @@ function detect4HAbsorptionContext(closedCandles4H) {
   const baselineAvgVolume = baseline.reduce((sum, c) => sum + Math.max(0, Number(c.volume) || 0), 0) / baseline.length;
   const recentAvgVolume = totalRecentVolume / recent.length;
   const relativeVolume = baselineAvgVolume > 0 ? recentAvgVolume / baselineAvgVolume : 0;
-  if (!(totalRecentVolume > 0) || !(baselineAvgVolume > 0) || relativeVolume < HTF_ABSORPTION_MIN_RELATIVE_VOLUME) return null;
+  if (!(totalRecentVolume > 0) || !(baselineAvgVolume > 0) || relativeVolume < HTF_ABSORPTION_MIN_RELATIVE_VOLUME)
+    return null;
 
   let signedVolume = 0;
   let negativeCandles = 0;
@@ -1375,8 +1323,13 @@ function detect4HAbsorptionContext(closedCandles4H) {
     const volume = Math.max(0, Number(candle.volume) || 0);
     if (![open, close, high, low, volume].every(Number.isFinite)) return null;
     // Match the existing bot delta proxy: candle-up volume is positive; otherwise negative.
-    if (close > open) { signedVolume += volume; positiveCandles++; }
-    else { signedVolume -= volume; negativeCandles++; }
+    if (close > open) {
+      signedVolume += volume;
+      positiveCandles++;
+    } else {
+      signedVolume -= volume;
+      negativeCandles++;
+    }
     rangeHigh = Math.max(rangeHigh, high);
     rangeLow = Math.min(rangeLow, low);
   }
@@ -1387,15 +1340,21 @@ function detect4HAbsorptionContext(closedCandles4H) {
   const netMoveAbs = Math.abs(netMove);
   const rangeWidth = rangeHigh - rangeLow;
   const pressureRatio = signedVolume / totalRecentVolume;
-  const compressed = netMoveAbs <= atr * HTF_ABSORPTION_MAX_NET_MOVE_ATR &&
-    rangeWidth <= atr * HTF_ABSORPTION_MAX_RANGE_ATR;
+  const compressed =
+    netMoveAbs <= atr * HTF_ABSORPTION_MAX_NET_MOVE_ATR && rangeWidth <= atr * HTF_ABSORPTION_MAX_RANGE_ATR;
   if (!compressed) return null;
 
   let direction = null;
-  if (negativeCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES && pressureRatio <= -HTF_ABSORPTION_MIN_PRESSURE_RATIO) {
-    direction = 'BULLISH'; // sellers are active, but price is making limited downside progress
-  } else if (positiveCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES && pressureRatio >= HTF_ABSORPTION_MIN_PRESSURE_RATIO) {
-    direction = 'BEARISH'; // buyers are active, but price is making limited upside progress
+  if (
+    negativeCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES &&
+    pressureRatio <= -HTF_ABSORPTION_MIN_PRESSURE_RATIO
+  ) {
+    direction = "BULLISH"; // sellers are active, but price is making limited downside progress
+  } else if (
+    positiveCandles >= HTF_ABSORPTION_MIN_DIRECTIONAL_CANDLES &&
+    pressureRatio >= HTF_ABSORPTION_MIN_PRESSURE_RATIO
+  ) {
+    direction = "BEARISH"; // buyers are active, but price is making limited upside progress
   }
   if (!direction) return null;
 
@@ -1409,13 +1368,18 @@ function detect4HAbsorptionContext(closedCandles4H) {
     netMovePct: firstClose !== 0 ? (netMove / firstClose) * 100 : 0,
     rangePct: lastClose !== 0 ? (rangeWidth / lastClose) * 100 : 0,
     candleCount: recent.length,
-    candleTime: recent[recent.length - 1].time
+    candleTime: recent[recent.length - 1].time,
   };
 }
 
 async function monitor4HAbsorptionContext(symbol, closedCandles4H, closedCandles1H) {
-  if (!Array.isArray(closedCandles4H) || closedCandles4H.length < 25 ||
-      !Array.isArray(closedCandles1H) || closedCandles1H.length < 2) return;
+  if (
+    !Array.isArray(closedCandles4H) ||
+    closedCandles4H.length < 25 ||
+    !Array.isArray(closedCandles1H) ||
+    closedCandles1H.length < 2
+  )
+    return;
 
   const latest4HCandle = closedCandles4H[closedCandles4H.length - 1];
   const latest4HTime = latest4HCandle?.time;
@@ -1432,32 +1396,32 @@ async function monitor4HAbsorptionContext(symbol, closedCandles4H, closedCandles
 
   // Follow the range after the 4H alert and report a later 1H structural break once.
   if (state && !state.breakoutAlerted) {
-    const bullishBreak = state.direction === 'BULLISH' && Number(latest1H.close) > state.rangeHigh;
-    const bearishBreak = state.direction === 'BEARISH' && Number(latest1H.close) < state.rangeLow;
-    const bullishInvalidation = state.direction === 'BULLISH' && Number(latest1H.close) < state.rangeLow;
-    const bearishInvalidation = state.direction === 'BEARISH' && Number(latest1H.close) > state.rangeHigh;
+    const bullishBreak = state.direction === "BULLISH" && Number(latest1H.close) > state.rangeHigh;
+    const bearishBreak = state.direction === "BEARISH" && Number(latest1H.close) < state.rangeLow;
+    const bullishInvalidation = state.direction === "BULLISH" && Number(latest1H.close) < state.rangeLow;
+    const bearishInvalidation = state.direction === "BEARISH" && Number(latest1H.close) > state.rangeHigh;
 
     if (bullishBreak || bearishBreak) {
       state.breakoutAlerted = true;
       state.breakoutTime = latest1H.time;
       await sendMessage(
         `📣 *4H ABSORPTION — 1H STRUCTURE CONFIRMATION*\n\n` +
-        `🪙 Symbol: *${symbol}*\n` +
-        `🧭 Context: *${state.direction}*\n` +
-        `⏱️ Confirmation: 1H candle closed beyond the observed 4H consolidation range\n` +
-        `📍 Range high: *${state.rangeHigh}*\n` +
-        `📍 Range low: *${state.rangeLow}*\n` +
-        `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n\n` +
-        `ℹ️ Informational only. No trade was opened by this alert; existing 15M/5M delta alignment and execution rules are unchanged.`
+          `🪙 Symbol: *${symbol}*\n` +
+          `🧭 Context: *${state.direction}*\n` +
+          `⏱️ Confirmation: 1H candle closed beyond the observed 4H consolidation range\n` +
+          `📍 Range high: *${state.rangeHigh}*\n` +
+          `📍 Range low: *${state.rangeLow}*\n` +
+          `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n\n` +
+          `ℹ️ Informational only. No trade was opened by this alert; existing 15M/5M delta alignment and execution rules are unchanged.`,
       );
     } else if (bullishInvalidation || bearishInvalidation) {
       await sendMessage(
         `⚠️ *4H ABSORPTION CONTEXT INVALIDATED*\n\n` +
-        `🪙 Symbol: *${symbol}*\n` +
-        `🧭 Previous context: *${state.direction}*\n` +
-        `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n` +
-        `Price closed beyond the opposite side of the observed 4H range.\n` +
-        `ℹ️ Informational only; trading logic was not changed.`
+          `🪙 Symbol: *${symbol}*\n` +
+          `🧭 Previous context: *${state.direction}*\n` +
+          `💰 1H close: *${Number(latest1H.close).toPrecision(8)}*\n` +
+          `Price closed beyond the opposite side of the observed 4H range.\n` +
+          `ℹ️ Informational only; trading logic was not changed.`,
       );
       delete higherTimeframeAbsorptionState[symbol];
       state = null;
@@ -1477,30 +1441,33 @@ async function monitor4HAbsorptionContext(symbol, closedCandles4H, closedCandles
   higherTimeframeAbsorptionState[symbol] = {
     ...candidate,
     detectedAt: Date.now(),
-    breakoutAlerted: false
+    breakoutAlerted: false,
   };
   state = higherTimeframeAbsorptionState[symbol];
 
   const deltaPressurePct = Math.abs(candidate.pressureRatio * 100).toFixed(1);
-  const directionText = candidate.direction === 'BULLISH'
-    ? 'Potential bullish absorption (persistent selling, limited downside progress)'
-    : 'Potential bearish absorption (persistent buying, limited upside progress)';
+  const directionText =
+    candidate.direction === "BULLISH"
+      ? "Potential bullish absorption (persistent selling, limited downside progress)"
+      : "Potential bearish absorption (persistent buying, limited upside progress)";
 
   await sendMessage(
     `🔎 *4H HIGHER-TIMEFRAME ABSORPTION WATCH*\n\n` +
-    `🪙 Symbol: *${symbol}*\n` +
-    `🧭 Potential context: *${candidate.direction}*\n` +
-    `📊 Observation: ${directionText}\n` +
-    `🕯️ Closed 4H candles: *${candidate.candleCount}*\n` +
-    `📉 Signed-volume pressure: *${deltaPressurePct}%* of observed volume\n` +
-    `📦 Relative volume: *${candidate.relativeVolume.toFixed(2)}x* its prior 20-candle average\n` +
-    `↔️ Consolidation range: *${candidate.rangePct.toFixed(2)}%*\n` +
-    `↕️ Net price change across window: *${candidate.netMovePct.toFixed(2)}%*\n` +
-    `📍 Range high: *${candidate.rangeHigh}*\n` +
-    `📍 Range low: *${candidate.rangeLow}*\n\n` +
-    `⏳ Watching for a 1H close beyond this range. This is a potential reversal area, not a trade signal. Existing 15M/5M delta alignment and all entry logic remain unchanged.`
+      `🪙 Symbol: *${symbol}*\n` +
+      `🧭 Potential context: *${candidate.direction}*\n` +
+      `📊 Observation: ${directionText}\n` +
+      `🕯️ Closed 4H candles: *${candidate.candleCount}*\n` +
+      `📉 Signed-volume pressure: *${deltaPressurePct}%* of observed volume\n` +
+      `📦 Relative volume: *${candidate.relativeVolume.toFixed(2)}x* its prior 20-candle average\n` +
+      `↔️ Consolidation range: *${candidate.rangePct.toFixed(2)}%*\n` +
+      `↕️ Net price change across window: *${candidate.netMovePct.toFixed(2)}%*\n` +
+      `📍 Range high: *${candidate.rangeHigh}*\n` +
+      `📍 Range low: *${candidate.rangeLow}*\n\n` +
+      `⏳ Watching for a 1H close beyond this range. This is a potential reversal area, not a trade signal. Existing 15M/5M delta alignment and all entry logic remain unchanged.`,
   );
-  log(`🔎 4H absorption watch ${symbol}: ${candidate.direction}, pressure=${candidate.pressureRatio.toFixed(3)}, relVol=${candidate.relativeVolume.toFixed(2)}x`);
+  log(
+    `🔎 4H absorption watch ${symbol}: ${candidate.direction}, pressure=${candidate.pressureRatio.toFixed(3)}, relVol=${candidate.relativeVolume.toFixed(2)}x`,
+  );
 }
 
 function calculate5MATRBands(candles) {
@@ -1521,7 +1488,7 @@ function calculate5MATRBands(candles) {
       mid: ema,
       upper: ema + atr * ATR_BAND_MULTIPLIER,
       lower: ema - atr * ATR_BAND_MULTIPLIER,
-      width: atr * ATR_BAND_MULTIPLIER * 2
+      width: atr * ATR_BAND_MULTIPLIER * 2,
     });
   }
 
@@ -1532,12 +1499,9 @@ function calculate5MATRBands(candles) {
 
   return {
     current,
-    previous
+    previous,
   };
 }
-
-
-
 
 function calculateOBVSeries(candles) {
   if (!candles || candles.length < 2) return [];
@@ -1555,11 +1519,7 @@ function calculateOBVSeries(candles) {
     const previousClose = Number(candles[i - 1].close);
     const volume = Number(candles[i].volume);
 
-    if (
-      !Number.isFinite(close) ||
-      !Number.isFinite(previousClose) ||
-      !Number.isFinite(volume)
-    ) {
+    if (!Number.isFinite(close) || !Number.isFinite(previousClose) || !Number.isFinite(volume)) {
       obv.push(currentOBV);
       continue;
     }
@@ -1575,7 +1535,6 @@ function calculateOBVSeries(candles) {
 
   return obv;
 }
-
 
 // =====================================================
 // SCRIPT 2 — ZONE + 1-CANDLE VOLUME IMBALANCE
@@ -1603,18 +1562,20 @@ function detectScript2Absorption(candles, zone) {
 
   // The absorption candle must actually interact with the detected
   // liquidity/order-block zone.
-  const candleTouchesZone = zone.kind === "ORDER_BLOCK"
-    ? high >= zone.low && low <= zone.high
-    : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
-      percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
-      (low <= zone.price && high >= zone.price);
+  const candleTouchesZone =
+    zone.kind === "ORDER_BLOCK"
+      ? high >= zone.low && low <= zone.high
+      : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+        percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+        (low <= zone.price && high >= zone.price);
 
   if (!candleTouchesZone) return null;
 
-  const avgVolume = recent.reduce((sum, candle) => {
-    const v = Number(candle.volume);
-    return sum + (Number.isFinite(v) && v > 0 ? v : 0);
-  }, 0) / recent.length;
+  const avgVolume =
+    recent.reduce((sum, candle) => {
+      const v = Number(candle.volume);
+      return sum + (Number.isFinite(v) && v > 0 ? v : 0);
+    }, 0) / recent.length;
 
   if (!Number.isFinite(avgVolume) || avgVolume <= 0) return null;
 
@@ -1643,7 +1604,7 @@ function detectScript2Absorption(candles, zone) {
       effortRatio,
       bodyRatio,
       wickRatio: lowerWickRatio,
-      candle: latest
+      candle: latest,
     };
   }
 
@@ -1661,13 +1622,12 @@ function detectScript2Absorption(candles, zone) {
       effortRatio,
       bodyRatio,
       wickRatio: upperWickRatio,
-      candle: latest
+      candle: latest,
     };
   }
 
   return null;
 }
-
 
 // =====================================================
 // SCRIPT 2 — LIQUIDITY-ZONE ABSORPTION OBSERVATION
@@ -1694,16 +1654,11 @@ function getScript2ZoneObservationKey(zone) {
       zone.type || "ORDER BLOCK",
       Number(zone.low).toFixed(8),
       Number(zone.high).toFixed(8),
-      atrName
+      atrName,
     ].join("|");
   }
 
-  return [
-    "LIQUIDITY",
-    zone.type || "LIQUIDITY",
-    Number(zone.price).toFixed(8),
-    atrName
-  ].join("|");
+  return ["LIQUIDITY", zone.type || "LIQUIDITY", Number(zone.price).toFixed(8), atrName].join("|");
 }
 
 function getScript2ZoneAbsorptionObservation(candles, zone) {
@@ -1722,11 +1677,12 @@ function getScript2ZoneAbsorptionObservation(candles, zone) {
     return null;
   }
 
-  const candleTouchesZone = zone.kind === "ORDER_BLOCK"
-    ? high >= zone.low && low <= zone.high
-    : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
-      percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
-      (low <= zone.price && high >= zone.price);
+  const candleTouchesZone =
+    zone.kind === "ORDER_BLOCK"
+      ? high >= zone.low && low <= zone.high
+      : percentDistance(low, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+        percentDistance(high, zone.price) <= SCRIPT2_ZONE_TOLERANCE_PERCENT ||
+        (low <= zone.price && high >= zone.price);
 
   if (!candleTouchesZone) {
     return {
@@ -1738,14 +1694,15 @@ function getScript2ZoneAbsorptionObservation(candles, zone) {
       wickRatio: null,
       type: null,
       direction: null,
-      candle: latest
+      candle: latest,
     };
   }
 
-  const avgVolume = recent.reduce((sum, candle) => {
-    const v = Number(candle.volume);
-    return sum + (Number.isFinite(v) && v > 0 ? v : 0);
-  }, 0) / recent.length;
+  const avgVolume =
+    recent.reduce((sum, candle) => {
+      const v = Number(candle.volume);
+      return sum + (Number.isFinite(v) && v > 0 ? v : 0);
+    }, 0) / recent.length;
 
   const range = high - low;
   if (!Number.isFinite(avgVolume) || avgVolume <= 0 || range <= 0) return null;
@@ -1773,7 +1730,7 @@ function getScript2ZoneAbsorptionObservation(candles, zone) {
       wickRatio: lowerWickRatio,
       type: "BULLISH ABSORPTION",
       direction: "BUY",
-      candle: latest
+      candle: latest,
     };
   }
 
@@ -1792,7 +1749,7 @@ function getScript2ZoneAbsorptionObservation(candles, zone) {
       wickRatio: upperWickRatio,
       type: "BEARISH ABSORPTION",
       direction: "SELL",
-      candle: latest
+      candle: latest,
     };
   }
 
@@ -1805,7 +1762,7 @@ function getScript2ZoneAbsorptionObservation(candles, zone) {
     wickRatio: Math.max(upperWickRatio, lowerWickRatio),
     type: null,
     direction: null,
-    candle: latest
+    candle: latest,
   };
 }
 
@@ -1837,7 +1794,7 @@ async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
         peakEffortRatio: 0,
         latestObservation: null,
         entryAlertSent: false,
-        highAlertSent: false
+        highAlertSent: false,
       };
       script2ZoneAbsorptionState[symbol] = state;
     } else {
@@ -1882,14 +1839,14 @@ async function observeScript2ZoneAbsorption(symbol, closedCandles5, zone, now) {
 
       await sendMessage(
         `🔥 *HIGH ABSORPTION CONFIRMED*\n\n` +
-        `🪙 Coin: *${symbol}*\n` +
-        `📍 Zone: *${atrLabel}*\n` +
-        `🧱 Type: *${zoneType}*\n` +
-        `🛑 Pattern: *${absorptionType}*\n` +
-        `📊 Volume vs 20-bar avg: *${effortText}*\n` +
-        `📏 Body/Range: *${bodyText}*\n` +
-        `↩️ Opposing Wick/Range: *${wickText}*\n\n` +
-        `ℹ️ *OBSERVATION ONLY — does not affect execution.*`
+          `🪙 Coin: *${symbol}*\n` +
+          `📍 Zone: *${atrLabel}*\n` +
+          `🧱 Type: *${zoneType}*\n` +
+          `🛑 Pattern: *${absorptionType}*\n` +
+          `📊 Volume vs 20-bar avg: *${effortText}*\n` +
+          `📏 Body/Range: *${bodyText}*\n` +
+          `↩️ Opposing Wick/Range: *${wickText}*\n\n` +
+          `ℹ️ *OBSERVATION ONLY — does not affect execution.*`,
       );
     }
   } catch (err) {
@@ -1956,7 +1913,7 @@ function calculateOneCandleVolumeImbalance(candles) {
       buyPct,
       sellPct,
       deltaPct,
-      candles: 1
+      candles: 1,
     };
   }
 
@@ -1969,7 +1926,7 @@ function calculateOneCandleVolumeImbalance(candles) {
       buyPct,
       sellPct,
       deltaPct,
-      candles: 1
+      candles: 1,
     };
   }
 
@@ -1981,18 +1938,13 @@ function calculateOneCandleVolumeImbalance(candles) {
     buyPct,
     sellPct,
     deltaPct,
-    candles: 1
+    candles: 1,
   };
 }
 
 function getScript2CandleKey(candle, fallback = "") {
   if (!candle) return fallback;
-  return String(
-    candle.openTime ??
-    candle.time ??
-    candle.timestamp ??
-    fallback
-  );
+  return String(candle.openTime ?? candle.time ?? candle.timestamp ?? fallback);
 }
 
 function getScript2ZoneBoundary(zone, direction) {
@@ -2010,7 +1962,6 @@ function getScript2ZoneBoundary(zone, direction) {
   const price = Number(zone.price);
   return Number.isFinite(price) ? price : null;
 }
-
 
 function getScript2ZoneRetest(candle, zone, direction) {
   if (!candle || !zone || !direction) return false;
@@ -2051,9 +2002,7 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
   // locked structure level. This lets valid setups take 20, 30, or more
   // minutes to break without being discarded merely because of time.
 
-  const createdIndex = candles.findIndex(
-    (candle) => getScript2CandleKey(candle) === String(setup.createdCandleKey)
-  );
+  const createdIndex = candles.findIndex((candle) => getScript2CandleKey(candle) === String(setup.createdCandleKey));
 
   if (createdIndex < 0) {
     return { status: "WAIT", latestKey, latestIndex };
@@ -2070,9 +2019,7 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
       return { status: "WAIT", latestKey, latestIndex, candlesSinceCreation };
     }
 
-    const breakConfirmed = setup.direction === "SELL"
-      ? close < boundary
-      : close > boundary;
+    const breakConfirmed = setup.direction === "SELL" ? close < boundary : close > boundary;
 
     if (!breakConfirmed) {
       if (Number.isFinite(Number(currentPrice))) {
@@ -2082,7 +2029,7 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
             status: "EXPIRE",
             reason: "STRUCTURE_DISTANCE_EXCEEDED",
             distanceFromStructure,
-            boundary
+            boundary,
           };
         }
       }
@@ -2106,23 +2053,28 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
         : null;
 
     const bosAtr = calculateATR(candles, ATR_PERIOD);
-    const candleAtrMultiple = Number.isFinite(bosAtr) && bosAtr > 0 && candleRange > 0
-      ? candleRange / bosAtr
-      : null;
+    const candleAtrMultiple = Number.isFinite(bosAtr) && bosAtr > 0 && candleRange > 0 ? candleRange / bosAtr : null;
 
-    const highMomentum = setup.direction === "BUY"
-      ? Number.isFinite(candleMomentum) && candleMomentum >= SCRIPT2_HIGH_MOMENTUM_THRESHOLD
-      : Number.isFinite(candleMomentum) && candleMomentum <= -SCRIPT2_HIGH_MOMENTUM_THRESHOLD;
-    const adequateMomentum = setup.direction === "BUY"
-      ? Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD
-      : Number.isFinite(candleMomentum) && candleMomentum <= -ADEQUATE_MOMENTUM_THRESHOLD;
+    const highMomentum =
+      setup.direction === "BUY"
+        ? Number.isFinite(candleMomentum) && candleMomentum >= SCRIPT2_HIGH_MOMENTUM_THRESHOLD
+        : Number.isFinite(candleMomentum) && candleMomentum <= -SCRIPT2_HIGH_MOMENTUM_THRESHOLD;
+    const adequateMomentum =
+      setup.direction === "BUY"
+        ? Number.isFinite(candleMomentum) && candleMomentum >= ADEQUATE_MOMENTUM_THRESHOLD
+        : Number.isFinite(candleMomentum) && candleMomentum <= -ADEQUATE_MOMENTUM_THRESHOLD;
 
     if (highMomentum) {
       return {
         status: "HIGH_MOMENTUM_BREAK_CONFIRMED",
-        latestKey, latestIndex, boundary, candlesSinceCreation,
-        candleMomentum, candleAtrMultiple, bosAtr,
-        highMomentum: true
+        latestKey,
+        latestIndex,
+        boundary,
+        candlesSinceCreation,
+        candleMomentum,
+        candleAtrMultiple,
+        bosAtr,
+        highMomentum: true,
       };
     }
 
@@ -2131,9 +2083,14 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
     if (adequateMomentum) {
       return {
         status: "BREAK_CONFIRMED",
-        latestKey, latestIndex, boundary, candlesSinceCreation,
-        candleMomentum, candleAtrMultiple, bosAtr,
-        highMomentum: false
+        latestKey,
+        latestIndex,
+        boundary,
+        candlesSinceCreation,
+        candleMomentum,
+        candleAtrMultiple,
+        bosAtr,
+        highMomentum: false,
       };
     }
 
@@ -2149,14 +2106,12 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
       latestIndex,
       boundary: setup.breakBoundary,
       candleMomentum: setup.breakCandleMomentum,
-      highMomentum: true
+      highMomentum: true,
     };
   }
 
   if (setup.stage === "BREAK_CONFIRMED") {
-    const breakIndex = candles.findIndex(
-      (candle) => getScript2CandleKey(candle) === String(setup.breakCandleKey)
-    );
+    const breakIndex = candles.findIndex((candle) => getScript2CandleKey(candle) === String(setup.breakCandleKey));
     if (breakIndex < 0) return { status: "EXPIRE", reason: "BREAK_CANDLE_NOT_FOUND" };
 
     const candlesSinceBreak = latestIndex - breakIndex;
@@ -2174,7 +2129,13 @@ function getScript2ContinuationState(candles, setup, currentPrice = null, moment
   return { status: "WAIT", latestKey, latestIndex };
 }
 
-async function processScript2Continuation(symbol, closedCandles5, now, currentPrice = null, momentumRegime = "LOW_MOMENTUM") {
+async function processScript2Continuation(
+  symbol,
+  closedCandles5,
+  now,
+  currentPrice = null,
+  momentumRegime = "LOW_MOMENTUM",
+) {
   const setup = script2PendingSetups[symbol];
   if (!setup || setup.setupType !== "CONTINUATION") return null;
 
@@ -2186,14 +2147,13 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
     if (state.reason === "STRUCTURE_DISTANCE_EXCEEDED") {
       await sendMessage(
         `⏳ *CONTINUATION SETUP EXPIRED* — *${symbol}*\n` +
-        `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
-        `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`
+          `📏 Price moved more than *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%* from the locked structure level\n` +
+          `🎯 Structure: *${Number(state.boundary).toPrecision(8)}*`,
       );
     } else if (state.reason === "RETEST_NOT_CONFIRMED") {
       awaitSendScript2Checkpoint(
         `⏳ *ADEQUATE-MOMENTUM CONTINUATION EXPIRED* — *${symbol}*
-` +
-        `🔁 Failed-reclaim retest was not confirmed within ${SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES} closed 5M candles.`
+` + `🔁 Failed-reclaim retest was not confirmed within ${SCRIPT2_CONTINUATION_MAX_RETEST_CANDLES} closed 5M candles.`,
       );
     }
     delete script2PendingSetups[symbol];
@@ -2212,11 +2172,10 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
       setup.highMomentumNotified = true;
       awaitSendScript2Checkpoint(
         `🔥 *HIGH-MOMENTUM CONTINUATION CONFIRMED* — *${symbol}*\n` +
-        `⚡ Candle Momentum: *${Number(state.candleMomentum).toFixed(2)}*\n` +
-        `🎯 Momentum Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
-  
-        `📈 Break of structure confirmed — *NO RETEST REQUIRED*\n` +
-        `➡️ Direction: *${setup.direction}*`
+          `⚡ Candle Momentum: *${Number(state.candleMomentum).toFixed(2)}*\n` +
+          `🎯 Momentum Threshold: *≥ ${SCRIPT2_HIGH_MOMENTUM_THRESHOLD.toFixed(2)}*\n` +
+          `📈 Break of structure confirmed — *NO RETEST REQUIRED*\n` +
+          `➡️ Direction: *${setup.direction}*`,
       );
     }
     return setup.direction;
@@ -2233,9 +2192,9 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
       setup.breakNotified = true;
       awaitSendScript2Checkpoint(
         `📈 *ADEQUATE-MOMENTUM BOS CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${setup.direction}*\n` +
-        `⚡ Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}*\n` +
-        `🔁 Retest required before entry.`
+          `➡️ Direction: *${setup.direction}*\n` +
+          `⚡ Candle Momentum: *${Number.isFinite(state.candleMomentum) ? state.candleMomentum.toFixed(2) : "N/A"}*\n` +
+          `🔁 Retest required before entry.`,
       );
     }
     return null;
@@ -2252,8 +2211,8 @@ async function processScript2Continuation(symbol, closedCandles5, now, currentPr
       setup.retestNotified = true;
       awaitSendScript2Checkpoint(
         `🔁 *FAILED-RECLAIM RETEST CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${setup.direction}*\n` +
-        `✅ Adequate-momentum continuation is ready for remaining checks.`
+          `➡️ Direction: *${setup.direction}*\n` +
+          `✅ Adequate-momentum continuation is ready for remaining checks.`,
       );
     }
     return setup.direction;
@@ -2279,7 +2238,7 @@ function getScript2AtrLocation(zone, atr, currentDayHigh, currentDayLow, previou
     { name: "CURRENT DAY HIGH", price: Number(currentDayHigh), side: "HIGH" },
     { name: "CURRENT DAY LOW", price: Number(currentDayLow), side: "LOW" },
     { name: "PREVIOUS DAY HIGH", price: Number(previousDayHigh), side: "HIGH" },
-    { name: "PREVIOUS DAY LOW", price: Number(previousDayLow), side: "LOW" }
+    { name: "PREVIOUS DAY LOW", price: Number(previousDayLow), side: "LOW" },
   ].filter((level) => Number.isFinite(level.price) && level.price > 0);
 
   if (!levels.length) return null;
@@ -2292,20 +2251,16 @@ function getScript2AtrLocation(zone, atr, currentDayHigh, currentDayLow, previou
   let nearest = null;
 
   for (const level of levels) {
-    const distance = level.price < zoneLow
-      ? zoneLow - level.price
-      : level.price > zoneHigh
-        ? level.price - zoneHigh
-        : 0;
+    const distance =
+      level.price < zoneLow ? zoneLow - level.price : level.price > zoneHigh ? level.price - zoneHigh : 0;
 
     const distanceATR = distance / atr;
 
-    if (distanceATR <= SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR &&
-        (!nearest || distanceATR < nearest.distanceATR)) {
+    if (distanceATR <= SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR && (!nearest || distanceATR < nearest.distanceATR)) {
       nearest = {
         ...level,
         distance,
-        distanceATR
+        distanceATR,
       };
     }
   }
@@ -2347,7 +2302,7 @@ function findScript2ContinuationStructureLevel(candles, currentPrice) {
       type,
       price,
       direction,
-      distancePercent
+      distancePercent,
     });
   }
 
@@ -2371,7 +2326,7 @@ function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayL
       kind: "ORDER_BLOCK",
       type: block.type,
       low: Number(block.low),
-      high: Number(block.high)
+      high: Number(block.high),
     };
     if (
       Number.isFinite(zone.low) &&
@@ -2380,7 +2335,12 @@ function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayL
       priceInteractsWithZone(currentPrice, zone)
     ) {
       const atrLocation = getScript2AtrLocation(
-        zone, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow
+        zone,
+        atr,
+        currentDayHigh,
+        currentDayLow,
+        previousDayHigh,
+        previousDayLow,
       );
 
       // Script 2 only accepts zones located at/near an ATR high/low area
@@ -2391,7 +2351,7 @@ function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayL
       candidates.push({
         ...zone,
         distancePercent: percentDistance(currentPrice, center),
-        atrLocation
+        atrLocation,
       });
     }
   }
@@ -2403,12 +2363,17 @@ function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayL
     const zone = {
       kind: "LIQUIDITY",
       type: level.type,
-      price
+      price,
     };
 
     if (priceInteractsWithZone(currentPrice, zone)) {
       const atrLocation = getScript2AtrLocation(
-        zone, atr, currentDayHigh, currentDayLow, previousDayHigh, previousDayLow
+        zone,
+        atr,
+        currentDayHigh,
+        currentDayLow,
+        previousDayHigh,
+        previousDayLow,
       );
 
       if (!atrLocation) continue;
@@ -2416,7 +2381,7 @@ function findScript2Zone(candles, currentPrice, atr, currentDayHigh, currentDayL
       candidates.push({
         ...zone,
         distancePercent: percentDistance(currentPrice, price),
-        atrLocation
+        atrLocation,
       });
     }
   }
@@ -2504,16 +2469,19 @@ function calculateScript2ZoneVolumeDelta(candles, zone) {
       bullishPct: 0,
       bearishPct: 0,
       bias: "MIXED",
-      dominantPct: 0
+      dominantPct: 0,
     };
   }
 
   const bullishPct = (bullishVolume / totalVolume) * 100;
   const bearishPct = (bearishVolume / totalVolume) * 100;
   const dominantPct = Math.max(bullishPct, bearishPct);
-  const bias = dominantPct < SCRIPT2_ZONE_DELTA_DOMINANCE_PCT
-    ? "MIXED"
-    : bullishPct > bearishPct ? "BUY-SIDE DOMINANT" : "SELL-SIDE DOMINANT";
+  const bias =
+    dominantPct < SCRIPT2_ZONE_DELTA_DOMINANCE_PCT
+      ? "MIXED"
+      : bullishPct > bearishPct
+        ? "BUY-SIDE DOMINANT"
+        : "SELL-SIDE DOMINANT";
 
   return {
     bullishVolume,
@@ -2523,7 +2491,7 @@ function calculateScript2ZoneVolumeDelta(candles, zone) {
     bullishPct,
     bearishPct,
     bias,
-    dominantPct
+    dominantPct,
   };
 }
 
@@ -2533,15 +2501,18 @@ function formatScript2ZoneVolumeDelta(delta) {
     return "📊 Zone volume delta: no recent closed 5M candles overlapped this zone";
   }
 
-  const biasText = delta.bias === "MIXED"
-    ? `MIXED (no side reached ${SCRIPT2_ZONE_DELTA_DOMINANCE_PCT}%)`
-    : `${delta.bias} (${delta.dominantPct.toFixed(1)}%)`;
+  const biasText =
+    delta.bias === "MIXED"
+      ? `MIXED (no side reached ${SCRIPT2_ZONE_DELTA_DOMINANCE_PCT}%)`
+      : `${delta.bias} (${delta.dominantPct.toFixed(1)}%)`;
 
-  return `📊 *ZONE VOLUME DELTA — 5M*\n` +
+  return (
+    `📊 *ZONE VOLUME DELTA — 5M*\n` +
     `🟢 Bullish volume: *${delta.bullishPct.toFixed(1)}%*\n` +
     `🔴 Bearish volume: *${delta.bearishPct.toFixed(1)}%*\n` +
     `🧭 Pressure: *${biasText}*\n` +
-    `🕯️ Zone-overlapping candles: *${delta.touchedCandles}*`;
+    `🕯️ Zone-overlapping candles: *${delta.touchedCandles}*`
+  );
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
@@ -2605,9 +2576,9 @@ function has5MSTCDivergence(candles, divergenceType) {
 
   const start = Math.max(0, candles.length - STC_DIVERGENCE_LOOKBACK);
   const recentCandles = candles.slice(start);
-  const closes = recentCandles.map(c => Number(c.close));
+  const closes = recentCandles.map((c) => Number(c.close));
 
-  if (closes.some(v => !Number.isFinite(v))) return false;
+  if (closes.some((v) => !Number.isFinite(v))) return false;
 
   const stcSeries = [];
   for (let i = 0; i < closes.length; i++) {
@@ -2615,7 +2586,7 @@ function has5MSTCDivergence(candles, divergenceType) {
       cycle: 4,
       fast: 10,
       slow: 20,
-      signal: 3
+      signal: 3,
     });
     stcSeries.push(value);
   }
@@ -2674,7 +2645,7 @@ function calculateOBVConfirmation(candles, direction) {
 
   const obvCandles = candles.map((candle, index) => ({
     ...candle,
-    close: obvSeries[index]
+    close: obvSeries[index],
   }));
 
   const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
@@ -2730,22 +2701,14 @@ async function checkLiquidity(symbol, direction, estimatedTradeNotional = 0) {
     const bestAsk = Number(asks[0][0]);
     const quoteVolume24h = Number(ticker?.quoteVolume || 0);
 
-    const spreadPct = bestBid > 0
-      ? ((bestAsk - bestBid) / bestBid) * 100
-      : Infinity;
+    const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : Infinity;
 
-    const bidDepth = bids.reduce(
-      (sum, level) => sum + Number(level[0]) * Number(level[1]),
-      0
-    );
-    const askDepth = asks.reduce(
-      (sum, level) => sum + Number(level[0]) * Number(level[1]),
-      0
-    );
+    const bidDepth = bids.reduce((sum, level) => sum + Number(level[0]) * Number(level[1]), 0);
+    const askDepth = asks.reduce((sum, level) => sum + Number(level[0]) * Number(level[1]), 0);
 
     const requiredDepth = Math.max(
       LIQUIDITY_MIN_BOOK_DEPTH_USDT,
-      Number(estimatedTradeNotional || 0) * LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE
+      Number(estimatedTradeNotional || 0) * LIQUIDITY_MIN_BOOK_DEPTH_MULTIPLE,
     );
 
     const volumePass = quoteVolume24h >= LIQUIDITY_MIN_24H_QUOTE_VOLUME_USDT;
@@ -2790,26 +2753,24 @@ async function sendLiquidityWarning(symbol, direction, liquidity) {
   if (now - lastWarning < ABSORPTION_ALERT_COOLDOWN_MS) return;
   liquidityWarningState[symbol] = now;
 
-  const spreadText = Number.isFinite(liquidity.spreadPct)
-    ? `${liquidity.spreadPct.toFixed(3)}%`
-    : "N/A";
+  const spreadText = Number.isFinite(liquidity.spreadPct) ? `${liquidity.spreadPct.toFixed(3)}%` : "N/A";
   const volumeText = Number.isFinite(liquidity.quoteVolume24h)
     ? `${liquidity.quoteVolume24h.toLocaleString(undefined, { maximumFractionDigits: 0 })} USDT`
     : "N/A";
 
   await sendMessage(
     `🚫 *LIQUIDITY FILTER — TRADE BLOCKED*\n\n` +
-    `🪙 Coin: *${symbol}*\n` +
-    `📈 Direction: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n\n` +
-    `❌ Liquidity: *INSUFFICIENT*\n` +
-    `📊 24H Quote Volume: *${volumeText}*\n` +
-    `↔️ Spread: *${spreadText}*\n` +
-    `📚 Bid Depth (Top 10): *${Number(liquidity.bidDepth || 0).toFixed(0)} USDT*\n` +
-    `📚 Ask Depth (Top 10): *${Number(liquidity.askDepth || 0).toFixed(0)} USDT*\n\n` +
-    `⚠️ Reason: *${liquidity.reason}*\n\n` +
-    `🚫 *No trade was placed.*\n` +
-    `➡️ The scanner will continue to the next active coin.\n` +
-    `💡 You may deactivate *${symbol}* manually if you do not want it considered.`
+      `🪙 Coin: *${symbol}*\n` +
+      `📈 Direction: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n\n` +
+      `❌ Liquidity: *INSUFFICIENT*\n` +
+      `📊 24H Quote Volume: *${volumeText}*\n` +
+      `↔️ Spread: *${spreadText}*\n` +
+      `📚 Bid Depth (Top 10): *${Number(liquidity.bidDepth || 0).toFixed(0)} USDT*\n` +
+      `📚 Ask Depth (Top 10): *${Number(liquidity.askDepth || 0).toFixed(0)} USDT*\n\n` +
+      `⚠️ Reason: *${liquidity.reason}*\n\n` +
+      `🚫 *No trade was placed.*\n` +
+      `➡️ The scanner will continue to the next active coin.\n` +
+      `💡 You may deactivate *${symbol}* manually if you do not want it considered.`,
   );
 }
 
@@ -2892,14 +2853,14 @@ async function checkAndWarnAbsorption(symbol, direction, closedCandles15) {
 
     await sendMessage(
       `⚠️ *ABSORPTION WARNING*\n\n` +
-      `🪙 Coin: *${symbol}*\n` +
-      `📈 Setup: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n` +
-      `🛑 Detected: *${absorption}*\n\n` +
-      `📊 Volume vs 20-bar average: *${effortRatio.toFixed(2)}x*\n` +
-      `📏 Candle body/range: *${bodyPct}%*\n` +
-      `↩️ Opposing wick/range: *${wickPct}%*\n\n` +
-      `⚠️ Price is showing possible absorption of the directional pressure.\n` +
-      `ℹ️ *INFORMATIONAL ONLY — trade will NOT be blocked.*`
+        `🪙 Coin: *${symbol}*\n` +
+        `📈 Setup: *${direction === "BUY" ? "LONG 🟢" : "SHORT 🔴"}*\n` +
+        `🛑 Detected: *${absorption}*\n\n` +
+        `📊 Volume vs 20-bar average: *${effortRatio.toFixed(2)}x*\n` +
+        `📏 Candle body/range: *${bodyPct}%*\n` +
+        `↩️ Opposing wick/range: *${wickPct}%*\n\n` +
+        `⚠️ Price is showing possible absorption of the directional pressure.\n` +
+        `ℹ️ *INFORMATIONAL ONLY — trade will NOT be blocked.*`,
     );
 
     return true;
@@ -2932,14 +2893,12 @@ function floorToStep(qty, step) {
 function getStopLossPrice(entryPrice, direction) {
   if (!Number.isFinite(entryPrice) || entryPrice <= 0) return null;
 
-  return direction === "BUY"
-    ? entryPrice * (1 - SL_PCT / 100)
-    : entryPrice * (1 + SL_PCT / 100);
+  return direction === "BUY" ? entryPrice * (1 - SL_PCT / 100) : entryPrice * (1 + SL_PCT / 100);
 }
 
 function percentDistance(priceA, priceB) {
   if (!Number.isFinite(priceA) || !Number.isFinite(priceB) || priceA <= 0) return Infinity;
-  return Math.abs(priceA - priceB) / priceA * 100;
+  return (Math.abs(priceA - priceB) / priceA) * 100;
 }
 
 function detectPotentialLiquidityLevels(candles) {
@@ -3003,10 +2962,7 @@ function detectPotentialLiquidityLevels(candles) {
   for (const level of levels) {
     const previous = merged[merged.length - 1];
 
-    if (
-      previous &&
-      percentDistance(previous.price, level.price) <= SL_LIQUIDITY_EQUAL_LEVEL_PERCENT
-    ) {
+    if (previous && percentDistance(previous.price, level.price) <= SL_LIQUIDITY_EQUAL_LEVEL_PERCENT) {
       previous.price = (previous.price + level.price) / 2;
       if (!previous.type.includes(level.type)) {
         previous.type += ` + ${level.type}`;
@@ -3025,14 +2981,16 @@ function detectPotentialLiquidityLevels(candles) {
 function calculateVolumeProfilePOC(candles, binCount = 50) {
   if (!Array.isArray(candles) || candles.length < 20) return null;
 
-  const valid = candles.filter(c => {
-    const h = Number(c.high), l = Number(c.low), v = Number(c.volume);
+  const valid = candles.filter((c) => {
+    const h = Number(c.high),
+      l = Number(c.low),
+      v = Number(c.volume);
     return Number.isFinite(h) && Number.isFinite(l) && Number.isFinite(v) && h >= l && v > 0;
   });
   if (valid.length < 20) return null;
 
-  const rangeHigh = Math.max(...valid.map(c => Number(c.high)));
-  const rangeLow = Math.min(...valid.map(c => Number(c.low)));
+  const rangeHigh = Math.max(...valid.map((c) => Number(c.high)));
+  const rangeLow = Math.min(...valid.map((c) => Number(c.low)));
   const range = rangeHigh - rangeLow;
   if (!Number.isFinite(range) || range <= 0) return rangeLow;
 
@@ -3068,11 +3026,11 @@ function getPOCHoldStatus(candles, poc) {
   }
 
   const lastTwo = candles.slice(-2);
-  const closes = lastTwo.map(c => Number(c.close));
+  const closes = lastTwo.map((c) => Number(c.close));
   if (!closes.every(Number.isFinite)) return { status: "UNAVAILABLE", closes };
 
-  const above = closes.every(close => close > poc);
-  const below = closes.every(close => close < poc);
+  const above = closes.every((close) => close > poc);
+  const below = closes.every((close) => close < poc);
 
   if (above) return { status: "ABOVE", closes };
   if (below) return { status: "BELOW", closes };
@@ -3087,7 +3045,10 @@ function detectPotentialOrderBlocks(candles) {
 
   for (let i = 2; i < recent.length - 2; i++) {
     const base = recent[i];
-    const o = Number(base.open), h = Number(base.high), l = Number(base.low), c = Number(base.close);
+    const o = Number(base.open),
+      h = Number(base.high),
+      l = Number(base.low),
+      c = Number(base.close);
     if (![o, h, l, c].every(Number.isFinite) || h <= l) continue;
 
     const baseBull = c > o;
@@ -3097,8 +3058,14 @@ function detectPotentialOrderBlocks(candles) {
     const baseRange = h - l;
     const f1 = recent[i + 1];
     const f2 = recent[i + 2];
-    const f1o = Number(f1.open), f1h = Number(f1.high), f1l = Number(f1.low), f1c = Number(f1.close);
-    const f2o = Number(f2.open), f2h = Number(f2.high), f2l = Number(f2.low), f2c = Number(f2.close);
+    const f1o = Number(f1.open),
+      f1h = Number(f1.high),
+      f1l = Number(f1.low),
+      f1c = Number(f1.close);
+    const f2o = Number(f2.open),
+      f2h = Number(f2.high),
+      f2l = Number(f2.low),
+      f2c = Number(f2.close);
     if (![f1o, f1h, f1l, f1c, f2o, f2h, f2l, f2c].every(Number.isFinite)) continue;
 
     const displacementRange = Math.max(f1h - f1l, f2h - f2l);
@@ -3116,17 +3083,23 @@ function detectPotentialOrderBlocks(candles) {
 }
 
 function calculateLiquidityEventStats(closed5mCandles, closed1mCandles, liquidityLevel) {
-  if (!Array.isArray(closed1mCandles) || closed1mCandles.length < 10 || !liquidityLevel || !Number.isFinite(Number(liquidityLevel.price))) {
+  if (
+    !Array.isArray(closed1mCandles) ||
+    closed1mCandles.length < 10 ||
+    !liquidityLevel ||
+    !Number.isFinite(Number(liquidityLevel.price))
+  ) {
     return null;
   }
 
   const levelPrice = Number(liquidityLevel.price);
-  const oneMinute = closed1mCandles.filter(c =>
-    Number.isFinite(Number(c.open)) &&
-    Number.isFinite(Number(c.high)) &&
-    Number.isFinite(Number(c.low)) &&
-    Number.isFinite(Number(c.close)) &&
-    Number.isFinite(Number(c.volume))
+  const oneMinute = closed1mCandles.filter(
+    (c) =>
+      Number.isFinite(Number(c.open)) &&
+      Number.isFinite(Number(c.high)) &&
+      Number.isFinite(Number(c.low)) &&
+      Number.isFinite(Number(c.close)) &&
+      Number.isFinite(Number(c.volume)),
   );
   if (oneMinute.length < 10) return null;
 
@@ -3163,13 +3136,11 @@ function calculateLiquidityEventStats(closed5mCandles, closed1mCandles, liquidit
   // Normalize against the coin's own average closed 5M volume.
   const normal5m = Array.isArray(closed5mCandles)
     ? closed5mCandles
-        .filter(c => Number.isFinite(Number(c.volume)))
+        .filter((c) => Number.isFinite(Number(c.volume)))
         .slice(-20)
-        .map(c => Number(c.volume))
+        .map((c) => Number(c.volume))
     : [];
-  const normalVolume = normal5m.length
-    ? normal5m.reduce((sum, v) => sum + v, 0) / normal5m.length
-    : 0;
+  const normalVolume = normal5m.length ? normal5m.reduce((sum, v) => sum + v, 0) / normal5m.length : 0;
 
   return {
     buyVolume,
@@ -3179,7 +3150,7 @@ function calculateLiquidityEventStats(closed5mCandles, closed1mCandles, liquidit
     eventStrength: normalVolume > 0 ? eventVolume / normalVolume : null,
     eventType: buyVolume > sellVolume ? "BUY" : sellVolume > buyVolume ? "SELL" : "BALANCED",
     levelPrice,
-    eventCandles: eventCandles.length
+    eventCandles: eventCandles.length,
   };
 }
 
@@ -3193,7 +3164,7 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
     const [candles, pocCandles, depthRes] = await Promise.all([
       fetchFuturesKlines(symbol, "5m", SL_LIQUIDITY_LOOKBACK_CANDLES + 10),
       fetchFuturesKlines(symbol, "1m", 300),
-      fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${SL_LIQUIDITY_ORDER_BOOK_LEVELS}`)
+      fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${SL_LIQUIDITY_ORDER_BOOK_LEVELS}`),
     ]);
 
     if (!Array.isArray(candles) || candles.length < 10) {
@@ -3201,7 +3172,7 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
         status: "UNAVAILABLE",
         entryPrice,
         slPrice,
-        reason: "Not enough 5M candles available."
+        reason: "Not enough 5M candles available.",
       };
     }
 
@@ -3226,9 +3197,7 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
 
     // Informational only: estimate the size and direction of the liquidity event
     // relative to this coin's normal 5M volume. This does not affect execution.
-    const liquidityEvent = nearest
-      ? calculateLiquidityEventStats(closedCandles, closedPOCCandles, nearest)
-      : null;
+    const liquidityEvent = nearest ? calculateLiquidityEventStats(closedCandles, closedPOCCandles, nearest) : null;
 
     // Visible resting orders near the SL are reported separately.
     let nearestBook = null;
@@ -3236,10 +3205,10 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
       const depth = await depthRes.json();
       const book = [
         ...(Array.isArray(depth?.bids) ? depth.bids : []),
-        ...(Array.isArray(depth?.asks) ? depth.asks : [])
+        ...(Array.isArray(depth?.asks) ? depth.asks : []),
       ]
-        .map(x => ({ price: Number(x[0]), qty: Number(x[1]) }))
-        .filter(x => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.qty));
+        .map((x) => ({ price: Number(x[0]), qty: Number(x[1]) }))
+        .filter((x) => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.qty));
 
       for (const level of book) {
         const distance = percentDistance(slPrice, level.price);
@@ -3248,7 +3217,7 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
             nearestBook = {
               price: level.price,
               qty: level.qty,
-              distancePercent: distance
+              distancePercent: distance,
             };
           }
         }
@@ -3277,14 +3246,25 @@ async function checkStopLossLiquidity(symbol, direction, entryPrice) {
       }
     }
 
-    return { status, entryPrice, slPrice, nearest, nearestBook, nearestOrderBlock, poc, pocHold, liquidityEvent, reason };
+    return {
+      status,
+      entryPrice,
+      slPrice,
+      nearest,
+      nearestBook,
+      nearestOrderBlock,
+      poc,
+      pocHold,
+      liquidityEvent,
+      reason,
+    };
   } catch (err) {
     log(`⚠️ SL liquidity diagnostic error ${symbol}: ${err?.message || err}`);
     return {
       status: "UNAVAILABLE",
       entryPrice,
       slPrice: getStopLossPrice(entryPrice, direction),
-      reason: `Diagnostic error: ${err?.message || err}`
+      reason: `Diagnostic error: ${err?.message || err}`,
     };
   }
 }
@@ -3295,12 +3275,20 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
   const directionText = direction === "BUY" ? "BUY 🟢" : "SELL 🔴";
   const ob = result.nearestOrderBlock;
   const obStatus = ob
-    ? (ob.inside || ob.distancePercent <= SL_ORDER_BLOCK_INSIDE_PERCENT ? "🔴 INSIDE" :
-       ob.distancePercent <= SL_ORDER_BLOCK_NEAR_PERCENT ? "🟡 NEAR" : "🟢 CLEAR")
+    ? ob.inside || ob.distancePercent <= SL_ORDER_BLOCK_INSIDE_PERCENT
+      ? "🔴 INSIDE"
+      : ob.distancePercent <= SL_ORDER_BLOCK_NEAR_PERCENT
+        ? "🟡 NEAR"
+        : "🟢 CLEAR"
     : "🟢 CLEAR";
-  const liqStatus = result.status === "INSIDE" ? "🔴 INSIDE" :
-    result.status === "NEAR" ? "🟡 NEAR" :
-    result.status === "CLEAR" ? "🟢 CLEAR" : "⚪ N/A";
+  const liqStatus =
+    result.status === "INSIDE"
+      ? "🔴 INSIDE"
+      : result.status === "NEAR"
+        ? "🟡 NEAR"
+        : result.status === "CLEAR"
+          ? "🟢 CLEAR"
+          : "⚪ N/A";
 
   let message =
     `🔍 *SL DIAGNOSTIC — ${symbol}*\n\n` +
@@ -3322,8 +3310,7 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
 
   if (result.liquidityEvent) {
     const le = result.liquidityEvent;
-    const eventLabel = le.eventType === "BUY" ? "🟢 BUY" :
-      le.eventType === "SELL" ? "🔴 SELL" : "⚪ BALANCED";
+    const eventLabel = le.eventType === "BUY" ? "🟢 BUY" : le.eventType === "SELL" ? "🔴 SELL" : "⚪ BALANCED";
     message += `\n\n🔥 *LIQUIDITY EVENT*`;
     message += `\n${eventLabel} Volume: *${Number(le.eventType === "BUY" ? le.buyVolume : le.eventType === "SELL" ? le.sellVolume : le.eventVolume).toPrecision(8)}*`;
     message += `\n🟢 BUY Volume: *${Number(le.buyVolume).toPrecision(8)}*`;
@@ -3333,13 +3320,14 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
   }
 
   if (Number.isFinite(result.poc)) {
-    const pocStatus = result.pocHold?.status === "ABOVE"
-      ? "🟢 Price holding above POC"
-      : result.pocHold?.status === "BELOW"
-        ? "🔴 Price holding below POC"
-        : result.pocHold?.status === "NO CLEAR HOLD"
-          ? "⚪ No clear hold"
-          : "⚪ N/A";
+    const pocStatus =
+      result.pocHold?.status === "ABOVE"
+        ? "🟢 Price holding above POC"
+        : result.pocHold?.status === "BELOW"
+          ? "🔴 Price holding below POC"
+          : result.pocHold?.status === "NO CLEAR HOLD"
+            ? "⚪ No clear hold"
+            : "⚪ N/A";
     message += `\n\n📍 POC: *${Number(result.poc).toPrecision(8)}*`;
     message += `\nPOC: *${pocStatus}*`;
   } else {
@@ -3356,7 +3344,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
     attempted: clients.length,
     executed: 0,
     skipped: 0,
-    failed: 0
+    failed: 0,
   };
 
   if (!clients.length) {
@@ -3405,7 +3393,8 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
       try {
         const info = await client.futuresExchangeInfo();
         const symInfo = info.symbols.find((s) => s.symbol === symbol);
-        if (symInfo) lotStep = parseFloat(symInfo.filters.find((f) => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
+        if (symInfo)
+          lotStep = parseFloat(symInfo.filters.find((f) => f.filterType === "LOT_SIZE")?.stepSize || lotStep);
       } catch {}
 
       const qty = floorToStep(rawQty, lotStep);
@@ -3442,7 +3431,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
           entryPrice: markPrice,
           qty,
           userId,
-          timestamp: Date.now()
+          timestamp: Date.now(),
         });
 
         result.executed += 1;
@@ -3508,10 +3497,10 @@ function getTradeProgressStructure(candles, direction, lookback = 6) {
     return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
   }
 
-  const recentHigh = Math.max(...recent.map(c => Number(c.high)));
-  const recentLow = Math.min(...recent.map(c => Number(c.low)));
-  const priorHigh = Math.max(...prior.map(c => Number(c.high)));
-  const priorLow = Math.min(...prior.map(c => Number(c.low)));
+  const recentHigh = Math.max(...recent.map((c) => Number(c.high)));
+  const recentLow = Math.min(...recent.map((c) => Number(c.low)));
+  const priorHigh = Math.max(...prior.map((c) => Number(c.high)));
+  const priorLow = Math.min(...prior.map((c) => Number(c.low)));
   const last = recent[recent.length - 1];
   const prev = recent[recent.length - 2];
 
@@ -3526,16 +3515,16 @@ function getTradeProgressStructure(candles, direction, lookback = 6) {
     const aligned = (hh && hl) || (close > prevClose && recentLow >= priorLow);
     return {
       aligned,
-      status: aligned ? "HH/HL" : (ll || lh ? "LH/LL" : "PULLBACK/FLAT"),
-      text: aligned ? "HH/HL intact" : (ll || lh ? "LH/LL risk" : "pullback/flat")
+      status: aligned ? "HH/HL" : ll || lh ? "LH/LL" : "PULLBACK/FLAT",
+      text: aligned ? "HH/HL intact" : ll || lh ? "LH/LL risk" : "pullback/flat",
     };
   }
 
   const aligned = (lh && ll) || (close < prevClose && recentHigh <= priorHigh);
   return {
     aligned,
-    status: aligned ? "LH/LL" : (hh || hl ? "HH/HL" : "PULLBACK/FLAT"),
-    text: aligned ? "LH/LL intact" : (hh || hl ? "HH/HL risk" : "pullback/flat")
+    status: aligned ? "LH/LL" : hh || hl ? "HH/HL" : "PULLBACK/FLAT",
+    text: aligned ? "LH/LL intact" : hh || hl ? "HH/HL risk" : "pullback/flat",
   };
 }
 
@@ -3552,22 +3541,22 @@ function getTradeProgressBands(candles, direction) {
     const aligned = aboveMid && close >= bands.current.lower;
     return {
       aligned,
-      status: close > bands.current.upper ? "ABOVE UPPER" : (aboveMid ? "ABOVE MID" : "BELOW MID"),
-      text: close > bands.current.upper ? "above upper band" : (aboveMid ? "above EMA mid" : "below EMA mid"),
+      status: close > bands.current.upper ? "ABOVE UPPER" : aboveMid ? "ABOVE MID" : "BELOW MID",
+      text: close > bands.current.upper ? "above upper band" : aboveMid ? "above EMA mid" : "below EMA mid",
       width: bands.current.width,
       widthChange: bands.current.width - bands.previous.width,
-      expanding: bands.current.width > bands.previous.width
+      expanding: bands.current.width > bands.previous.width,
     };
   }
 
   const aligned = belowMid && close <= bands.current.upper;
   return {
     aligned,
-    status: close < bands.current.lower ? "BELOW LOWER" : (belowMid ? "BELOW MID" : "ABOVE MID"),
-    text: close < bands.current.lower ? "below lower band" : (belowMid ? "below EMA mid" : "above EMA mid"),
+    status: close < bands.current.lower ? "BELOW LOWER" : belowMid ? "BELOW MID" : "ABOVE MID",
+    text: close < bands.current.lower ? "below lower band" : belowMid ? "below EMA mid" : "above EMA mid",
     width: bands.current.width,
     widthChange: bands.current.width - bands.previous.width,
-    expanding: bands.current.width > bands.previous.width
+    expanding: bands.current.width > bands.previous.width,
   };
 }
 
@@ -3575,13 +3564,15 @@ function getTradeProgressDelta(candles, direction) {
   const trDelta = calculateTrendResetCumulativeDelta(candles);
   if (!trDelta) return { aligned: false, strong: false, status: "UNAVAILABLE", text: "N/A" };
 
-  const aligned = direction === "BUY"
-    ? trDelta.cumDelta > 0 && trDelta.cumDelta > trDelta.deltaMA
-    : trDelta.cumDelta < 0 && trDelta.cumDelta < trDelta.deltaMA;
+  const aligned =
+    direction === "BUY"
+      ? trDelta.cumDelta > 0 && trDelta.cumDelta > trDelta.deltaMA
+      : trDelta.cumDelta < 0 && trDelta.cumDelta < trDelta.deltaMA;
 
-  const strong = direction === "BUY"
-    ? trDelta.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-    : trDelta.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
+  const strong =
+    direction === "BUY"
+      ? trDelta.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+      : trDelta.deltaStrength <= -DELTA_STRENGTH_THRESHOLD;
 
   return {
     aligned,
@@ -3590,7 +3581,7 @@ function getTradeProgressDelta(candles, direction) {
     text: aligned ? (strong ? "aligned + strong" : "aligned but weaker") : "against trade",
     cumDelta: trDelta.cumDelta,
     deltaMA: trDelta.deltaMA,
-    deltaStrength: trDelta.deltaStrength
+    deltaStrength: trDelta.deltaStrength,
   };
 }
 
@@ -3599,7 +3590,7 @@ function getTradeProgressStc(candles, direction) {
     return { aligned: false, status: "UNAVAILABLE", text: "N/A" };
   }
 
-  const closes = candles.map(c => Number(c.close));
+  const closes = candles.map((c) => Number(c.close));
   const current = calculateSTC(closes);
   const previous = calculateSTC(closes.slice(0, -1));
   if (!Number.isFinite(current) || !Number.isFinite(previous)) {
@@ -3615,7 +3606,7 @@ function getTradeProgressStc(candles, direction) {
     status: aligned ? (movingWithTrade ? "CONFIRMING" : "WEAKENING") : "AGAINST",
     text: aligned ? (movingWithTrade ? "aligned/rising" : "aligned/falling") : "against trade",
     current,
-    previous
+    previous,
   };
 }
 
@@ -3627,9 +3618,7 @@ function getTradeProgress4H(candles, direction) {
   const trend = calculate4HTrendATR(candles);
   if (!trend) return { aligned: false, quality: null, trend: "N/A", text: "N/A" };
 
-  const aligned = direction === "BUY"
-    ? trend.trendState === 1
-    : trend.trendState === -1;
+  const aligned = direction === "BUY" ? trend.trendState === 1 : trend.trendState === -1;
 
   let quality = null;
   try {
@@ -3640,7 +3629,7 @@ function getTradeProgress4H(candles, direction) {
     aligned,
     quality,
     trend: trend.trend || "NEUTRAL",
-    text: aligned ? (quality?.status || "directional") : "trend conflict"
+    text: aligned ? quality?.status || "directional" : "trend conflict",
   };
 }
 
@@ -3658,13 +3647,15 @@ function getTradeProgressAbsorption(candles, direction) {
   const lowerWick = Math.min(Number(candle.open), Number(candle.close)) - Number(candle.low);
   const highVolume = Number(candle.volume) >= avgVolume * ABSORPTION_VOLUME_MULTIPLE;
 
-  const bearishAbsorption = direction === "BUY" &&
+  const bearishAbsorption =
+    direction === "BUY" &&
     Number(candle.close) > Number(candle.open) &&
     highVolume &&
     body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
     upperWick / range >= ABSORPTION_MIN_WICK_TO_RANGE;
 
-  const bullishAbsorption = direction === "SELL" &&
+  const bullishAbsorption =
+    direction === "SELL" &&
     Number(candle.close) < Number(candle.open) &&
     highVolume &&
     body / range <= ABSORPTION_MAX_BODY_TO_RANGE &&
@@ -3672,7 +3663,7 @@ function getTradeProgressAbsorption(candles, direction) {
 
   return {
     warning: bearishAbsorption || bullishAbsorption,
-    text: bearishAbsorption ? "bearish absorption" : (bullishAbsorption ? "bullish absorption" : "none")
+    text: bearishAbsorption ? "bearish absorption" : bullishAbsorption ? "bullish absorption" : "none",
   };
 }
 
@@ -3688,7 +3679,7 @@ function getTradeProgressOBV(candles, direction) {
     return { status: "UNAVAILABLE", text: "N/A", aligned: null };
   }
 
-  const obvCandles = obvSeries.map(value => ({ close: value }));
+  const obvCandles = obvSeries.map((value) => ({ close: value }));
   const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
   const lastIndex = obvSeries.length - 1;
   const current = Number(obvSeries[lastIndex]);
@@ -3702,8 +3693,8 @@ function getTradeProgressOBV(candles, direction) {
   const aligned = direction === "BUY" ? current > average : current < average;
   const rising = current > previous;
   const falling = current < previous;
-  const slope = rising ? "rising" : (falling ? "falling" : "flat");
-  const position = current > average ? "above 50-EMA" : (current < average ? "below 50-EMA" : "at 50-EMA");
+  const slope = rising ? "rising" : falling ? "falling" : "flat";
+  const position = current > average ? "above 50-EMA" : current < average ? "below 50-EMA" : "at 50-EMA";
   const status = aligned ? "ALIGNED" : "AGAINST";
 
   return {
@@ -3712,7 +3703,7 @@ function getTradeProgressOBV(candles, direction) {
     text: `${aligned ? "aligned" : "against trade"}; ${slope}; ${position}`,
     current,
     average,
-    slope
+    slope,
   };
 }
 
@@ -3730,8 +3721,7 @@ function detect15MObvDivergenceAgainstTrade(candles, direction) {
   }
 
   const obv = calculateOBVSeries(candles);
-  if (!Array.isArray(obv) || obv.length !== candles.length ||
-      obv.some(value => !Number.isFinite(Number(value)))) {
+  if (!Array.isArray(obv) || obv.length !== candles.length || obv.some((value) => !Number.isFinite(Number(value)))) {
     return { confirmed: false, status: "UNAVAILABLE", text: "OBV unavailable" };
   }
 
@@ -3754,7 +3744,10 @@ function detect15MObvDivergenceAgainstTrade(candles, direction) {
       }
       // Strict pivots reduce false matches from flat/equal highs or lows.
       if (direction === "BUY") {
-        if (!(price > before && price > after)) { isPivot = false; break; }
+        if (!(price > before && price > after)) {
+          isPivot = false;
+          break;
+        }
       } else if (!(price < before && price < after)) {
         isPivot = false;
         break;
@@ -3768,11 +3761,11 @@ function detect15MObvDivergenceAgainstTrade(candles, direction) {
   }
 
   const latestIndex = pivotIndices[pivotIndices.length - 1];
-  const previousIndex = [...pivotIndices].reverse().find(i => latestIndex - i >= leftRight + 1);
+  const previousIndex = [...pivotIndices].reverse().find((i) => latestIndex - i >= leftRight + 1);
   if (previousIndex === undefined) {
     return { confirmed: false, status: "NONE", text: "confirmed pivots too close together" };
   }
-  if ((candles.length - 1 - latestIndex) > OBV_DIVERGENCE_MAX_PIVOT_AGE) {
+  if (candles.length - 1 - latestIndex > OBV_DIVERGENCE_MAX_PIVOT_AGE) {
     return { confirmed: false, status: "STALE", text: "latest divergence pivot is stale" };
   }
 
@@ -3784,16 +3777,10 @@ function detect15MObvDivergenceAgainstTrade(candles, direction) {
     return { confirmed: false, status: "UNAVAILABLE", text: "pivot values unavailable" };
   }
 
-  const priceMovedAgainstTrade = direction === "BUY"
-    ? latestPrice > previousPrice
-    : latestPrice < previousPrice;
-  const obvMovedAgainstTrade = direction === "BUY"
-    ? latestObv < previousObv
-    : latestObv > previousObv;
+  const priceMovedAgainstTrade = direction === "BUY" ? latestPrice > previousPrice : latestPrice < previousPrice;
+  const obvMovedAgainstTrade = direction === "BUY" ? latestObv < previousObv : latestObv > previousObv;
   const confirmed = priceMovedAgainstTrade && obvMovedAgainstTrade;
-  const priceChangePct = previousPrice !== 0
-    ? ((latestPrice - previousPrice) / previousPrice) * 100
-    : null;
+  const priceChangePct = previousPrice !== 0 ? ((latestPrice - previousPrice) / previousPrice) * 100 : null;
 
   return {
     confirmed,
@@ -3808,7 +3795,7 @@ function detect15MObvDivergenceAgainstTrade(candles, direction) {
     priceChangePct,
     text: confirmed
       ? `${direction === "BUY" ? "bearish" : "bullish"} divergence confirmed on closed 15M candles`
-      : "no confirmed divergence against trade"
+      : "no confirmed divergence against trade",
   };
 }
 
@@ -3834,24 +3821,36 @@ function evaluateTradeProgress(direction, data, previous) {
   const meaningfulProfit = Number.isFinite(data.progress?.averageMovePct) && data.progress.averageMovePct >= 1;
 
   const coreConflicts = [momentumConflict, obvConflict, structureConflict].filter(Boolean).length;
-  const supportingConflicts = [higherConflict, stcConflict, bandConflict, deltaConflict, data.absorption.warning].filter(Boolean).length;
+  const supportingConflicts = [
+    higherConflict,
+    stcConflict,
+    bandConflict,
+    deltaConflict,
+    data.absorption.warning,
+  ].filter(Boolean).length;
   const weakeningSignals = coreConflicts + supportingConflicts;
 
   // Require multiple independent failures before issuing the strongest warning.
-  if ((structureConflict && momentumConflict && obvConflict) ||
-      (higherConflict && structureConflict && (momentumConflict || obvConflict))) {
+  if (
+    (structureConflict && momentumConflict && obvConflict) ||
+    (higherConflict && structureConflict && (momentumConflict || obvConflict))
+  ) {
     return "EXIT_WARNING";
   }
 
-  if ((meaningfulProfit && coreConflicts >= 2) ||
-      (structureConflict && obvConflict && (momentumConflict || deltaConflict)) ||
-      (losingProgress && coreConflicts >= 2 && supportingConflicts >= 1)) {
+  if (
+    (meaningfulProfit && coreConflicts >= 2) ||
+    (structureConflict && obvConflict && (momentumConflict || deltaConflict)) ||
+    (losingProgress && coreConflicts >= 2 && supportingConflicts >= 1)
+  ) {
     return "PROTECT_PROFIT";
   }
 
-  if (weakeningSignals >= 3 ||
-      (previous?.state === "HOLD" && weakeningSignals >= 2) ||
-      (losingProgress && coreConflicts >= 1)) {
+  if (
+    weakeningSignals >= 3 ||
+    (previous?.state === "HOLD" && weakeningSignals >= 2) ||
+    (losingProgress && coreConflicts >= 1)
+  ) {
     return "CAUTION";
   }
 
@@ -3888,7 +3887,7 @@ async function monitorTradeProgress() {
           fetchFuturesKlines(symbol, "4h", 100),
           fetchFuturesKlines(symbol, "1h", 80),
           fetchFuturesKlines(symbol, "15m", 150),
-          fetchFuturesKlines(symbol, "5m", 100)
+          fetchFuturesKlines(symbol, "5m", 100),
         ]);
 
         const closed4H = candles4H?.slice(0, -1) || [];
@@ -3902,13 +3901,11 @@ async function monitorTradeProgress() {
 
         const higher = getTradeProgress4H(closed4H, side);
         const momentum = calculate1HMomentum(closed1H);
-        const momentumAligned = side === "BUY"
-          ? Number(momentum?.current) > 0
-          : Number(momentum?.current) < 0;
+        const momentumAligned = side === "BUY" ? Number(momentum?.current) > 0 : Number(momentum?.current) < 0;
         const momentumData = {
           aligned: momentumAligned,
           accelerating: momentum?.state === "ACCELERATING",
-          text: momentumAligned ? (momentum?.state || "aligned") : "against trade"
+          text: momentumAligned ? momentum?.state || "aligned" : "against trade",
         };
 
         const stc = getTradeProgressStc(closed1H, side);
@@ -3930,23 +3927,26 @@ async function monitorTradeProgress() {
           obv,
           obvDivergence,
           absorption,
-          structure5
+          structure5,
         };
 
         const previous = tradeProgressPrevious[groupKey] || null;
         const currentClose = Number(closed15[closed15.length - 1].close);
-        const moveValues = group.map(({ pos }) => side === "BUY"
-          ? ((currentClose - Number(pos.entryPrice)) / Number(pos.entryPrice)) * 100
-          : ((Number(pos.entryPrice) - currentClose) / Number(pos.entryPrice)) * 100
-        ).filter(Number.isFinite);
+        const moveValues = group
+          .map(({ pos }) =>
+            side === "BUY"
+              ? ((currentClose - Number(pos.entryPrice)) / Number(pos.entryPrice)) * 100
+              : ((Number(pos.entryPrice) - currentClose) / Number(pos.entryPrice)) * 100,
+          )
+          .filter(Number.isFinite);
         const progress = {
           averageMovePct: moveValues.length
             ? moveValues.reduce((sum, value) => sum + value, 0) / moveValues.length
             : null,
           bestMovePct: moveValues.length ? Math.max(...moveValues) : null,
           worstMovePct: moveValues.length ? Math.min(...moveValues) : null,
-          profitableCount: moveValues.filter(value => value > 0).length,
-          losingCount: moveValues.filter(value => value < 0).length
+          profitableCount: moveValues.filter((value) => value > 0).length,
+          losingCount: moveValues.filter((value) => value < 0).length,
         };
         data.progress = progress;
         const state = evaluateTradeProgress(side, data, previous);
@@ -3956,15 +3956,18 @@ async function monitorTradeProgress() {
           try {
             await sendMessage(
               `🚨 *CONFIRMED 15M OBV DIVERGENCE — AUTO-CLOSE*\n\n` +
-              `• Symbol: *${symbol}*\n` +
-              `• Open position: *${side}*\n` +
-              `• Divergence: *${obvDivergence.status}* against the position\n` +
-              `• Price pivot: ${obvDivergence.previousPrice} → ${obvDivergence.latestPrice}` +
-              `${Number.isFinite(obvDivergence.priceChangePct) ? ` (${obvDivergence.priceChangePct >= 0 ? "+" : ""}${obvDivergence.priceChangePct.toFixed(2)}%)` : ""}\n` +
-              `• OBV at pivots: ${obvDivergence.previousObv.toFixed(0)} → ${obvDivergence.latestObv.toFixed(0)}\n\n` +
-              `Confirmed using closed 15M candles. Triggering the same tracked-position close path as /close ${symbol}.`
+                `• Symbol: *${symbol}*\n` +
+                `• Open position: *${side}*\n` +
+                `• Divergence: *${obvDivergence.status}* against the position\n` +
+                `• Price pivot: ${obvDivergence.previousPrice} → ${obvDivergence.latestPrice}` +
+                `${Number.isFinite(obvDivergence.priceChangePct) ? ` (${obvDivergence.priceChangePct >= 0 ? "+" : ""}${obvDivergence.priceChangePct.toFixed(2)}%)` : ""}\n` +
+                `• OBV at pivots: ${obvDivergence.previousObv.toFixed(0)} → ${obvDivergence.latestObv.toFixed(0)}\n\n` +
+                `Confirmed using closed 15M candles. Triggering the same tracked-position close path as /close ${symbol}.`,
             );
-            await closeTrackedSymbolPositions(symbol, `confirmed 15M OBV ${obvDivergence.status.toLowerCase()} divergence against ${side}`);
+            await closeTrackedSymbolPositions(
+              symbol,
+              `confirmed 15M OBV ${obvDivergence.status.toLowerCase()} divergence against ${side}`,
+            );
           } finally {
             obvDivergenceCloseInProgress.delete(symbol);
           }
@@ -3976,9 +3979,10 @@ async function monitorTradeProgress() {
 
         let userLines = "";
         for (const { userId, pos } of group) {
-          const move = side === "BUY"
-            ? ((currentClose - pos.entryPrice) / pos.entryPrice) * 100
-            : ((pos.entryPrice - currentClose) / pos.entryPrice) * 100;
+          const move =
+            side === "BUY"
+              ? ((currentClose - pos.entryPrice) / pos.entryPrice) * 100
+              : ((pos.entryPrice - currentClose) / pos.entryPrice) * 100;
 
           userLines +=
             `• User ${userId}: *${move >= 0 ? "+" : ""}${move.toFixed(2)}%*` +
@@ -3989,7 +3993,8 @@ async function monitorTradeProgress() {
         const report =
           `📡 *15M TRADE PROGRESS — ${symbol} ${side}*\n\n` +
           `👥 Users holding this position: ${group.length}\n` +
-          userLines + `\n` +
+          userLines +
+          `\n` +
           `${formatTradeProgressState(state)}\n\n` +
           `4️⃣ 4H TREND\n` +
           `• Direction: ${higher.trend}\n` +
@@ -4006,9 +4011,9 @@ async function monitorTradeProgress() {
           `• Pressure: ${delta.text}\n` +
           `• Strength: ${Number.isFinite(delta.deltaStrength) ? delta.deltaStrength.toFixed(2) : "N/A"}\n\n` +
           `📈 15M ON-BALANCE VOLUME (OBV)\n` +
-          `• Confirmation: ${obv.status === "UNAVAILABLE" ? "unavailable" : (obv.aligned ? "✅ aligned with trade" : "❌ against trade")}\n` +
+          `• Confirmation: ${obv.status === "UNAVAILABLE" ? "unavailable" : obv.aligned ? "✅ aligned with trade" : "❌ against trade"}\n` +
           `• Trend: ${obv.slope || "N/A"}\n` +
-          `• Position vs ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.current) && Number.isFinite(obv.average) ? (obv.current > obv.average ? "above" : (obv.current < obv.average ? "below" : "at")) : "N/A"}\n` +
+          `• Position vs ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.current) && Number.isFinite(obv.average) ? (obv.current > obv.average ? "above" : obv.current < obv.average ? "below" : "at") : "N/A"}\n` +
           `• OBV: ${Number.isFinite(obv.current) ? obv.current.toFixed(0) : "N/A"} | ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.average) ? obv.average.toFixed(0) : "N/A"}\n` +
           `• Divergence against trade: ${obvDivergence.confirmed ? `🚨 CONFIRMED ${obvDivergence.status}` : obvDivergence.text}\n\n` +
           `5️⃣ 5M PRICE STRUCTURE\n` +
@@ -4024,7 +4029,7 @@ async function monitorTradeProgress() {
           deltaStrength: delta.deltaStrength,
           stc: stc.current,
           bandWidth: bands.width,
-          averageMovePct: progress.averageMovePct
+          averageMovePct: progress.averageMovePct,
         };
       } catch (err) {
         log(`❌ 15M trade progress error ${groupKey}: ${err?.message || err}`);
@@ -4035,8 +4040,7 @@ async function monitorTradeProgress() {
   // Clean state for positions that no longer exist.
   for (const key of Object.keys(tradeProgressLastReport)) {
     const [symbol, side] = key.split(":");
-    const stillExists = Object.values(activePositions[symbol] || {})
-      .some(pos => pos.side === side);
+    const stillExists = Object.values(activePositions[symbol] || {}).some((pos) => pos.side === side);
 
     if (!stillExists) {
       delete tradeProgressLastReport[key];
@@ -4046,11 +4050,8 @@ async function monitorTradeProgress() {
 }
 
 setInterval(() => {
-  monitorTradeProgress().catch(err =>
-    log(`❌ Trade progress scheduler error: ${err?.message || err}`)
-  );
+  monitorTradeProgress().catch((err) => log(`❌ Trade progress scheduler error: ${err?.message || err}`));
 }, TRADE_PROGRESS_SCHEDULER_MS);
-
 
 // --- Monitor positions (TP/SL/Trailing Stop) ---
 async function monitorPositions() {
@@ -4065,9 +4066,7 @@ async function monitorPositions() {
 
       try {
         const positions = await client.futuresPositionRisk();
-        const p = Array.isArray(positions)
-          ? positions.find((x) => x.symbol === symbol)
-          : null;
+        const p = Array.isArray(positions) ? positions.find((x) => x.symbol === symbol) : null;
         const amt = p ? parseFloat(p.positionAmt || 0) : 0;
 
         if (!p || amt === 0) {
@@ -4110,11 +4109,11 @@ async function monitorPositions() {
 
             await sendMessage(
               `🏃 RUNNER ACTIVATED: *${symbol}* ${pos.side}\n\n` +
-              `💰 Profit: +${move.toFixed(2)}%\n` +
-              `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
-              `📊 Runner Mode: ACTIVE\n` +
-              `🎯 Runner Rule: +1% more within 30 minutes\n\n` +
-              `👥 All users' ${symbol} positions are now in runner mode.`
+                `💰 Profit: +${move.toFixed(2)}%\n` +
+                `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
+                `📊 Runner Mode: ACTIVE\n` +
+                `🎯 Runner Rule: +1% more within 30 minutes\n\n` +
+                `👥 All users' ${symbol} positions are now in runner mode.`,
             );
           }
         }
@@ -4155,13 +4154,15 @@ async function monitorPositions() {
 
               await sendMessage(
                 `🎯 RUNNER TARGET REACHED: *${symbol}* ${pos.side}\n` +
-                `Profit: +${move.toFixed(2)}%\n` +
-                `Target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
-                `30-minute runner extension requirement satisfied.`
+                  `Profit: +${move.toFixed(2)}%\n` +
+                  `Target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
+                  `30-minute runner extension requirement satisfied.`,
               );
             }
-          } else if (!pos.runnerTargetReached &&
-                     Date.now() - Number(pos.runnerActivatedAt) >= RUNNER_POST_ACTIVATION_TIMEOUT_MS) {
+          } else if (
+            !pos.runnerTargetReached &&
+            Date.now() - Number(pos.runnerActivatedAt) >= RUNNER_POST_ACTIVATION_TIMEOUT_MS
+          ) {
             // Use the exact same close-order path as /close SYMBOL.
             // Only this timed-out user's position is removed from tracking.
             await closeTrackedPositionOrder(client, symbol, pos);
@@ -4171,10 +4172,10 @@ async function monitorPositions() {
 
             await sendMessage(
               `⏱️ RUNNER TIMEOUT EXIT: *${symbol}* ${pos.side}\n` +
-              `Current Profit: ${move.toFixed(2)}%\n` +
-              `Runner activated at: +${Number(pos.runnerActivationMove || RUNNER_ACTIVATION_PCT).toFixed(2)}%\n` +
-              `Required target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
-              `The extra +${RUNNER_POST_ACTIVATION_EXTRA_PCT.toFixed(2)}% was not reached within 30 minutes.`
+                `Current Profit: ${move.toFixed(2)}%\n` +
+                `Runner activated at: +${Number(pos.runnerActivationMove || RUNNER_ACTIVATION_PCT).toFixed(2)}%\n` +
+                `Required target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
+                `The extra +${RUNNER_POST_ACTIVATION_EXTRA_PCT.toFixed(2)}% was not reached within 30 minutes.`,
             );
 
             continue;
@@ -4200,9 +4201,7 @@ async function monitorPositions() {
             delete activePositions[symbol][userId];
             saveActivePositions();
 
-            await sendMessage(
-              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
-            );
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
 
             continue;
           }
@@ -4220,9 +4219,7 @@ async function monitorPositions() {
             delete activePositions[symbol][userId];
             saveActivePositions();
 
-            await sendMessage(
-              `🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`
-            );
+            await sendMessage(`🔒 Trailing Stop Hit: *${symbol}* (User ${userId})`);
 
             continue;
           }
@@ -4247,27 +4244,18 @@ async function monitorPositions() {
           delete activePositions[symbol][userId];
           saveActivePositions();
 
-          await sendMessage(
-            `🔻 STOP LOSS: *${symbol}* User ${userId}`
-          );
+          await sendMessage(`🔻 STOP LOSS: *${symbol}* User ${userId}`);
 
           continue;
         }
       } catch (err) {
-        log(
-          `❌ monitorPositions error ${userId} ${symbol}: ${
-            err?.message || err
-          }`
-        );
+        log(`❌ monitorPositions error ${userId} ${symbol}: ${err?.message || err}`);
       }
     }
 
     // Reset notification state when there are no positions left
     // for this symbol, allowing a future trade to activate a new runner.
-    if (
-      !activePositions[symbol] ||
-      Object.keys(activePositions[symbol]).length === 0
-    ) {
+    if (!activePositions[symbol] || Object.keys(activePositions[symbol]).length === 0) {
       delete runnerActivationNotified[symbol];
       delete slLiquidityReportSent[symbol];
       delete activePositions[symbol];
@@ -4300,9 +4288,7 @@ async function monitorPriceActivations() {
     if (priceActivated[symbol] === true) continue;
 
     try {
-      const res = await fetch(
-        `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`
-      );
+      const res = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -4324,10 +4310,8 @@ async function monitorPriceActivations() {
         continue;
       }
 
-      const crossedUp =
-        previousPrice < activationPrice && currentPrice >= activationPrice;
-      const crossedDown =
-        previousPrice > activationPrice && currentPrice <= activationPrice;
+      const crossedUp = previousPrice < activationPrice && currentPrice >= activationPrice;
+      const crossedDown = previousPrice > activationPrice && currentPrice <= activationPrice;
 
       if (crossedUp || crossedDown) {
         // Automatically perform the same state change as /activate <symbol>.
@@ -4335,23 +4319,22 @@ async function monitorPriceActivations() {
         // for the normal trading scanner, not just unlock the price gate.
         priceActivated[symbol] = true;
         symbolActive[symbol] = true;
-        
+
         const crossDirection = crossedUp ? "UPWARD ⬆️" : "DOWNWARD ⬇️";
 
         await sendMessage(
           `🔓 *PRICE ACTIVATION TRIGGERED*\n\n` +
-          `🪙 Coin: *${symbol}*\n` +
-          `🎯 Activation Price: *${activationPrice}*\n` +
-          `💰 Current Price: *${currentPrice}*\n` +
-          `↕️ Cross: *${crossDirection}*\n\n` +
-          `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
-          `This is the same action as /activate ${symbol}.\n` +
-          `The 1H STC is monitored for trend context. Entry execution is based on zone, absorption/continuation and 1-candle directional volume imbalance.`
+            `🪙 Coin: *${symbol}*\n` +
+            `🎯 Activation Price: *${activationPrice}*\n` +
+            `💰 Current Price: *${currentPrice}*\n` +
+            `↕️ Cross: *${crossDirection}*\n\n` +
+            `✅ *${symbol}* has been automatically ACTIVATED for trading.\n` +
+            `This is the same action as /activate ${symbol}.\n` +
+            `The 1H STC is monitored for trend context. Entry execution is based on zone, absorption/continuation and 1-candle directional volume imbalance.`,
         );
 
         log(
-          `🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. ` +
-          `Trigger: ${activationPrice}. Cross: ${crossDirection}`
+          `🔓 PRICE ACTIVATED ${symbol} at ${currentPrice}. ` + `Trigger: ${activationPrice}. Cross: ${crossDirection}`,
         );
       }
 
@@ -4495,10 +4478,7 @@ setInterval(async () => {
       }
 
       // Price activation gate. This does not change /activate or /deactivate.
-      if (
-        priceActivationLevels[symbol] !== undefined &&
-        priceActivated[symbol] !== true
-      ) continue;
+      if (priceActivationLevels[symbol] !== undefined && priceActivated[symbol] !== true) continue;
 
       if (symbolCooldowns[symbol] && now - symbolCooldowns[symbol] < COOLDOWN_MS) continue;
 
@@ -4536,9 +4516,8 @@ setInterval(async () => {
                 const flipDelta = calculateTrendResetCumulativeDelta(flipClosedCandles5);
 
                 if (flipDelta && Number.isFinite(flipDelta.deltaStrength)) {
-                  const pressureStrength = autoCycle === "BULL"
-                    ? Math.max(0, -flipDelta.deltaStrength)
-                    : Math.max(0, flipDelta.deltaStrength);
+                  const pressureStrength =
+                    autoCycle === "BULL" ? Math.max(0, -flipDelta.deltaStrength) : Math.max(0, flipDelta.deltaStrength);
                   opposingDelta = pressureStrength.toFixed(2);
                 }
 
@@ -4559,9 +4538,8 @@ setInterval(async () => {
 
                 const totalPressureVol = buyVol + sellVol;
                 if (totalPressureVol > 0) {
-                  const pct = autoCycle === "BULL"
-                    ? (sellVol / totalPressureVol) * 100
-                    : (buyVol / totalPressureVol) * 100;
+                  const pct =
+                    autoCycle === "BULL" ? (sellVol / totalPressureVol) * 100 : (buyVol / totalPressureVol) * 100;
                   opposingVolume = `${pct.toFixed(1)}%`;
                 }
               }
@@ -4569,20 +4547,15 @@ setInterval(async () => {
               log(`⚠️ STC flip pressure measurement failed for ${symbol}: ${pressureErr?.message || pressureErr}`);
             }
 
-            const pressureEmoji =
-              opposingDelta !== "N/A" && Number(opposingDelta) >= 0.80
-                ? "⚠️"
-                : "✅";
+            const pressureEmoji = opposingDelta !== "N/A" && Number(opposingDelta) >= 0.8 ? "⚠️" : "✅";
 
             await sendMessage(
               `🔄 1H STC FLIP — *${symbol}*\n` +
-              `${previousCycle === "BULL" ? "🟢" : "🔴"}→${autoCycle === "BULL" ? "🟢" : "🔴"} *${autoCycle}*\n` +
-              `${pressureEmoji} Opposing ${opposingDirection}: ${opposingDelta} Delta | ${opposingVolume} Vol`,
+                `${previousCycle === "BULL" ? "🟢" : "🔴"}→${autoCycle === "BULL" ? "🟢" : "🔴"} *${autoCycle}*\n` +
+                `${pressureEmoji} Opposing ${opposingDirection}: ${opposingDelta} Delta | ${opposingVolume} Vol`,
             );
           } else {
-            await sendMessage(
-              `🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`,
-            );
+            await sendMessage(`🔁 1H STC Auto Cycle Set for *${symbol}*: *${autoCycle}*`);
           }
         }
       } else if (!currentCycle[symbol]) {
@@ -4592,528 +4565,502 @@ setInterval(async () => {
       const trendCycle = currentCycle[symbol];
 
       // =====================================================
-// SCRIPT 2 ENTRY LOGIC — ZONE → REVERSAL OR CONTINUATION
-// =====================================================
-// 1) Price must first interact with a potential liquidity level
-//    or order block that is located at/near an ATR high/low area
-//    associated with the current-day or previous-day high/low.
-// 2) DECISION ORDER: absorption is checked FIRST at the ATR extreme.
-//    A qualifying absorption owns the setup decision. ATR LOW bullish
-//    absorption = BUY reversal; ATR HIGH bearish absorption = SELL reversal.
-//    A mismatched qualifying absorption blocks continuation rather than
-//    being interpreted as continuation pressure.
-// 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
-//    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
-//    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
-// 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
-// 5) A direction-neutral market-activity gate must allow NEW setups.
-//    Adequate momentum keeps the original 0.25 threshold and 2-of-3 activity
-//    score; high momentum is classified at 0.40. Low momentum remains blocked.
-// 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
-//
-// 1H STC flip/pressure messages, absorption, liquidity, SL and
-// trade-management messages remain available as context/diagnostics.
-// =====================================================
+      // SCRIPT 2 ENTRY LOGIC — ZONE → REVERSAL OR CONTINUATION
+      // =====================================================
+      // 1) Price must first interact with a potential liquidity level
+      //    or order block that is located at/near an ATR high/low area
+      //    associated with the current-day or previous-day high/low.
+      // 2) DECISION ORDER: absorption is checked FIRST at the ATR extreme.
+      //    A qualifying absorption owns the setup decision. ATR LOW bullish
+      //    absorption = BUY reversal; ATR HIGH bearish absorption = SELL reversal.
+      //    A mismatched qualifying absorption blocks continuation rather than
+      //    being interpreted as continuation pressure.
+      // 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
+      //    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
+      //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
+      // 4) The latest CLOSED 5M candle directional volume imbalance threshold is 70%.
+      // 5) A direction-neutral market-activity gate must allow NEW setups.
+      //    Adequate momentum keeps the original 0.25 threshold and 2-of-3 activity
+      //    score; high momentum is classified at 0.40. Low momentum remains blocked.
+      // 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
+      //
+      // 1H STC flip/pressure messages, absorption, liquidity, SL and
+      // trade-management messages remain available as context/diagnostics.
+      // =====================================================
 
-const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
-if (!candles5 || candles5.length < 40) continue;
+      const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
+      if (!candles5 || candles5.length < 40) continue;
 
-// Only CLOSED 5M candles are used for the volume imbalance.
-const closedCandles5 = candles5.slice(0, -1);
+      // Only CLOSED 5M candles are used for the volume imbalance.
+      const closedCandles5 = candles5.slice(0, -1);
 
-// Global market-activity regime is informational only. All regimes may create
-// setups; continuation BOS handling uses the breakout candle's own momentum.
-const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
-const script2LatestClosedCandleKey = getScript2CandleKey(
-  closedCandles5[closedCandles5.length - 1],
-  String(closedCandles5.length - 1)
-);
-
-
-maybeSendScript2MomentumRegimeCheckpoint(
-  symbol,
-  script2MomentumRegime,
-  script2LatestClosedCandleKey
-);
-
-// Current market price is used only to determine whether price has
-// reached/interacted with a detected zone.
-let script2CurrentPrice = null;
-try {
-  const priceRes = await fetch(
-    `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
-  );
-  if (priceRes.ok) {
-    const priceData = await priceRes.json();
-    script2CurrentPrice = Number(priceData?.price);
-  }
-} catch (priceErr) {
-  log(`⚠️ Script 2 price check failed for ${symbol}: ${priceErr?.message || priceErr}`);
-}
-
-if (!Number.isFinite(script2CurrentPrice)) continue;
-
-// Keep the existing 15M absorption warning informational only.
-const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
-if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
-  const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
-  await checkAndWarnAbsorption(
-    symbol,
-    trendCycle === "BULL" ? "BUY" : "SELL",
-    closedCandles15ForAbsorption
-  );
-}
-
-// -----------------------------------------------------
-// MASTER UNLOCK — CLOSED 15M + 5M TREND-RESET DELTA
-// -----------------------------------------------------
-// Stage 1: 15M and 5M Delta must agree directionally relative to their own
-// Delta MAs. Send one Telegram message when a new alignment event begins.
-// Stage 2: the existing adaptive strength threshold must be met by the 5M
-// Delta before creating NEW Script 2 setups. Once a continuation candidate
-// exists, keep monitoring its anchored BOS/retest state even if alignment
-// later weakens; delta unlock must not interrupt an already-staged candidate.
-// All delta inputs below use CLOSED candles only.
-const activeContinuationBeforeDeltaGate =
-  script2PendingSetups[symbol]?.setupType === "CONTINUATION";
-const closedCandles15ForDelta =
-  candles15ForAbsorption && candles15ForAbsorption.length > 1
-    ? candles15ForAbsorption.slice(0, -1)
-    : null;
-
-if (!closedCandles15ForDelta || closedCandles15ForDelta.length < 30) {
-  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: 15M delta data unavailable; continuing monitoring of existing continuation setup.`);
-}
-
-const delta15ForGate = closedCandles15ForDelta && closedCandles15ForDelta.length >= 30
-  ? calculateTrendResetCumulativeDelta(closedCandles15ForDelta)
-  : null;
-const delta5ForGate = calculateTrendResetCumulativeDelta(closedCandles5);
-
-if (!delta15ForGate || !delta5ForGate) {
-  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: delta unavailable; continuing monitoring of existing continuation setup.`);
-}
-
-const getDeltaPositionDirection = (delta) => {
-  if (delta.cumDelta > 0 && delta.cumDelta > delta.deltaMA) return "BUY";
-  if (delta.cumDelta < 0 && delta.cumDelta < delta.deltaMA) return "SELL";
-  return null;
-};
-
-const delta15Direction = delta15ForGate ? getDeltaPositionDirection(delta15ForGate) : null;
-const delta5Direction = delta5ForGate ? getDeltaPositionDirection(delta5ForGate) : null;
-const alignedDeltaDirection =
-  delta15Direction && delta15Direction === delta5Direction
-    ? delta15Direction
-    : null;
-
-let deltaGateState = script2DeltaGateState[symbol] || {
-  alignmentDirection: null,
-  confirmed: false
-};
-
-if (!alignedDeltaDirection) {
-  if (deltaGateState.alignmentDirection && !deltaGateState.confirmed) {
-    log(`⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending NEW-SETUP confirmation cancelled.`);
-  }
-  script2DeltaGateState[symbol] = {
-    alignmentDirection: null,
-    confirmed: false
-  };
-  deltaGateState = script2DeltaGateState[symbol];
-  if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: 15M/5M delta alignment is currently absent; monitoring existing continuation BOS/retest anyway.`);
-}
-
-if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaDirection) {
-  deltaGateState = {
-    alignmentDirection: alignedDeltaDirection,
-    confirmed: false,
-    alignmentStartedAt: Date.now()
-  };
-  script2DeltaGateState[symbol] = deltaGateState;
-
-  // Do not carry a staged setup in the opposite direction into a new
-  // directional Delta alignment event.
-  if (
-    script2PendingSetups[symbol] &&
-    script2PendingSetups[symbol].setupType !== "CONTINUATION" &&
-    script2PendingSetups[symbol].direction !== alignedDeltaDirection
-  ) {
-    delete script2PendingSetups[symbol];
-  }
-
-  await sendMessage(
-    `🧭 *15M + 5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
-    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
-    `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
-    `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
-    `⏳ Waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
-    `🔒 Setups remain locked until confirmation.`
-  );
-}
-
-// The 5M threshold is the second-stage confirmation. It is evaluated only
-// after directional 15M/5M alignment has been established.
-const delta5StrengthConfirmed = Boolean(delta5ForGate && alignedDeltaDirection) && (
-  alignedDeltaDirection === "BUY"
-    ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
-    : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
-);
-
-if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
-  deltaGateState.confirmed = true;
-  deltaGateState.confirmedAt = Date.now();
-  script2DeltaGateState[symbol] = deltaGateState;
-
-  await sendMessage(
-    `✅ *5M DELTA STRENGTH CONFIRMED* — *${symbol}*\n\n` +
-    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
-    `📊 5M Delta strength: *${delta5ForGate.deltaStrength.toFixed(2)}*\n` +
-    `🎯 Required threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
-    `🔓 *${alignedDeltaDirection} setups unlocked.* Existing setup, OBV, liquidity and execution checks remain in force.`
-  );
-}
-
-if (!deltaGateState.confirmed && !activeContinuationBeforeDeltaGate) {
-  continue;
-}
-
-if (!deltaGateState.confirmed && activeContinuationBeforeDeltaGate) {
-  log(`ℹ️ ${symbol}: delta gate is not currently confirmed; new setup creation remains locked, existing continuation monitoring stays active.`);
-}
-
-// Existing candidates may be monitored without a live delta unlock, but
-// new reversal/continuation candidates must still pass the master delta gate.
-if (deltaGateState.confirmed) {
-// -----------------------------------------------------
-// STEP 1 — ZONE REACH
-// -----------------------------------------------------
-
-const currentDayCandle = dailyCandles[dailyCandles.length - 1];
-const currentDayHigh = Number(currentDayCandle?.high);
-const currentDayLow = Number(currentDayCandle?.low);
-const previousDayHigh = Number(lastClosedDaily?.high);
-const previousDayLow = Number(lastClosedDaily?.low);
-
-const script2Zone = findScript2Zone(
-  closedCandles5,
-  script2CurrentPrice,
-  atr,
-  currentDayHigh,
-  currentDayLow,
-  previousDayHigh,
-  previousDayLow
-);
-let script2ZoneVolumeDelta = null;
-
-if (script2Zone) {
-  // Recalculate on every scan while the zone is active, not only when the
-  // one-time ZONE REACHED Telegram checkpoint is first sent.
-  script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
-
-  // Zone volume delta is observational only. Record it for an existing
-  // continuation if available, but never use it to unlock or block execution.
-  const stagedSetupForZoneDelta = script2PendingSetups[symbol];
-  if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
-    stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
-  }
-  const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
-  if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
-    script2CheckpointState[symbol] = { zoneKey: zoneCheckpointKey, zoneNotified: false };
-  }
-  if (!script2CheckpointState[symbol].zoneNotified) {
-    script2CheckpointState[symbol].zoneNotified = true;
-    await sendMessage(
-      `📍 *ZONE REACHED* — *${symbol}*\n` +
-      `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
-      `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
-      `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
-      `ℹ️ Zone reach and zone volume delta are informational only; they do not block setup creation.`
-    );
-  }
-
-  // Observation-only liquidity-zone absorption tracking.
-  await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
-
-  // ---------------------------------------------------
-  // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
-  // ---------------------------------------------------
-  // Market regime is informational only; it does not gate reversal setup creation.
-  { // Unconditional: market regime is informational only.
-  const atrSide = script2Zone.atrLocation?.side;
-  const absorption = detectScript2Absorption(closedCandles5, script2Zone);
-  const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
-  const latestClosedCandleKey = getScript2CandleKey(
-    latestClosedCandle,
-    String(closedCandles5.length - 1)
-  );
-
-  // ===================================================
-  // DECISION GATE — PREVIOUS-DAY REVERSAL / ALL-DAY CONTINUATION
-  // ===================================================
-  // Previous-day high/low (PDH/PDL) can produce either a reversal
-  // or a continuation. Current-day high/low (CDH/CDL) can produce
-  // continuation only.
-  //
-  // The selected ATR location is authoritative because getScript2AtrLocation()
-  // already chooses the nearest qualifying current/previous-day level.
-  const liquiditySource = String(script2Zone.atrLocation?.name || "");
-  const isPreviousDayLiquidity = liquiditySource === "PREVIOUS DAY HIGH" ||
-    liquiditySource === "PREVIOUS DAY LOW";
-  const hasAbsorption = Boolean(absorption?.direction);
-  const reversalEligible = isPreviousDayLiquidity && hasAbsorption;
-
-  if (reversalEligible) {
-    // Only qualifying absorption at PDH/PDL may create a reversal.
-    // A mismatched absorption is not continuation evidence.
-    // IMPORTANT: never cancel an already-active continuation setup merely
-    // because ATR expansion/reselection now points at another zone. The
-    // active continuation owns its anchored zone until success or expiry.
-    const activeContinuationSetup = script2PendingSetups[symbol]?.setupType === "CONTINUATION";
-    if (!activeContinuationSetup) {
-      delete script2PendingSetups[symbol];
-    }
-
-    const reversalDirection =
-      atrSide === "LOW" && absorption.direction === "BUY" ? "BUY" :
-      atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
-      null;
-
-    // Absorption selects reversal direction. It must agree with the already-
-    // unlocked 15M/5M delta direction. Zone volume delta is informational only
-    // and must not delay or reject an otherwise-valid reversal candidate.
-    const reversalOrderFlowConfirmed = Boolean(
-      reversalDirection &&
-      reversalDirection === alignedDeltaDirection
-    );
-
-    if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
-      const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
-
-      await sendMessage(
-        `🛑 *ABSORPTION CONFIRMED* — *${symbol}*\n` +
-        `🟢 ${absorption.type}\n` +
-        `📊 Volume: *${Number(absorption.effortRatio).toFixed(2)}x average*\n` +
-        `📏 Body/Range: *${(Number(absorption.bodyRatio) * 100).toFixed(1)}%*\n` +
-        `↩️ Wick/Range: *${(Number(absorption.wickRatio) * 100).toFixed(1)}%*`
+      // Global market-activity regime is informational only. All regimes may create
+      // setups; continuation BOS handling uses the breakout candle's own momentum.
+      const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
+      const script2LatestClosedCandleKey = getScript2CandleKey(
+        closedCandles5[closedCandles5.length - 1],
+        String(closedCandles5.length - 1),
       );
 
-      await sendMessage(
-        `🔄 *REVERSAL DIRECTION CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${reversalDirection}*`
-      );
+      maybeSendScript2MomentumRegimeCheckpoint(symbol, script2MomentumRegime, script2LatestClosedCandleKey);
 
-      // Absorption is the sole authority for reversal direction. The latest
-      // CLOSED 5M candle's imbalance is a directional confirmation gate only;
-      // it must meet the 70% threshold in the already-selected absorption
-      // direction and must never choose or flip the reversal direction.
-      const reversalImbalancePct = Number(
-        volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"]
-      );
+      // Current market price is used only to determine whether price has
+      // reached/interacted with a detected zone.
+      let script2CurrentPrice = null;
+      try {
+        const priceRes = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
+        if (priceRes.ok) {
+          const priceData = await priceRes.json();
+          script2CurrentPrice = Number(priceData?.price);
+        }
+      } catch (priceErr) {
+        log(`⚠️ Script 2 price check failed for ${symbol}: ${priceErr?.message || priceErr}`);
+      }
 
-      if (
-        Number.isFinite(reversalImbalancePct) &&
-        reversalImbalancePct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT
-      ) {
-        await sendMessage(
-          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${reversalImbalancePct.toFixed(1)}%*\n` +
-          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
+      if (!Number.isFinite(script2CurrentPrice)) continue;
+
+      // Keep the existing 15M absorption warning informational only.
+      const candles15ForAbsorption = await fetchFuturesKlines(symbol, "15m", 40);
+      if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
+        const closedCandles15ForAbsorption = candles15ForAbsorption.slice(0, -1);
+        await checkAndWarnAbsorption(symbol, trendCycle === "BULL" ? "BUY" : "SELL", closedCandles15ForAbsorption);
+      }
+
+      // -----------------------------------------------------
+      // MASTER UNLOCK — CLOSED 15M + 5M TREND-RESET DELTA
+      // -----------------------------------------------------
+      // Stage 1: 15M and 5M Delta must agree directionally relative to their own
+      // Delta MAs. Send one Telegram message when a new alignment event begins.
+      // Stage 2: the existing adaptive strength threshold must be met by the 5M
+      // Delta before creating NEW Script 2 setups. Once a continuation candidate
+      // exists, keep monitoring its anchored BOS/retest state even if alignment
+      // later weakens; delta unlock must not interrupt an already-staged candidate.
+      // All delta inputs below use CLOSED candles only.
+      const activeContinuationBeforeDeltaGate = script2PendingSetups[symbol]?.setupType === "CONTINUATION";
+      const closedCandles15ForDelta =
+        candles15ForAbsorption && candles15ForAbsorption.length > 1 ? candles15ForAbsorption.slice(0, -1) : null;
+
+      if (!closedCandles15ForDelta || closedCandles15ForDelta.length < 30) {
+        script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
+        if (!activeContinuationBeforeDeltaGate) continue;
+        log(`ℹ️ ${symbol}: 15M delta data unavailable; continuing monitoring of existing continuation setup.`);
+      }
+
+      const delta15ForGate =
+        closedCandles15ForDelta && closedCandles15ForDelta.length >= 30
+          ? calculateTrendResetCumulativeDelta(closedCandles15ForDelta)
+          : null;
+      const delta5ForGate = calculateTrendResetCumulativeDelta(closedCandles5);
+
+      if (!delta15ForGate || !delta5ForGate) {
+        script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
+        if (!activeContinuationBeforeDeltaGate) continue;
+        log(`ℹ️ ${symbol}: delta unavailable; continuing monitoring of existing continuation setup.`);
+      }
+
+      const getDeltaPositionDirection = (delta) => {
+        if (delta.cumDelta > 0 && delta.cumDelta > delta.deltaMA) return "BUY";
+        if (delta.cumDelta < 0 && delta.cumDelta < delta.deltaMA) return "SELL";
+        return null;
+      };
+
+      const delta15Direction = delta15ForGate ? getDeltaPositionDirection(delta15ForGate) : null;
+      const delta5Direction = delta5ForGate ? getDeltaPositionDirection(delta5ForGate) : null;
+      const alignedDeltaDirection = delta15Direction && delta15Direction === delta5Direction ? delta15Direction : null;
+
+      let deltaGateState = script2DeltaGateState[symbol] || {
+        alignmentDirection: null,
+        confirmed: false,
+      };
+
+      if (!alignedDeltaDirection) {
+        if (deltaGateState.alignmentDirection && !deltaGateState.confirmed) {
+          log(
+            `⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending NEW-SETUP confirmation cancelled.`,
+          );
+        }
+        script2DeltaGateState[symbol] = {
+          alignmentDirection: null,
+          confirmed: false,
+        };
+        deltaGateState = script2DeltaGateState[symbol];
+        if (!activeContinuationBeforeDeltaGate) continue;
+        log(
+          `ℹ️ ${symbol}: 15M/5M delta alignment is currently absent; monitoring existing continuation BOS/retest anyway.`,
         );
-        script2PendingSetups[symbol] = {
-          direction: reversalDirection,
-          setupType: "REVERSAL",
-          absorption,
-          zone: script2Zone,
-          detectedAt: Date.now(),
-          executionDirectionNotified: false,
-          obvNotified: false,
-          liquidityNotified: false,
-          volumeImbalance: {
-            ...volumeImbalance,
-            direction: reversalDirection
+      }
+
+      if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaDirection) {
+        deltaGateState = {
+          alignmentDirection: alignedDeltaDirection,
+          confirmed: false,
+          alignmentStartedAt: Date.now(),
+        };
+        script2DeltaGateState[symbol] = deltaGateState;
+
+        // Do not carry a staged setup in the opposite direction into a new
+        // directional Delta alignment event.
+        if (
+          script2PendingSetups[symbol] &&
+          script2PendingSetups[symbol].setupType !== "CONTINUATION" &&
+          script2PendingSetups[symbol].direction !== alignedDeltaDirection
+        ) {
+          delete script2PendingSetups[symbol];
+        }
+
+        await sendMessage(
+          `🧭 *15M + 5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
+            `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
+            `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
+            `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
+            `⏳ Waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
+            `🔒 Setups remain locked until confirmation.`,
+        );
+      }
+
+      // The 5M threshold is the second-stage confirmation. It is evaluated only
+      // after directional 15M/5M alignment has been established.
+      const delta5StrengthConfirmed =
+        Boolean(delta5ForGate && alignedDeltaDirection) &&
+        (alignedDeltaDirection === "BUY"
+          ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
+          : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD);
+
+      if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
+        deltaGateState.confirmed = true;
+        deltaGateState.confirmedAt = Date.now();
+        script2DeltaGateState[symbol] = deltaGateState;
+
+        await sendMessage(
+          `✅ *5M DELTA STRENGTH CONFIRMED* — *${symbol}*\n\n` +
+            `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
+            `📊 5M Delta strength: *${delta5ForGate.deltaStrength.toFixed(2)}*\n` +
+            `🎯 Required threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
+            `🔓 *${alignedDeltaDirection} setups unlocked.* Existing setup, OBV, liquidity and execution checks remain in force.`,
+        );
+      }
+
+      if (!deltaGateState.confirmed && !activeContinuationBeforeDeltaGate) {
+        continue;
+      }
+
+      if (!deltaGateState.confirmed && activeContinuationBeforeDeltaGate) {
+        log(
+          `ℹ️ ${symbol}: delta gate is not currently confirmed; new setup creation remains locked, existing continuation monitoring stays active.`,
+        );
+      }
+
+      // Existing candidates may be monitored without a live delta unlock, but
+      // new reversal/continuation candidates must still pass the master delta gate.
+      if (deltaGateState.confirmed) {
+        // -----------------------------------------------------
+        // STEP 1 — ZONE REACH
+        // -----------------------------------------------------
+
+        const currentDayCandle = dailyCandles[dailyCandles.length - 1];
+        const currentDayHigh = Number(currentDayCandle?.high);
+        const currentDayLow = Number(currentDayCandle?.low);
+        const previousDayHigh = Number(lastClosedDaily?.high);
+        const previousDayLow = Number(lastClosedDaily?.low);
+
+        const script2Zone = findScript2Zone(
+          closedCandles5,
+          script2CurrentPrice,
+          atr,
+          currentDayHigh,
+          currentDayLow,
+          previousDayHigh,
+          previousDayLow,
+        );
+        let script2ZoneVolumeDelta = null;
+
+        if (script2Zone) {
+          // Recalculate on every scan while the zone is active, not only when the
+          // one-time ZONE REACHED Telegram checkpoint is first sent.
+          script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
+
+          // Zone volume delta is observational only. Record it for an existing
+          // continuation if available, but never use it to unlock or block execution.
+          const stagedSetupForZoneDelta = script2PendingSetups[symbol];
+          if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
+            stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
           }
-        };
+          const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
+          if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
+            script2CheckpointState[symbol] = { zoneKey: zoneCheckpointKey, zoneNotified: false };
+          }
+          if (!script2CheckpointState[symbol].zoneNotified) {
+            script2CheckpointState[symbol].zoneNotified = true;
+            await sendMessage(
+              `📍 *ZONE REACHED* — *${symbol}*\n` +
+                `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
+                `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
+                `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
+                `ℹ️ Zone reach and zone volume delta are informational only; they do not block setup creation.`,
+            );
+          }
+
+          // Observation-only liquidity-zone absorption tracking.
+          await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
+
+          // ---------------------------------------------------
+          // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
+          // ---------------------------------------------------
+          // Market regime is informational only; it does not gate reversal setup creation.
+          {
+            // Unconditional: market regime is informational only.
+            const atrSide = script2Zone.atrLocation?.side;
+            const absorption = detectScript2Absorption(closedCandles5, script2Zone);
+            const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
+            const latestClosedCandleKey = getScript2CandleKey(latestClosedCandle, String(closedCandles5.length - 1));
+
+            // ===================================================
+            // DECISION GATE — PREVIOUS-DAY REVERSAL / ALL-DAY CONTINUATION
+            // ===================================================
+            // Previous-day high/low (PDH/PDL) can produce either a reversal
+            // or a continuation. Current-day high/low (CDH/CDL) can produce
+            // continuation only.
+            //
+            // The selected ATR location is authoritative because getScript2AtrLocation()
+            // already chooses the nearest qualifying current/previous-day level.
+            const liquiditySource = String(script2Zone.atrLocation?.name || "");
+            const isPreviousDayLiquidity =
+              liquiditySource === "PREVIOUS DAY HIGH" || liquiditySource === "PREVIOUS DAY LOW";
+            const hasAbsorption = Boolean(absorption?.direction);
+            const reversalEligible = isPreviousDayLiquidity && hasAbsorption;
+
+            if (reversalEligible) {
+              // Only qualifying absorption at PDH/PDL may create a reversal.
+              // A mismatched absorption is not continuation evidence.
+              // IMPORTANT: never cancel an already-active continuation setup merely
+              // because ATR expansion/reselection now points at another zone. The
+              // active continuation owns its anchored zone until success or expiry.
+              const activeContinuationSetup = script2PendingSetups[symbol]?.setupType === "CONTINUATION";
+              if (!activeContinuationSetup) {
+                delete script2PendingSetups[symbol];
+              }
+
+              const reversalDirection =
+                atrSide === "LOW" && absorption.direction === "BUY"
+                  ? "BUY"
+                  : atrSide === "HIGH" && absorption.direction === "SELL"
+                    ? "SELL"
+                    : null;
+
+              // Absorption selects reversal direction. It must agree with the already-
+              // unlocked 15M/5M delta direction. Zone volume delta is informational only
+              // and must not delay or reject an otherwise-valid reversal candidate.
+              const reversalOrderFlowConfirmed = Boolean(
+                reversalDirection && reversalDirection === alignedDeltaDirection,
+              );
+
+              if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
+                const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
+
+                await sendMessage(
+                  `🛑 *ABSORPTION CONFIRMED* — *${symbol}*\n` +
+                    `🟢 ${absorption.type}\n` +
+                    `📊 Volume: *${Number(absorption.effortRatio).toFixed(2)}x average*\n` +
+                    `📏 Body/Range: *${(Number(absorption.bodyRatio) * 100).toFixed(1)}%*\n` +
+                    `↩️ Wick/Range: *${(Number(absorption.wickRatio) * 100).toFixed(1)}%*`,
+                );
+
+                await sendMessage(
+                  `🔄 *REVERSAL DIRECTION CONFIRMED* — *${symbol}*\n` + `➡️ Direction: *${reversalDirection}*`,
+                );
+
+                // Absorption is the sole authority for reversal direction. The latest
+                // CLOSED 5M candle's imbalance is a directional confirmation gate only;
+                // it must meet the 70% threshold in the already-selected absorption
+                // direction and must never choose or flip the reversal direction.
+                const reversalImbalancePct = Number(
+                  volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"],
+                );
+
+                if (
+                  Number.isFinite(reversalImbalancePct) &&
+                  reversalImbalancePct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT
+                ) {
+                  await sendMessage(
+                    `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+                      `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${reversalImbalancePct.toFixed(1)}%*\n` +
+                      `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`,
+                  );
+                  script2PendingSetups[symbol] = {
+                    direction: reversalDirection,
+                    setupType: "REVERSAL",
+                    absorption,
+                    zone: script2Zone,
+                    detectedAt: Date.now(),
+                    executionDirectionNotified: false,
+                    obvNotified: false,
+                    liquidityNotified: false,
+                    volumeImbalance: {
+                      ...volumeImbalance,
+                      direction: reversalDirection,
+                    },
+                  };
+                }
+              }
+            }
+          }
+        }
+
+        // -----------------------------------------------------
+        // STEP 2B — DELTA-UNLOCKED VOLUME-IMBALANCE CANDLE STRUCTURE
+        // -----------------------------------------------------
+        // Delta must already have unlocked this symbol before this section runs.
+        // The latest CLOSED 5M candle is measured for directional volume imbalance.
+        // If imbalance reaches the existing 70% threshold, that SAME candle defines
+        // the continuation breakout structure: BUY breaks its high; SELL breaks its low.
+        // Zone reach and zone-volume delta are informational only. Continuation
+        // candidates can be created away from a detected zone once the unlocked delta
+        // direction and latest closed candle's imbalance agree. Reversals still require
+        // their previous-day high/low absorption context.
+        // Market regime is informational only; it does not gate continuation setup creation.
+        {
+          // Unconditional: market regime is informational only.
+          const existing = script2PendingSetups[symbol];
+          const activeContinuation = existing?.setupType === "CONTINUATION";
+          const activeReversal = existing?.setupType === "REVERSAL";
+
+          if (!activeContinuation && !activeReversal) {
+            const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
+            const continuationDirection = volumeImbalance?.direction || null;
+            const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
+            const latestClosedCandleKey = getScript2CandleKey(latestClosedCandle, String(closedCandles5.length - 1));
+
+            // The unlocked 15M/5M delta direction is authoritative. Zone reach and
+            // zone-volume delta do not gate candidate creation; the latest closed 5M
+            // imbalance direction must simply agree with the unlocked direction.
+            const deltaThresholdDirection = deltaGateState.alignmentDirection;
+            const continuationDirectionConfirmed = Boolean(
+              deltaThresholdDirection && continuationDirection === deltaThresholdDirection,
+            );
+
+            if (continuationDirection && latestClosedCandle && continuationDirectionConfirmed) {
+              const structurePrice =
+                continuationDirection === "BUY" ? Number(latestClosedCandle.high) : Number(latestClosedCandle.low);
+
+              if (Number.isFinite(structurePrice) && structurePrice > 0) {
+                const structureType =
+                  continuationDirection === "BUY" ? "IMBALANCE CANDLE HIGH" : "IMBALANCE CANDLE LOW";
+                const anchoredZone = {
+                  kind: "IMBALANCE_CANDLE",
+                  type: structureType,
+                  price: structurePrice,
+                  high: Number(latestClosedCandle.high),
+                  low: Number(latestClosedCandle.low),
+                  direction: continuationDirection,
+                  candleKey: latestClosedCandleKey,
+                };
+
+                script2PendingSetups[symbol] = {
+                  direction: continuationDirection,
+                  setupType: "CONTINUATION",
+                  stage: "CANDIDATE",
+                  absorption: null,
+                  zone: anchoredZone,
+                  zoneLocked: true,
+                  anchoredZoneKey: `${structureType}:${structurePrice}:${latestClosedCandleKey}`,
+                  anchoredBoundary: structurePrice,
+                  detectedAt: Date.now(),
+                  createdCandleKey: latestClosedCandleKey,
+                  breakCandleKey: null,
+                  continuationMode: "PENDING",
+                  breakNotified: false,
+                  highMomentumNotified: false,
+                  executionDirectionNotified: false,
+                  obvNotified: false,
+                  liquidityNotified: false,
+                  volumeImbalanceNotified: false,
+                  candidateNotified: false,
+                  zoneVolumeDeltaConfirmed: true,
+                  zoneVolumeDelta: script2ZoneVolumeDelta,
+                  volumeImbalance,
+                };
+
+                await sendMessage(
+                  `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+                    `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
+                    `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`,
+                );
+
+                await sendMessage(
+                  `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
+                    `Direction: *${continuationDirection}*\n` +
+                    `🕯️ Structure candle: *latest closed 5M imbalance candle*\n` +
+                    `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
+                    `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`,
+                );
+              }
+            }
+          }
+        }
+      } // End new-setup creation gate. Existing staged continuation still advances below.
+
+      // -----------------------------------------------------
+      // STEP 3 — ADVANCE A STAGED CONTINUATION
+      // -----------------------------------------------------
+      // This runs even after price leaves the original zone. Once a candidate
+      // exists, the bot watches for BOS without a fixed BOS time limit. A BOS candle
+      // with directional momentum >= 0.50 can execute directly; >= 0.25 requires retest.
+      const confirmedContinuationDirection = await processScript2Continuation(
+        symbol,
+        closedCandles5,
+        now,
+        script2CurrentPrice,
+        script2MomentumRegime.regime,
+      );
+
+      // If a continuation was confirmed, it is now executable through the
+      // same existing manual-direction and liquidity gates below.
+      if (confirmedContinuationDirection) {
+        const confirmedSetup = script2PendingSetups[symbol];
+        if (confirmedSetup) {
+          confirmedSetup.direction = confirmedContinuationDirection;
+        }
       }
-    }
-  }
-  }
-}
 
-// -----------------------------------------------------
-// STEP 2B — DELTA-UNLOCKED VOLUME-IMBALANCE CANDLE STRUCTURE
-// -----------------------------------------------------
-// Delta must already have unlocked this symbol before this section runs.
-// The latest CLOSED 5M candle is measured for directional volume imbalance.
-// If imbalance reaches the existing 70% threshold, that SAME candle defines
-// the continuation breakout structure: BUY breaks its high; SELL breaks its low.
-// Zone reach and zone-volume delta are informational only. Continuation
-// candidates can be created away from a detected zone once the unlocked delta
-// direction and latest closed candle's imbalance agree. Reversals still require
-// their previous-day high/low absorption context.
-// Market regime is informational only; it does not gate continuation setup creation.
-{ // Unconditional: market regime is informational only.
-  const existing = script2PendingSetups[symbol];
-  const activeContinuation = existing?.setupType === "CONTINUATION";
-  const activeReversal = existing?.setupType === "REVERSAL";
-
-  if (!activeContinuation && !activeReversal) {
-    const volumeImbalance = calculateOneCandleVolumeImbalance(closedCandles5);
-    const continuationDirection = volumeImbalance?.direction || null;
-    const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
-    const latestClosedCandleKey = getScript2CandleKey(
-      latestClosedCandle,
-      String(closedCandles5.length - 1)
-    );
-
-    // The unlocked 15M/5M delta direction is authoritative. Zone reach and
-    // zone-volume delta do not gate candidate creation; the latest closed 5M
-    // imbalance direction must simply agree with the unlocked direction.
-    const deltaThresholdDirection = deltaGateState.alignmentDirection;
-    const continuationDirectionConfirmed = Boolean(
-      deltaThresholdDirection &&
-      continuationDirection === deltaThresholdDirection
-    );
-
-    if (continuationDirection && latestClosedCandle && continuationDirectionConfirmed) {
-      const structurePrice = continuationDirection === "BUY"
-        ? Number(latestClosedCandle.high)
-        : Number(latestClosedCandle.low);
-
-      if (Number.isFinite(structurePrice) && structurePrice > 0) {
-        const structureType = continuationDirection === "BUY"
-          ? "IMBALANCE CANDLE HIGH"
-          : "IMBALANCE CANDLE LOW";
-        const anchoredZone = {
-          kind: "IMBALANCE_CANDLE",
-          type: structureType,
-          price: structurePrice,
-          high: Number(latestClosedCandle.high),
-          low: Number(latestClosedCandle.low),
-          direction: continuationDirection,
-          candleKey: latestClosedCandleKey
-        };
-
-        script2PendingSetups[symbol] = {
-          direction: continuationDirection,
-          setupType: "CONTINUATION",
-          stage: "CANDIDATE",
-          absorption: null,
-          zone: anchoredZone,
-          zoneLocked: true,
-          anchoredZoneKey: `${structureType}:${structurePrice}:${latestClosedCandleKey}`,
-          anchoredBoundary: structurePrice,
-          detectedAt: Date.now(),
-          createdCandleKey: latestClosedCandleKey,
-          breakCandleKey: null,
-          continuationMode: "PENDING",
-          breakNotified: false,
-          highMomentumNotified: false,
-          executionDirectionNotified: false,
-          obvNotified: false,
-          liquidityNotified: false,
-          volumeImbalanceNotified: false,
-          candidateNotified: false,
-          zoneVolumeDeltaConfirmed: true,
-          zoneVolumeDelta: script2ZoneVolumeDelta,
-          volumeImbalance
-        };
-
-        await sendMessage(
-          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
-          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
-        );
-
-        await sendMessage(
-          `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
-          `Direction: *${continuationDirection}*\n` +
-          `🕯️ Structure candle: *latest closed 5M imbalance candle*\n` +
-          `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
-          `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`
-        );
+      // If price is no longer detected in a qualifying zone, keep the observation
+      // alive briefly to avoid false exits caused by a single scanner miss.
+      if (!script2Zone) {
+        await finalizeScript2ZoneAbsorptionObservation(symbol, now);
       }
-    }
-  }
-}
 
-} // End new-setup creation gate. Existing staged continuation still advances below.
+      // -----------------------------------------------------
+      // STEP 4 — EXECUTION DIRECTION + OBV CONFIRMATION
+      // -----------------------------------------------------
+      // STC is completely removed from execution. Once a valid setup is
+      // created and its direction is confirmed, the existing 5M OBV
+      // confirmation is the final directional confirmation before liquidity
+      // is checked and the market order is placed.
 
-// -----------------------------------------------------
-// STEP 3 — ADVANCE A STAGED CONTINUATION
-// -----------------------------------------------------
-// This runs even after price leaves the original zone. Once a candidate
-// exists, the bot watches for BOS without a fixed BOS time limit. A BOS candle
-// with directional momentum >= 0.50 can execute directly; >= 0.25 requires retest.
-const confirmedContinuationDirection = await processScript2Continuation(
-  symbol,
-  closedCandles5,
-  now,
-  script2CurrentPrice,
-  script2MomentumRegime.regime
-);
+      let direction = null;
+      const pendingSetup = script2PendingSetups[symbol];
 
-// If a continuation was confirmed, it is now executable through the
-// same existing manual-direction and liquidity gates below.
-if (confirmedContinuationDirection) {
-  const confirmedSetup = script2PendingSetups[symbol];
-  if (confirmedSetup) {
-    confirmedSetup.direction = confirmedContinuationDirection;
-  }
-}
+      if (pendingSetup) {
+        // Continuations are executable after high-momentum BOS or after the
+        // adequate-momentum BOS + failed-reclaim retest sequence.
+        const continuationZoneDeltaReady =
+          pendingSetup.setupType !== "CONTINUATION" || pendingSetup.zoneVolumeDeltaConfirmed === true;
+        const continuationReady =
+          continuationZoneDeltaReady &&
+          (pendingSetup.setupType !== "CONTINUATION" ||
+            pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" ||
+            pendingSetup.stage === "RETEST_CONFIRMED");
 
-// If price is no longer detected in a qualifying zone, keep the observation
-// alive briefly to avoid false exits caused by a single scanner miss.
-if (!script2Zone) {
-  await finalizeScript2ZoneAbsorptionObservation(symbol, now);
-}
+        const setupDirection = pendingSetup.direction;
 
-// -----------------------------------------------------
-// STEP 4 — EXECUTION DIRECTION + OBV CONFIRMATION
-// -----------------------------------------------------
-// STC is completely removed from execution. Once a valid setup is
-// created and its direction is confirmed, the existing 5M OBV
-// confirmation is the final directional confirmation before liquidity
-// is checked and the market order is placed.
+        // Manual BULL/BEAR mode controls execution direction only.
+        // It does not reintroduce STC into the entry logic.
+        // /setbull = BUY only, /setbear = SELL only, /setauto = no manual restriction.
+        const manualDirection = MANUAL_CYCLE === "BULL" ? "BUY" : MANUAL_CYCLE === "BEAR" ? "SELL" : null;
 
-let direction = null;
-const pendingSetup = script2PendingSetups[symbol];
-
-if (pendingSetup) {
-  // Continuations are executable after high-momentum BOS or after the
-  // adequate-momentum BOS + failed-reclaim retest sequence.
-  const continuationZoneDeltaReady =
-    pendingSetup.setupType !== "CONTINUATION" ||
-    pendingSetup.zoneVolumeDeltaConfirmed === true;
-  const continuationReady =
-    continuationZoneDeltaReady && (
-      pendingSetup.setupType !== "CONTINUATION" ||
-      pendingSetup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" ||
-      pendingSetup.stage === "RETEST_CONFIRMED"
-    );
-
-  const setupDirection = pendingSetup.direction;
-
-  // Manual BULL/BEAR mode controls execution direction only.
-  // It does not reintroduce STC into the entry logic.
-  // /setbull = BUY only, /setbear = SELL only, /setauto = no manual restriction.
-  const manualDirection =
-    MANUAL_CYCLE === "BULL" ? "BUY" :
-    MANUAL_CYCLE === "BEAR" ? "SELL" :
-    null;
-
-  if (
-    continuationReady &&
-    (!manualDirection || setupDirection === manualDirection)
-  ) {
-    direction = setupDirection;
-  }
-}
+        if (continuationReady && (!manualDirection || setupDirection === manualDirection)) {
+          direction = setupDirection;
+        }
+      }
 
       // =====================================================
       // LIQUIDITY GATE + EXECUTION
@@ -5135,10 +5082,7 @@ if (pendingSetup) {
 
         if (!pendingSetup.executionDirectionNotified) {
           pendingSetup.executionDirectionNotified = true;
-          await sendMessage(
-            `🧭 *EXECUTION DIRECTION PASSED* — *${symbol}*\n` +
-            `🟢 ${direction} allowed`
-          );
+          await sendMessage(`🧭 *EXECUTION DIRECTION PASSED* — *${symbol}*\n` + `🟢 ${direction} allowed`);
         }
 
         // ---------------------------------------------------
@@ -5157,9 +5101,9 @@ if (pendingSetup) {
           pendingSetup.obvNotified = true;
           await sendMessage(
             `📈 *OBV CONFIRMATION PASSED* — *${symbol}*\n` +
-            `${direction === "BUY" ? "🟢" : "🔴"} ${direction}\n` +
-            `📊 Latest closed 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA\n` +
-            `✅ OBV is on the correct side of the EMA — no fresh crossover required`
+              `${direction === "BUY" ? "🟢" : "🔴"} ${direction}\n` +
+              `📊 Latest closed 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA\n` +
+              `✅ OBV is on the correct side of the EMA — no fresh crossover required`,
           );
         }
 
@@ -5171,29 +5115,27 @@ if (pendingSetup) {
 
         if (liquidity.passed && !pendingSetup.liquidityNotified) {
           pendingSetup.liquidityNotified = true;
-          await sendMessage(
-            `💧 *LIQUIDITY GATE PASSED* — *${symbol}*\n` +
-            `📚 Order-book liquidity sufficient`
-          );
+          await sendMessage(`💧 *LIQUIDITY GATE PASSED* — *${symbol}*\n` + `📚 Order-book liquidity sufficient`);
         }
 
         const setupForReport = pendingSetup;
         const executionResult = await executeMarketOrderForAllUsers(symbol, direction);
 
         if (executionResult.executed > 0) {
-          const modeText = setupForReport.setupType === "CONTINUATION"
-            ? (setupForReport.continuationMode === "HIGH_MOMENTUM"
-              ? "🔥 HIGH-MOMENTUM CONTINUATION"
-              : "⛔ CONTINUATION REJECTED")
-            : "🔄 REVERSAL";
+          const modeText =
+            setupForReport.setupType === "CONTINUATION"
+              ? setupForReport.continuationMode === "HIGH_MOMENTUM"
+                ? "🔥 HIGH-MOMENTUM CONTINUATION"
+                : "⛔ CONTINUATION REJECTED"
+              : "🔄 REVERSAL";
 
           await sendMessage(
             `🚀 *${modeText} ENTRY EXECUTED* — *${symbol}*\n` +
-            `${direction === "BUY" ? "🟢" : "🔴"} *${symbol} ${direction}*\n` +
-            `📈 Market Regime (info only): *${script2MomentumRegime.regime.replace("_MOMENTUM", "")}*\n` +
-            `👥 Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
-            (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
-            (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : "")
+              `${direction === "BUY" ? "🟢" : "🔴"} *${symbol} ${direction}*\n` +
+              `📈 Market Regime (info only): *${script2MomentumRegime.regime.replace("_MOMENTUM", "")}*\n` +
+              `👥 Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
+              (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
+              (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : ""),
           );
         }
 
@@ -5201,14 +5143,16 @@ if (pendingSetup) {
           delete script2PendingSetups[symbol];
           symbolCooldowns[symbol] = now;
         } else {
-          log(`⚠️ ${symbol}: no user order executed (${executionResult.attempted || 0} attempted, ${executionResult.failed || 0} failed, ${executionResult.skipped || 0} skipped). Keeping setup active and not starting cooldown so the opportunity is not silently consumed.`);
+          log(
+            `⚠️ ${symbol}: no user order executed (${executionResult.attempted || 0} attempted, ${executionResult.failed || 0} failed, ${executionResult.skipped || 0} skipped). Keeping setup active and not starting cooldown so the opportunity is not silently consumed.`,
+          );
           if (!setupForReport.orderFailureNotified) {
             setupForReport.orderFailureNotified = true;
             await sendMessage(
               `⚠️ *ENTRY NOT COMPLETED — SETUP RETAINED* — *${symbol}*\n` +
-              `Direction: *${direction}*\n` +
-              `👥 Attempted: ${executionResult.attempted || 0} | Failed: ${executionResult.failed || 0} | Skipped: ${executionResult.skipped || 0}\n` +
-              `🔁 Setup retained; cooldown not started. Check the user/order error logs.`
+                `Direction: *${direction}*\n` +
+                `👥 Attempted: ${executionResult.attempted || 0} | Failed: ${executionResult.failed || 0} | Skipped: ${executionResult.skipped || 0}\n` +
+                `🔁 Setup retained; cooldown not started. Check the user/order error logs.`,
             );
           }
         }
@@ -5274,7 +5218,6 @@ if (pendingSetup) {
 // 1H  = MOMENTUM / TREND HEALTH
 //======================================================
 
-
 //======================================================
 // 4H TREND SETTINGS
 //
@@ -5295,478 +5238,223 @@ const TREND_ATR_MULTIPLIER = 1;
 // and a meaningful 4H EMA slope before it can enter the TOP 7.
 const TREND_QUALITY_LOOKBACK = 10;
 const TREND_QUALITY_STRUCTURE_LOOKBACK = 5;
-const TREND_QUALITY_MIN_EFFICIENCY = 0.30;
-const TREND_QUALITY_MIN_ATR_RATIO = 0.80;
+const TREND_QUALITY_MIN_EFFICIENCY = 0.3;
+const TREND_QUALITY_MIN_ATR_RATIO = 0.8;
 const TREND_QUALITY_MIN_EMA_SLOPE_PCT = 0.05;
-
-
 
 //======================================================
 // CUMULATIVE DELTA
 //======================================================
 
 function calculateCumulativeDelta(candles) {
+  if (!candles || candles.length < 2) {
+    return [];
+  }
 
-    if (
-        !candles ||
-        candles.length < 2
-    ) {
+  let delta = 0;
 
-        return [];
+  const cumulativeDelta = [];
 
+  for (const candle of candles) {
+    const open = Number(candle.open);
+
+    const close = Number(candle.close);
+
+    const volume = Number(candle.volume);
+
+    if (!Number.isFinite(open) || !Number.isFinite(close) || !Number.isFinite(volume)) {
+      continue;
     }
 
-    let delta = 0;
-
-    const cumulativeDelta = [];
-
-    for (
-        const candle of candles
-    ) {
-
-        const open =
-            Number(candle.open);
-
-        const close =
-            Number(candle.close);
-
-        const volume =
-            Number(candle.volume);
-
-        if (
-            !Number.isFinite(open) ||
-            !Number.isFinite(close) ||
-            !Number.isFinite(volume)
-        ) {
-
-            continue;
-
-        }
-
-        if (
-            close > open
-        ) {
-
-            delta += volume;
-
-        }
-
-        else if (
-            close < open
-        ) {
-
-            delta -= volume;
-
-        }
-
-        cumulativeDelta.push(
-            delta
-        );
-
+    if (close > open) {
+      delta += volume;
+    } else if (close < open) {
+      delta -= volume;
     }
 
-    return cumulativeDelta;
+    cumulativeDelta.push(delta);
+  }
 
+  return cumulativeDelta;
 }
-
 
 //======================================================
 // ANALYZE DELTA
 //======================================================
 
 function analyzeDelta(cumulativeDelta) {
+  if (!cumulativeDelta || cumulativeDelta.length < 2) {
+    return null;
+  }
 
-    if (
-        !cumulativeDelta ||
-        cumulativeDelta.length < 2
-    ) {
+  const currentIndex = cumulativeDelta.length - 1;
 
-        return null;
+  const previousIndex = currentIndex - 1;
 
+  const currentDelta = Number(cumulativeDelta[currentIndex]);
+
+  const previousDelta = Number(cumulativeDelta[previousIndex]);
+
+  if (!Number.isFinite(currentDelta) || !Number.isFinite(previousDelta)) {
+    return null;
+  }
+
+  const deltaChange = currentDelta - previousDelta;
+
+  let trend = "FLAT";
+
+  let control = "BALANCED";
+
+  //==================================================
+  // POSITIVE DELTA
+  //==================================================
+
+  if (currentDelta > 0) {
+    control = "BUYERS IN CONTROL";
+
+    if (currentDelta > previousDelta) {
+      trend = "HIGHER POSITIVE";
+    } else if (currentDelta < previousDelta) {
+      trend = "LOWER POSITIVE";
+    } else {
+      trend = "POSITIVE / FLAT";
     }
+  }
 
-    const currentIndex =
-        cumulativeDelta.length - 1;
+  //==================================================
+  // NEGATIVE DELTA
+  //==================================================
+  else if (currentDelta < 0) {
+    control = "SELLERS IN CONTROL";
 
-    const previousIndex =
-        currentIndex - 1;
-
-    const currentDelta =
-        Number(
-            cumulativeDelta[
-                currentIndex
-            ]
-        );
-
-    const previousDelta =
-        Number(
-            cumulativeDelta[
-                previousIndex
-            ]
-        );
-
-    if (
-        !Number.isFinite(currentDelta) ||
-        !Number.isFinite(previousDelta)
-    ) {
-
-        return null;
-
+    if (currentDelta < previousDelta) {
+      trend = "LOWER NEGATIVE";
+    } else if (currentDelta > previousDelta) {
+      trend = "HIGHER NEGATIVE";
+    } else {
+      trend = "NEGATIVE / FLAT";
     }
+  }
 
-    const deltaChange =
-        currentDelta -
-        previousDelta;
+  //==================================================
+  // ZERO
+  //==================================================
+  else {
+    control = "BALANCED";
 
-    let trend =
-        "FLAT";
+    trend = "AT ZERO";
+  }
 
-    let control =
-        "BALANCED";
+  return {
+    currentDelta,
 
+    previousDelta,
 
-    //==================================================
-    // POSITIVE DELTA
-    //==================================================
+    deltaChange,
 
-    if (
-        currentDelta > 0
-    ) {
+    trend,
 
-        control =
-            "BUYERS IN CONTROL";
-
-        if (
-            currentDelta >
-            previousDelta
-        ) {
-
-            trend =
-                "HIGHER POSITIVE";
-
-        }
-
-        else if (
-            currentDelta <
-            previousDelta
-        ) {
-
-            trend =
-                "LOWER POSITIVE";
-
-        }
-
-        else {
-
-            trend =
-                "POSITIVE / FLAT";
-
-        }
-
-    }
-
-
-    //==================================================
-    // NEGATIVE DELTA
-    //==================================================
-
-    else if (
-        currentDelta < 0
-    ) {
-
-        control =
-            "SELLERS IN CONTROL";
-
-        if (
-            currentDelta <
-            previousDelta
-        ) {
-
-            trend =
-                "LOWER NEGATIVE";
-
-        }
-
-        else if (
-            currentDelta >
-            previousDelta
-        ) {
-
-            trend =
-                "HIGHER NEGATIVE";
-
-        }
-
-        else {
-
-            trend =
-                "NEGATIVE / FLAT";
-
-        }
-
-    }
-
-
-    //==================================================
-    // ZERO
-    //==================================================
-
-    else {
-
-        control =
-            "BALANCED";
-
-        trend =
-            "AT ZERO";
-
-    }
-
-    return {
-
-        currentDelta,
-
-        previousDelta,
-
-        deltaChange,
-
-        trend,
-
-        control
-
-    };
-
+    control,
+  };
 }
-
 
 //======================================================
 // EMA VALUE
 //======================================================
 
-function calculateEMAValue(
-    candles,
-    period
-) {
+function calculateEMAValue(candles, period) {
+  if (!candles || candles.length < period) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length < period
-    ) {
+  let sum = 0;
 
-        return null;
+  for (let i = 0; i < period; i++) {
+    const close = Number(candles[i].close);
 
+    if (!Number.isFinite(close)) {
+      return null;
     }
 
-    let sum = 0;
+    sum += close;
+  }
 
-    for (
-        let i = 0;
-        i < period;
-        i++
-    ) {
+  let ema = sum / period;
 
-        const close =
-            Number(
-                candles[i].close
-            );
+  const multiplier = 2 / (period + 1);
 
-        if (
-            !Number.isFinite(close)
-        ) {
+  for (let i = period; i < candles.length; i++) {
+    const close = Number(candles[i].close);
 
-            return null;
-
-        }
-
-        sum += close;
-
+    if (!Number.isFinite(close)) {
+      continue;
     }
 
-    let ema =
-        sum / period;
+    ema = (close - ema) * multiplier + ema;
+  }
 
-    const multiplier =
-        2 /
-        (period + 1);
-
-    for (
-        let i = period;
-        i < candles.length;
-        i++
-    ) {
-
-        const close =
-            Number(
-                candles[i].close
-            );
-
-        if (
-            !Number.isFinite(close)
-        ) {
-
-            continue;
-
-        }
-
-        ema =
-            (
-                close -
-                ema
-            ) *
-            multiplier +
-            ema;
-
-    }
-
-    return ema;
-
+  return ema;
 }
-
 
 //======================================================
 // ATR VALUE
 //======================================================
 
-function calculateATRValue(
-    candles,
-    period
-) {
+function calculateATRValue(candles, period) {
+  if (!candles || candles.length <= period) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <= period
-    ) {
+  const trueRanges = [];
 
-        return null;
+  for (let i = 0; i < candles.length; i++) {
+    const high = Number(candles[i].high);
 
+    const low = Number(candles[i].low);
+
+    if (!Number.isFinite(high) || !Number.isFinite(low)) {
+      return null;
     }
 
-    const trueRanges = [];
+    if (i === 0) {
+      trueRanges.push(high - low);
 
-    for (
-        let i = 0;
-        i < candles.length;
-        i++
-    ) {
-
-        const high =
-            Number(
-                candles[i].high
-            );
-
-        const low =
-            Number(
-                candles[i].low
-            );
-
-        if (
-            !Number.isFinite(high) ||
-            !Number.isFinite(low)
-        ) {
-
-            return null;
-
-        }
-
-        if (
-            i === 0
-        ) {
-
-            trueRanges.push(
-                high - low
-            );
-
-            continue;
-
-        }
-
-        const previousClose =
-            Number(
-                candles[
-                    i - 1
-                ].close
-            );
-
-        if (
-            !Number.isFinite(
-                previousClose
-            )
-        ) {
-
-            return null;
-
-        }
-
-        const range1 =
-            high - low;
-
-        const range2 =
-            Math.abs(
-                high -
-                previousClose
-            );
-
-        const range3 =
-            Math.abs(
-                low -
-                previousClose
-            );
-
-        trueRanges.push(
-            Math.max(
-                range1,
-                range2,
-                range3
-            )
-        );
-
+      continue;
     }
 
-    if (
-        trueRanges.length <= period
-    ) {
+    const previousClose = Number(candles[i - 1].close);
 
-        return null;
-
+    if (!Number.isFinite(previousClose)) {
+      return null;
     }
 
-    let atr = 0;
+    const range1 = high - low;
 
-    for (
-        let i = 1;
-        i <= period;
-        i++
-    ) {
+    const range2 = Math.abs(high - previousClose);
 
-        atr +=
-            trueRanges[i];
+    const range3 = Math.abs(low - previousClose);
 
-    }
+    trueRanges.push(Math.max(range1, range2, range3));
+  }
 
-    atr /=
-        period;
+  if (trueRanges.length <= period) {
+    return null;
+  }
 
-    for (
-        let i = period + 1;
-        i < trueRanges.length;
-        i++
-    ) {
+  let atr = 0;
 
-        atr =
-            (
-                (
-                    atr *
-                    (period - 1)
-                ) +
-                trueRanges[i]
-            ) /
-            period;
+  for (let i = 1; i <= period; i++) {
+    atr += trueRanges[i];
+  }
 
-    }
+  atr /= period;
 
-    return atr;
+  for (let i = period + 1; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
+  }
 
+  return atr;
 }
-
 
 //======================================================
 // 4H TREND / ATR STRUCTURE
@@ -5782,253 +5470,124 @@ function calculateATRValue(
 // Otherwise previous trend remains.
 //======================================================
 
-function calculate4HTrendATR(
-    candles
-) {
+function calculate4HTrendATR(candles) {
+  if (!candles || candles.length < TREND_EMA_LENGTH + 2) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <
-        TREND_EMA_LENGTH + 2
-    ) {
+  let trendState = 0;
 
-        return null;
+  let lastBreakType = "NONE";
 
+  let lastBreakIndex = -1;
+
+  let activeUpperBand = null;
+
+  let activeLowerBand = null;
+
+  for (let i = TREND_EMA_LENGTH; i < candles.length; i++) {
+    const availableCandles = candles.slice(0, i + 1);
+
+    const ema = calculateEMAValue(availableCandles, TREND_EMA_LENGTH);
+
+    const atr = calculateATRValue(availableCandles, TREND_ATR_LENGTH);
+
+    if (ema === null || atr === null) {
+      continue;
     }
 
-    let trendState =
-        0;
+    const upperBand = ema + atr * TREND_ATR_MULTIPLIER;
 
-    let lastBreakType =
-        "NONE";
+    const lowerBand = ema - atr * TREND_ATR_MULTIPLIER;
 
-    let lastBreakIndex =
-        -1;
+    const close = Number(candles[i].close);
 
-    let activeUpperBand =
-        null;
-
-    let activeLowerBand =
-        null;
-
-
-    for (
-        let i =
-            TREND_EMA_LENGTH;
-        i < candles.length;
-        i++
-    ) {
-
-        const availableCandles =
-            candles.slice(
-                0,
-                i + 1
-            );
-
-        const ema =
-            calculateEMAValue(
-                availableCandles,
-                TREND_EMA_LENGTH
-            );
-
-        const atr =
-            calculateATRValue(
-                availableCandles,
-                TREND_ATR_LENGTH
-            );
-
-        if (
-            ema === null ||
-            atr === null
-        ) {
-
-            continue;
-
-        }
-
-        const upperBand =
-            ema +
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-        const lowerBand =
-            ema -
-            (
-                atr *
-                TREND_ATR_MULTIPLIER
-            );
-
-        const close =
-            Number(
-                candles[i].close
-            );
-
-        if (
-            !Number.isFinite(close)
-        ) {
-
-            continue;
-
-        }
-
-        const previousTrend =
-            trendState;
-
-
-        if (
-            close >
-            upperBand
-        ) {
-
-            trendState =
-                1;
-
-        }
-
-        else if (
-            close <
-            lowerBand
-        ) {
-
-            trendState =
-                -1;
-
-        }
-
-
-        if (
-            trendState === 1 &&
-            previousTrend !== 1
-        ) {
-
-            lastBreakType =
-                "UPPER BAND BREAK";
-
-            lastBreakIndex =
-                i;
-
-        }
-
-
-        if (
-            trendState === -1 &&
-            previousTrend !== -1
-        ) {
-
-            lastBreakType =
-                "LOWER BAND BREAK";
-
-            lastBreakIndex =
-                i;
-
-        }
-
-        activeUpperBand =
-            upperBand;
-
-        activeLowerBand =
-            lowerBand;
-
+    if (!Number.isFinite(close)) {
+      continue;
     }
 
+    const previousTrend = trendState;
 
-    if (
-        trendState === 0
-    ) {
-
-        return {
-
-            trend:
-                "NEUTRAL",
-
-            trendState:
-                0,
-
-            upperBand:
-                activeUpperBand,
-
-            lowerBand:
-                activeLowerBand,
-
-            activeLevel:
-                null,
-
-            activeType:
-                "NONE",
-
-            lastBreak:
-                "NONE",
-
-            lastBreakIndex
-
-        };
-
+    if (close > upperBand) {
+      trendState = 1;
+    } else if (close < lowerBand) {
+      trendState = -1;
     }
 
+    if (trendState === 1 && previousTrend !== 1) {
+      lastBreakType = "UPPER BAND BREAK";
 
-    if (
-        trendState === 1
-    ) {
-
-        return {
-
-            trend:
-                "BULLISH TREND",
-
-            trendState:
-                1,
-
-            upperBand:
-                activeUpperBand,
-
-            lowerBand:
-                activeLowerBand,
-
-            activeLevel:
-                activeLowerBand,
-
-            activeType:
-                "SUPPORT",
-
-            lastBreak:
-                lastBreakType,
-
-            lastBreakIndex
-
-        };
-
+      lastBreakIndex = i;
     }
 
+    if (trendState === -1 && previousTrend !== -1) {
+      lastBreakType = "LOWER BAND BREAK";
 
+      lastBreakIndex = i;
+    }
+
+    activeUpperBand = upperBand;
+
+    activeLowerBand = lowerBand;
+  }
+
+  if (trendState === 0) {
     return {
+      trend: "NEUTRAL",
 
-        trend:
-            "BEARISH TREND",
+      trendState: 0,
 
-        trendState:
-            -1,
+      upperBand: activeUpperBand,
 
-        upperBand:
-            activeUpperBand,
+      lowerBand: activeLowerBand,
 
-        lowerBand:
-            activeLowerBand,
+      activeLevel: null,
 
-        activeLevel:
-            activeUpperBand,
+      activeType: "NONE",
 
-        activeType:
-            "RESISTANCE",
+      lastBreak: "NONE",
 
-        lastBreak:
-            lastBreakType,
-
-        lastBreakIndex
-
+      lastBreakIndex,
     };
+  }
 
+  if (trendState === 1) {
+    return {
+      trend: "BULLISH TREND",
+
+      trendState: 1,
+
+      upperBand: activeUpperBand,
+
+      lowerBand: activeLowerBand,
+
+      activeLevel: activeLowerBand,
+
+      activeType: "SUPPORT",
+
+      lastBreak: lastBreakType,
+
+      lastBreakIndex,
+    };
+  }
+
+  return {
+    trend: "BEARISH TREND",
+
+    trendState: -1,
+
+    upperBand: activeUpperBand,
+
+    lowerBand: activeLowerBand,
+
+    activeLevel: activeUpperBand,
+
+    activeType: "RESISTANCE",
+
+    lastBreak: lastBreakType,
+
+    lastBreakIndex,
+  };
 }
 
 //======================================================
@@ -6047,154 +5606,73 @@ function calculate4HTrendATR(
 
 const MOMENTUM_LOOKBACK_1H = 10;
 
-
 function calculate1HMomentum(candles) {
+  if (!candles || candles.length < MOMENTUM_LOOKBACK_1H * 2 + 1) {
+    return null;
+  }
 
-    if (
-        !candles ||
-        candles.length <
-        (MOMENTUM_LOOKBACK_1H * 2) + 1
-    ) {
+  const end = candles.length - 1;
 
-        return null;
+  const currentClose = Number(candles[end].close);
 
-    }
+  const close10HoursAgo = Number(candles[end - MOMENTUM_LOOKBACK_1H].close);
 
-    const end =
-        candles.length - 1;
+  const close20HoursAgo = Number(candles[end - MOMENTUM_LOOKBACK_1H * 2].close);
 
+  if (!Number.isFinite(currentClose) || !Number.isFinite(close10HoursAgo) || !Number.isFinite(close20HoursAgo)) {
+    return null;
+  }
 
-    const currentClose =
-        Number(
-            candles[end].close
-        );
+  //==================================================
+  // CURRENT 10H MOMENTUM
+  //==================================================
 
+  const currentMomentum = (currentClose - close10HoursAgo) / MOMENTUM_LOOKBACK_1H;
 
-    const close10HoursAgo =
-        Number(
-            candles[
-                end -
-                MOMENTUM_LOOKBACK_1H
-            ].close
-        );
+  //==================================================
+  // PREVIOUS 10H MOMENTUM
+  //==================================================
 
+  const previousMomentum = (close10HoursAgo - close20HoursAgo) / MOMENTUM_LOOKBACK_1H;
 
-    const close20HoursAgo =
-        Number(
-            candles[
-                end -
-                (
-                    MOMENTUM_LOOKBACK_1H * 2
-                )
-            ].close
-        );
+  //==================================================
+  // MOMENTUM CHANGE
+  //==================================================
 
+  const momentumChange = currentMomentum - previousMomentum;
 
-    if (
-        !Number.isFinite(currentClose) ||
-        !Number.isFinite(close10HoursAgo) ||
-        !Number.isFinite(close20HoursAgo)
-    ) {
+  //==================================================
+  // DIRECTION
+  //==================================================
 
-        return null;
+  let direction = "FLAT";
 
-    }
+  if (currentMomentum > 0) {
+    direction = "POSITIVE";
+  } else if (currentMomentum < 0) {
+    direction = "NEGATIVE";
+  }
 
+  //==================================================
+  // ACCELERATION / DECELERATION
+  //==================================================
 
-    //==================================================
-    // CURRENT 10H MOMENTUM
-    //==================================================
+  const accelerating = Math.abs(currentMomentum) >= Math.abs(previousMomentum);
 
-    const currentMomentum =
-        (
-            currentClose -
-            close10HoursAgo
-        ) /
-        MOMENTUM_LOOKBACK_1H;
+  const state = accelerating ? "ACCELERATING" : "DECELERATING";
 
+  return {
+    current: currentMomentum,
 
-    //==================================================
-    // PREVIOUS 10H MOMENTUM
-    //==================================================
+    previous: previousMomentum,
 
-    const previousMomentum =
-        (
-            close10HoursAgo -
-            close20HoursAgo
-        ) /
-        MOMENTUM_LOOKBACK_1H;
+    change: momentumChange,
 
+    direction,
 
-    //==================================================
-    // MOMENTUM CHANGE
-    //==================================================
-
-    const momentumChange =
-        currentMomentum -
-        previousMomentum;
-
-
-    //==================================================
-    // DIRECTION
-    //==================================================
-
-    let direction =
-        "FLAT";
-
-
-    if (
-        currentMomentum > 0
-    ) {
-
-        direction =
-            "POSITIVE";
-
-    }
-
-    else if (
-        currentMomentum < 0
-    ) {
-
-        direction =
-            "NEGATIVE";
-
-    }
-
-
-    //==================================================
-    // ACCELERATION / DECELERATION
-    //==================================================
-
-    const accelerating =
-        Math.abs(currentMomentum) >=
-        Math.abs(previousMomentum);
-
-
-    const state =
-        accelerating
-            ? "ACCELERATING"
-            : "DECELERATING";
-
-
-    return {
-
-        current:
-            currentMomentum,
-
-        previous:
-            previousMomentum,
-
-        change:
-            momentumChange,
-
-        direction,
-
-        state
-
-    };
-
+    state,
+  };
 }
-
 
 //======================================================
 // TREND HEALTH / EXHAUSTION
@@ -6217,233 +5695,120 @@ function calculate1HMomentum(candles) {
 // Momentum is no longer aligned with the broader trend.
 //======================================================
 
-function analyzeTrendHealth(
-    trend4H,
-    delta30M,
-    momentum1H
-) {
-
-    if (
-        !trend4H ||
-        !delta30M ||
-        !momentum1H
-    ) {
-
-        return {
-
-            trend:
-                "UNKNOWN",
-
-            exhaustion:
-                "UNKNOWN",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    const bullish =
-        trend4H.trendState === 1;
-
-
-    const bearish =
-        trend4H.trendState === -1;
-
-
-    //==================================================
-    // MOMENTUM ALIGNMENT
-    //==================================================
-
-    const momentumAligned =
-        (
-            bullish &&
-            momentum1H.current > 0
-        ) ||
-        (
-            bearish &&
-            momentum1H.current < 0
-        );
-
-
-    //==================================================
-    // DELTA ALIGNMENT
-    //==================================================
-
-    const deltaAligned =
-        (
-            bullish &&
-            (
-                delta30M.trend ===
-                "HIGHER POSITIVE" ||
-
-                delta30M.trend ===
-                "LOWER POSITIVE"
-            )
-        ) ||
-
-        (
-            bearish &&
-            (
-                delta30M.trend ===
-                "LOWER NEGATIVE" ||
-
-                delta30M.trend ===
-                "HIGHER NEGATIVE"
-            )
-        );
-
-
-    //==================================================
-    // MOMENTUM WEAKENING
-    //==================================================
-
-    const momentumWeakening =
-        momentum1H.state ===
-        "DECELERATING";
-
-
-    //==================================================
-    // ORDER FLOW WEAKENING
-    //==================================================
-
-    const deltaWeakening =
-        (
-            bullish &&
-            delta30M.trend ===
-            "LOWER POSITIVE"
-        ) ||
-
-        (
-            bearish &&
-            delta30M.trend ===
-            "HIGHER NEGATIVE"
-        );
-
-
-    //==================================================
-    // HIGH EXHAUSTION
-    //
-    // Momentum has moved against the broader trend.
-    //==================================================
-
-    if (
-        !momentumAligned
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "HIGH",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // MODERATE EXHAUSTION
-    //
-    // Order flow no longer confirms the broader trend.
-    //==================================================
-
-    if (
-        !deltaAligned
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // MOMENTUM + DELTA BOTH WEAKENING
-    //==================================================
-
-    if (
-        momentumWeakening &&
-        deltaWeakening
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // ONE COMPONENT WEAKENING
-    //==================================================
-
-    if (
-        momentumWeakening ||
-        deltaWeakening
-    ) {
-
-        return {
-
-            trend:
-                "WEAKENING",
-
-            exhaustion:
-                "MODERATE",
-
-            action:
-                "MONITOR"
-
-        };
-
-    }
-
-
-    //==================================================
-    // HEALTHY TREND
-    //==================================================
-
+function analyzeTrendHealth(trend4H, delta30M, momentum1H) {
+  if (!trend4H || !delta30M || !momentum1H) {
     return {
+      trend: "UNKNOWN",
 
-        trend:
-            "HEALTHY",
+      exhaustion: "UNKNOWN",
 
-        exhaustion:
-            "LOW",
-
-        action:
-            "HOLD"
-
+      action: "MONITOR",
     };
+  }
 
+  const bullish = trend4H.trendState === 1;
+
+  const bearish = trend4H.trendState === -1;
+
+  //==================================================
+  // MOMENTUM ALIGNMENT
+  //==================================================
+
+  const momentumAligned = (bullish && momentum1H.current > 0) || (bearish && momentum1H.current < 0);
+
+  //==================================================
+  // DELTA ALIGNMENT
+  //==================================================
+
+  const deltaAligned =
+    (bullish && (delta30M.trend === "HIGHER POSITIVE" || delta30M.trend === "LOWER POSITIVE")) ||
+    (bearish && (delta30M.trend === "LOWER NEGATIVE" || delta30M.trend === "HIGHER NEGATIVE"));
+
+  //==================================================
+  // MOMENTUM WEAKENING
+  //==================================================
+
+  const momentumWeakening = momentum1H.state === "DECELERATING";
+
+  //==================================================
+  // ORDER FLOW WEAKENING
+  //==================================================
+
+  const deltaWeakening =
+    (bullish && delta30M.trend === "LOWER POSITIVE") || (bearish && delta30M.trend === "HIGHER NEGATIVE");
+
+  //==================================================
+  // HIGH EXHAUSTION
+  //
+  // Momentum has moved against the broader trend.
+  //==================================================
+
+  if (!momentumAligned) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "HIGH",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // MODERATE EXHAUSTION
+  //
+  // Order flow no longer confirms the broader trend.
+  //==================================================
+
+  if (!deltaAligned) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // MOMENTUM + DELTA BOTH WEAKENING
+  //==================================================
+
+  if (momentumWeakening && deltaWeakening) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // ONE COMPONENT WEAKENING
+  //==================================================
+
+  if (momentumWeakening || deltaWeakening) {
+    return {
+      trend: "WEAKENING",
+
+      exhaustion: "MODERATE",
+
+      action: "MONITOR",
+    };
+  }
+
+  //==================================================
+  // HEALTHY TREND
+  //==================================================
+
+  return {
+    trend: "HEALTHY",
+
+    exhaustion: "LOW",
+
+    action: "HOLD",
+  };
 }
-
 
 //======================================================
 // 4H TREND QUALITY / CONSOLIDATION FILTER
@@ -6461,262 +5826,201 @@ function analyzeTrendHealth(
 // CONSOLIDATING coins are excluded from recommendations.
 //======================================================
 
-function analyzeTrendQuality(
-    candles4H,
-    trend4H
-) {
-
-    if (
-        !candles4H ||
-        !trend4H ||
-        trend4H.trendState === 0
-    ) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "NONE",
-            reason: "No established directional 4H trend"
-        };
-    }
-
-    const needed =
-        Math.max(
-            TREND_EMA_LENGTH + 5,
-            TREND_QUALITY_LOOKBACK + 1,
-            TREND_QUALITY_STRUCTURE_LOOKBACK + 2
-        );
-
-    if (candles4H.length < needed) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "UNKNOWN",
-            reason: "Insufficient 4H data"
-        };
-    }
-
-    const end = candles4H.length - 1;
-    const lookbackStart = end - TREND_QUALITY_LOOKBACK;
-    const structureStart = end - TREND_QUALITY_STRUCTURE_LOOKBACK;
-
-    const closes = candles4H.map(c => Number(c.close));
-    const highs = candles4H.map(c => Number(c.high));
-    const lows = candles4H.map(c => Number(c.low));
-
-    if (
-        !Number.isFinite(closes[end]) ||
-        !Number.isFinite(closes[lookbackStart])
-    ) {
-        return {
-            status: "CONSOLIDATING",
-            score: 0,
-            efficiency: 0,
-            atrRatio: 0,
-            emaSlopePct: 0,
-            structure: "UNKNOWN",
-            reason: "Invalid 4H price data"
-        };
-    }
-
-    // -----------------------------------------------
-    // PRICE EFFICIENCY
-    // Net directional movement divided by total
-    // absolute movement over the last 10 closed 4H bars.
-    // Higher values = cleaner trend; lower values = chop.
-    // -----------------------------------------------
-    let path = 0;
-
-    for (let i = lookbackStart + 1; i <= end; i++) {
-        if (
-            Number.isFinite(closes[i]) &&
-            Number.isFinite(closes[i - 1])
-        ) {
-            path += Math.abs(closes[i] - closes[i - 1]);
-        }
-    }
-
-    const netMove =
-        closes[end] - closes[lookbackStart];
-
-    const efficiency =
-        path > 0
-            ? Math.abs(netMove) / path
-            : 0;
-
-    // -----------------------------------------------
-    // EMA20 SLOPE
-    // Compare the latest EMA20 with its value five
-    // closed 4H candles earlier.
-    // -----------------------------------------------
-    const emaNow =
-        calculateEMAValue(
-            candles4H.slice(0, end + 1),
-            TREND_EMA_LENGTH
-        );
-
-    const emaEarlier =
-        calculateEMAValue(
-            candles4H.slice(0, end - 5 + 1),
-            TREND_EMA_LENGTH
-        );
-
-    const emaSlopePct =
-        Number.isFinite(emaNow) &&
-        Number.isFinite(emaEarlier) &&
-        emaEarlier !== 0
-            ? ((emaNow - emaEarlier) / Math.abs(emaEarlier)) * 100
-            : 0;
-
-    // -----------------------------------------------
-    // ATR EXPANSION / COMPRESSION
-    // Current ATR14 compared with the average ATR14
-    // over the previous 10 available ATR readings.
-    // -----------------------------------------------
-    const atrValues = [];
-
-    for (
-        let i = Math.max(TREND_ATR_LENGTH, end - 19);
-        i <= end;
-        i++
-    ) {
-        const atr =
-            calculateATRValue(
-                candles4H.slice(0, i + 1),
-                TREND_ATR_LENGTH
-            );
-
-        if (Number.isFinite(atr) && atr > 0) {
-            atrValues.push(atr);
-        }
-    }
-
-    const currentATR =
-        atrValues.length
-            ? atrValues[atrValues.length - 1]
-            : null;
-
-    const previousATRValues =
-        atrValues.length > 1
-            ? atrValues.slice(0, -1)
-            : [];
-
-    const averagePreviousATR =
-        previousATRValues.length
-            ? previousATRValues.reduce((sum, value) => sum + value, 0) / previousATRValues.length
-            : null;
-
-    const atrRatio =
-        Number.isFinite(currentATR) &&
-        Number.isFinite(averagePreviousATR) &&
-        averagePreviousATR > 0
-            ? currentATR / averagePreviousATR
-            : 0;
-
-    // -----------------------------------------------
-    // DIRECTIONAL STRUCTURE
-    // Require the latest close to continue moving in
-    // the established 4H direction and to sit on the
-    // correct side of the recent range midpoint.
-    // -----------------------------------------------
-    const recentHighs = highs.slice(structureStart, end + 1).filter(Number.isFinite);
-    const recentLows = lows.slice(structureStart, end + 1).filter(Number.isFinite);
-
-    const priorHighs = highs.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
-    const priorLows = lows.slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart).filter(Number.isFinite);
-
-    const recentHigh = recentHighs.length ? Math.max(...recentHighs) : null;
-    const recentLow = recentLows.length ? Math.min(...recentLows) : null;
-    const priorHigh = priorHighs.length ? Math.max(...priorHighs) : null;
-    const priorLow = priorLows.length ? Math.min(...priorLows) : null;
-
-    const rangeHigh = Math.max(...highs.slice(lookbackStart, end + 1).filter(Number.isFinite));
-    const rangeLow = Math.min(...lows.slice(lookbackStart, end + 1).filter(Number.isFinite));
-    const rangeMid = (rangeHigh + rangeLow) / 2;
-
-    let structure = "NEUTRAL";
-
-    if (trend4H.trendState === 1) {
-        structure =
-            closes[end] > closes[structureStart] &&
-            closes[end] > rangeMid &&
-            recentHigh !== null &&
-            priorHigh !== null &&
-            recentHigh > priorHigh
-                ? "BULLISH STRUCTURE"
-                : "WEAK BULLISH STRUCTURE";
-    }
-    else if (trend4H.trendState === -1) {
-        structure =
-            closes[end] < closes[structureStart] &&
-            closes[end] < rangeMid &&
-            recentLow !== null &&
-            priorLow !== null &&
-            recentLow < priorLow
-                ? "BEARISH STRUCTURE"
-                : "WEAK BEARISH STRUCTURE";
-    }
-
-    const structureAligned =
-        structure === "BULLISH STRUCTURE" ||
-        structure === "BEARISH STRUCTURE";
-
-    const emaSlopeAligned =
-        (trend4H.trendState === 1 && emaSlopePct >= TREND_QUALITY_MIN_EMA_SLOPE_PCT) ||
-        (trend4H.trendState === -1 && emaSlopePct <= -TREND_QUALITY_MIN_EMA_SLOPE_PCT);
-
-    const efficiencyStrong =
-        efficiency >= TREND_QUALITY_MIN_EFFICIENCY;
-
-    const volatilityHealthy =
-        atrRatio >= TREND_QUALITY_MIN_ATR_RATIO;
-
-    const strongTrend =
-        structureAligned &&
-        emaSlopeAligned &&
-        efficiencyStrong &&
-        volatilityHealthy;
-
-    const transitionTrend =
-        structureAligned &&
-        emaSlopeAligned &&
-        efficiency >= 0.20;
-
-    let status = "CONSOLIDATING";
-    let score = 0;
-
-    if (strongTrend) {
-        status = "STRONG TREND";
-        score = 100;
-        if (atrRatio >= 1) score += 10;
-        if (efficiency >= 0.50) score += 10;
-    }
-    else if (transitionTrend) {
-        status = "TRANSITION";
-        score = 50;
-    }
-
+function analyzeTrendQuality(candles4H, trend4H) {
+  if (!candles4H || !trend4H || trend4H.trendState === 0) {
     return {
-        status,
-        score,
-        efficiency,
-        atrRatio,
-        emaSlopePct,
-        structure,
-        reason: strongTrend
-            ? "Directional structure, EMA slope, efficiency and volatility confirmed"
-            : transitionTrend
-                ? "Directional structure present but trend strength/volatility is not fully confirmed"
-                : "Price action lacks sufficient directional structure; consolidation risk is high"
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "NONE",
+      reason: "No established directional 4H trend",
     };
+  }
 
+  const needed = Math.max(TREND_EMA_LENGTH + 5, TREND_QUALITY_LOOKBACK + 1, TREND_QUALITY_STRUCTURE_LOOKBACK + 2);
+
+  if (candles4H.length < needed) {
+    return {
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "UNKNOWN",
+      reason: "Insufficient 4H data",
+    };
+  }
+
+  const end = candles4H.length - 1;
+  const lookbackStart = end - TREND_QUALITY_LOOKBACK;
+  const structureStart = end - TREND_QUALITY_STRUCTURE_LOOKBACK;
+
+  const closes = candles4H.map((c) => Number(c.close));
+  const highs = candles4H.map((c) => Number(c.high));
+  const lows = candles4H.map((c) => Number(c.low));
+
+  if (!Number.isFinite(closes[end]) || !Number.isFinite(closes[lookbackStart])) {
+    return {
+      status: "CONSOLIDATING",
+      score: 0,
+      efficiency: 0,
+      atrRatio: 0,
+      emaSlopePct: 0,
+      structure: "UNKNOWN",
+      reason: "Invalid 4H price data",
+    };
+  }
+
+  // -----------------------------------------------
+  // PRICE EFFICIENCY
+  // Net directional movement divided by total
+  // absolute movement over the last 10 closed 4H bars.
+  // Higher values = cleaner trend; lower values = chop.
+  // -----------------------------------------------
+  let path = 0;
+
+  for (let i = lookbackStart + 1; i <= end; i++) {
+    if (Number.isFinite(closes[i]) && Number.isFinite(closes[i - 1])) {
+      path += Math.abs(closes[i] - closes[i - 1]);
+    }
+  }
+
+  const netMove = closes[end] - closes[lookbackStart];
+
+  const efficiency = path > 0 ? Math.abs(netMove) / path : 0;
+
+  // -----------------------------------------------
+  // EMA20 SLOPE
+  // Compare the latest EMA20 with its value five
+  // closed 4H candles earlier.
+  // -----------------------------------------------
+  const emaNow = calculateEMAValue(candles4H.slice(0, end + 1), TREND_EMA_LENGTH);
+
+  const emaEarlier = calculateEMAValue(candles4H.slice(0, end - 5 + 1), TREND_EMA_LENGTH);
+
+  const emaSlopePct =
+    Number.isFinite(emaNow) && Number.isFinite(emaEarlier) && emaEarlier !== 0
+      ? ((emaNow - emaEarlier) / Math.abs(emaEarlier)) * 100
+      : 0;
+
+  // -----------------------------------------------
+  // ATR EXPANSION / COMPRESSION
+  // Current ATR14 compared with the average ATR14
+  // over the previous 10 available ATR readings.
+  // -----------------------------------------------
+  const atrValues = [];
+
+  for (let i = Math.max(TREND_ATR_LENGTH, end - 19); i <= end; i++) {
+    const atr = calculateATRValue(candles4H.slice(0, i + 1), TREND_ATR_LENGTH);
+
+    if (Number.isFinite(atr) && atr > 0) {
+      atrValues.push(atr);
+    }
+  }
+
+  const currentATR = atrValues.length ? atrValues[atrValues.length - 1] : null;
+
+  const previousATRValues = atrValues.length > 1 ? atrValues.slice(0, -1) : [];
+
+  const averagePreviousATR = previousATRValues.length
+    ? previousATRValues.reduce((sum, value) => sum + value, 0) / previousATRValues.length
+    : null;
+
+  const atrRatio =
+    Number.isFinite(currentATR) && Number.isFinite(averagePreviousATR) && averagePreviousATR > 0
+      ? currentATR / averagePreviousATR
+      : 0;
+
+  // -----------------------------------------------
+  // DIRECTIONAL STRUCTURE
+  // Require the latest close to continue moving in
+  // the established 4H direction and to sit on the
+  // correct side of the recent range midpoint.
+  // -----------------------------------------------
+  const recentHighs = highs.slice(structureStart, end + 1).filter(Number.isFinite);
+  const recentLows = lows.slice(structureStart, end + 1).filter(Number.isFinite);
+
+  const priorHighs = highs
+    .slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart)
+    .filter(Number.isFinite);
+  const priorLows = lows
+    .slice(Math.max(0, structureStart - TREND_QUALITY_STRUCTURE_LOOKBACK), structureStart)
+    .filter(Number.isFinite);
+
+  const recentHigh = recentHighs.length ? Math.max(...recentHighs) : null;
+  const recentLow = recentLows.length ? Math.min(...recentLows) : null;
+  const priorHigh = priorHighs.length ? Math.max(...priorHighs) : null;
+  const priorLow = priorLows.length ? Math.min(...priorLows) : null;
+
+  const rangeHigh = Math.max(...highs.slice(lookbackStart, end + 1).filter(Number.isFinite));
+  const rangeLow = Math.min(...lows.slice(lookbackStart, end + 1).filter(Number.isFinite));
+  const rangeMid = (rangeHigh + rangeLow) / 2;
+
+  let structure = "NEUTRAL";
+
+  if (trend4H.trendState === 1) {
+    structure =
+      closes[end] > closes[structureStart] &&
+      closes[end] > rangeMid &&
+      recentHigh !== null &&
+      priorHigh !== null &&
+      recentHigh > priorHigh
+        ? "BULLISH STRUCTURE"
+        : "WEAK BULLISH STRUCTURE";
+  } else if (trend4H.trendState === -1) {
+    structure =
+      closes[end] < closes[structureStart] &&
+      closes[end] < rangeMid &&
+      recentLow !== null &&
+      priorLow !== null &&
+      recentLow < priorLow
+        ? "BEARISH STRUCTURE"
+        : "WEAK BEARISH STRUCTURE";
+  }
+
+  const structureAligned = structure === "BULLISH STRUCTURE" || structure === "BEARISH STRUCTURE";
+
+  const emaSlopeAligned =
+    (trend4H.trendState === 1 && emaSlopePct >= TREND_QUALITY_MIN_EMA_SLOPE_PCT) ||
+    (trend4H.trendState === -1 && emaSlopePct <= -TREND_QUALITY_MIN_EMA_SLOPE_PCT);
+
+  const efficiencyStrong = efficiency >= TREND_QUALITY_MIN_EFFICIENCY;
+
+  const volatilityHealthy = atrRatio >= TREND_QUALITY_MIN_ATR_RATIO;
+
+  const strongTrend = structureAligned && emaSlopeAligned && efficiencyStrong && volatilityHealthy;
+
+  const transitionTrend = structureAligned && emaSlopeAligned && efficiency >= 0.2;
+
+  let status = "CONSOLIDATING";
+  let score = 0;
+
+  if (strongTrend) {
+    status = "STRONG TREND";
+    score = 100;
+    if (atrRatio >= 1) score += 10;
+    if (efficiency >= 0.5) score += 10;
+  } else if (transitionTrend) {
+    status = "TRANSITION";
+    score = 50;
+  }
+
+  return {
+    status,
+    score,
+    efficiency,
+    atrRatio,
+    emaSlopePct,
+    structure,
+    reason: strongTrend
+      ? "Directional structure, EMA slope, efficiency and volatility confirmed"
+      : transitionTrend
+        ? "Directional structure present but trend strength/volatility is not fully confirmed"
+        : "Price action lacks sufficient directional structure; consolidation risk is high",
+  };
 }
-
 
 //======================================================
 // ALIGNMENT SCORE
@@ -6739,407 +6043,183 @@ function analyzeTrendQuality(
 // Conflicting conditions = 0
 //======================================================
 
-function calculateAlignmentScore(
-    trend4H,
-    delta30M
-) {
+function calculateAlignmentScore(trend4H, delta30M) {
+  let score = 0;
 
-    let score =
-        0;
+  let trendPoints = 0;
 
-    let trendPoints =
-        0;
+  let orderFlowPoints = 0;
 
-    let orderFlowPoints =
-        0;
+  //==================================================
+  // BULLISH 4H
+  //==================================================
 
+  if (trend4H && trend4H.trendState === 1) {
+    trendPoints = 50;
 
-    //==================================================
-    // BULLISH 4H
-    //==================================================
-
-    if (
-        trend4H &&
-        trend4H.trendState === 1
-    ) {
-
-        trendPoints =
-            50;
-
-
-        if (
-            delta30M &&
-            delta30M.trend ===
-            "HIGHER POSITIVE"
-        ) {
-
-            orderFlowPoints =
-                50;
-
-        }
-
-        else if (
-            delta30M &&
-            delta30M.trend ===
-            "LOWER POSITIVE"
-        ) {
-
-            orderFlowPoints =
-                25;
-
-        }
-
+    if (delta30M && delta30M.trend === "HIGHER POSITIVE") {
+      orderFlowPoints = 50;
+    } else if (delta30M && delta30M.trend === "LOWER POSITIVE") {
+      orderFlowPoints = 25;
     }
+  }
 
+  //==================================================
+  // BEARISH 4H
+  //==================================================
+  else if (trend4H && trend4H.trendState === -1) {
+    trendPoints = 50;
 
-    //==================================================
-    // BEARISH 4H
-    //==================================================
-
-    else if (
-        trend4H &&
-        trend4H.trendState === -1
-    ) {
-
-        trendPoints =
-            50;
-
-
-        if (
-            delta30M &&
-            delta30M.trend ===
-            "LOWER NEGATIVE"
-        ) {
-
-            orderFlowPoints =
-                50;
-
-        }
-
-        else if (
-            delta30M &&
-            delta30M.trend ===
-            "HIGHER NEGATIVE"
-        ) {
-
-            orderFlowPoints =
-                25;
-
-        }
-
+    if (delta30M && delta30M.trend === "LOWER NEGATIVE") {
+      orderFlowPoints = 50;
+    } else if (delta30M && delta30M.trend === "HIGHER NEGATIVE") {
+      orderFlowPoints = 25;
     }
+  }
 
+  score = trendPoints + orderFlowPoints;
 
-    score =
-        trendPoints +
-        orderFlowPoints;
+  return {
+    score,
 
+    trendPoints,
 
-    return {
-
-        score,
-
-        trendPoints,
-
-        orderFlowPoints
-
-    };
-
+    orderFlowPoints,
+  };
 }
-
 
 //======================================================
 // CALCULATE COIN SCORE
 //======================================================
 
-async function calculateCoinScore(
-    symbol
-) {
+async function calculateCoinScore(symbol) {
+  try {
+    let delta30M = null;
 
-    try {
+    let trend4H = null;
 
-        let delta30M =
-            null;
+    let momentum1H = null;
 
-        let trend4H =
-            null;
+    let trendQuality = null;
 
-        let momentum1H =
-            null;
+    //================================================
+    // 30M DATA
+    //================================================
 
-        let trendQuality =
-            null;
+    const candles30M = await fetchFuturesKlines(symbol, "30m", 120);
 
+    if (!candles30M || candles30M.length < 3) {
+      log(`30M data unavailable for ${symbol}`);
 
-        //================================================
-        // 30M DATA
-        //================================================
-
-        const candles30M =
-            await fetchFuturesKlines(
-                symbol,
-                "30m",
-                120
-            );
-
-
-        if (
-            !candles30M ||
-            candles30M.length < 3
-        ) {
-
-            log(
-                `30M data unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        // Remove currently forming candle.
-
-        const closed30M =
-            candles30M.slice(
-                0,
-                -1
-            );
-
-
-        const currentPrice =
-            Number(
-                closed30M[
-                    closed30M.length - 1
-                ].close
-            );
-
-
-        if (
-            !Number.isFinite(
-                currentPrice
-            )
-        ) {
-
-            log(
-                `Current price unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        //================================================
-        // 30M CUMULATIVE DELTA
-        //================================================
-
-        const delta30MSeries =
-            calculateCumulativeDelta(
-                closed30M
-            );
-
-
-        delta30M =
-            analyzeDelta(
-                delta30MSeries
-            );
-
-
-        if (
-            !delta30M
-        ) {
-
-            log(
-                `30M Delta unavailable for ${symbol}`
-            );
-
-            return null;
-
-        }
-
-
-        //================================================
-        // 4H DATA
-        //================================================
-
-        const candles4H =
-            await fetchFuturesKlines(
-                symbol,
-                "4h",
-                120
-            );
-
-
-        if (
-            candles4H &&
-            candles4H.length >=
-            TREND_EMA_LENGTH + 2
-        ) {
-
-            const closed4H =
-                candles4H.slice(
-                    0,
-                    -1
-                );
-
-
-            trend4H =
-                calculate4HTrendATR(
-                    closed4H
-                );
-
-            trendQuality =
-                analyzeTrendQuality(
-                    closed4H,
-                    trend4H
-                );
-
-
-            if (
-                !trend4H
-            ) {
-
-                log(
-                    `4H Trend/ATR calculation unavailable for ${symbol}`
-                );
-
-            }
-
-        }
-
-        else {
-
-            log(
-                `4H data unavailable for ${symbol}. Candles received: ${
-                    candles4H
-                        ? candles4H.length
-                        : 0
-                }`
-            );
-
-        }
-
-
-        //================================================
-        // 1H DATA
-        //================================================
-
-        const candles1H =
-            await fetchFuturesKlines(
-                symbol,
-                "1h",
-                60
-            );
-
-
-        if (
-            candles1H &&
-            candles1H.length >=
-            (
-                (MOMENTUM_LOOKBACK_1H * 2) + 2
-            )
-        ) {
-
-            const closed1H =
-                candles1H.slice(
-                    0,
-                    -1
-                );
-
-
-            momentum1H =
-                calculate1HMomentum(
-                    closed1H
-                );
-
-        }
-
-        else {
-
-            log(
-                `1H Momentum data unavailable for ${symbol}. Candles received: ${
-                    candles1H
-                        ? candles1H.length
-                        : 0
-                }`
-            );
-
-        }
-
-
-        //================================================
-        // TREND HEALTH
-        //================================================
-
-        const trendHealth =
-            analyzeTrendHealth(
-                trend4H,
-                delta30M,
-                momentum1H
-            );
-
-
-        //================================================
-        // ALIGNMENT SCORE
-        //================================================
-
-        const alignmentScore =
-            calculateAlignmentScore(
-                trend4H,
-                delta30M
-            );
-
-
-        //================================================
-        // DELTA STRENGTH
-        //================================================
-
-        const orderFlowStrength =
-            Math.abs(
-                delta30M.deltaChange
-            );
-
-
-        //================================================
-        // RETURN RESULT
-        //================================================
-
-        return {
-
-            symbol,
-
-            currentPrice,
-
-            delta30M,
-
-            trend4H,
-
-            momentum1H,
-
-            trendHealth,
-
-            trendQuality,
-
-            alignmentScore,
-
-            orderFlowStrength
-
-        };
-
+      return null;
     }
 
-    catch (err) {
+    // Remove currently forming candle.
 
-        log(
-            `Order Flow Error ${symbol}: ${
-                err.message
-            }`
-        );
+    const closed30M = candles30M.slice(0, -1);
 
-        return null;
+    const currentPrice = Number(closed30M[closed30M.length - 1].close);
 
+    if (!Number.isFinite(currentPrice)) {
+      log(`Current price unavailable for ${symbol}`);
+
+      return null;
     }
 
+    //================================================
+    // 30M CUMULATIVE DELTA
+    //================================================
+
+    const delta30MSeries = calculateCumulativeDelta(closed30M);
+
+    delta30M = analyzeDelta(delta30MSeries);
+
+    if (!delta30M) {
+      log(`30M Delta unavailable for ${symbol}`);
+
+      return null;
+    }
+
+    //================================================
+    // 4H DATA
+    //================================================
+
+    const candles4H = await fetchFuturesKlines(symbol, "4h", 120);
+
+    if (candles4H && candles4H.length >= TREND_EMA_LENGTH + 2) {
+      const closed4H = candles4H.slice(0, -1);
+
+      trend4H = calculate4HTrendATR(closed4H);
+
+      trendQuality = analyzeTrendQuality(closed4H, trend4H);
+
+      if (!trend4H) {
+        log(`4H Trend/ATR calculation unavailable for ${symbol}`);
+      }
+    } else {
+      log(`4H data unavailable for ${symbol}. Candles received: ${candles4H ? candles4H.length : 0}`);
+    }
+
+    //================================================
+    // 1H DATA
+    //================================================
+
+    const candles1H = await fetchFuturesKlines(symbol, "1h", 60);
+
+    if (candles1H && candles1H.length >= MOMENTUM_LOOKBACK_1H * 2 + 2) {
+      const closed1H = candles1H.slice(0, -1);
+
+      momentum1H = calculate1HMomentum(closed1H);
+    } else {
+      log(`1H Momentum data unavailable for ${symbol}. Candles received: ${candles1H ? candles1H.length : 0}`);
+    }
+
+    //================================================
+    // TREND HEALTH
+    //================================================
+
+    const trendHealth = analyzeTrendHealth(trend4H, delta30M, momentum1H);
+
+    //================================================
+    // ALIGNMENT SCORE
+    //================================================
+
+    const alignmentScore = calculateAlignmentScore(trend4H, delta30M);
+
+    //================================================
+    // DELTA STRENGTH
+    //================================================
+
+    const orderFlowStrength = Math.abs(delta30M.deltaChange);
+
+    //================================================
+    // RETURN RESULT
+    //================================================
+
+    return {
+      symbol,
+
+      currentPrice,
+
+      delta30M,
+
+      trend4H,
+
+      momentum1H,
+
+      trendHealth,
+
+      trendQuality,
+
+      alignmentScore,
+
+      orderFlowStrength,
+    };
+  } catch (err) {
+    log(`Order Flow Error ${symbol}: ${err.message}`);
+
+    return null;
+  }
 }
 
 //======================================================
@@ -7179,259 +6259,130 @@ async function calculateCoinScore(
 //======================================================
 
 async function generateCoinScoreReport() {
+  try {
+    const results = [];
 
-    try {
+    //================================================
+    // SCAN ALL COINS
+    //================================================
 
-        const results = [];
+    for (const symbol of COIN_LIST) {
+      try {
+        const result = await calculateCoinScore(symbol);
 
+        if (result) {
+          results.push(result);
+        }
+      } catch (err) {
+        log(`Scanner Error ${symbol}: ${err.message}`);
+      }
+    }
 
-        //================================================
-        // SCAN ALL COINS
-        //================================================
+    //================================================
+    // FILTER ELIGIBLE TRENDING COINS
+    //
+    // A coin MUST pass ALL conditions:
+    //
+    // 1. 4H TREND = BULLISH or BEARISH
+    // 2. 1H MOMENTUM agrees with 4H trend
+    // 3. 30M DELTA agrees with 4H trend
+    // 4. TREND = HEALTHY
+    // 5. EXHAUSTION = LOW
+    //
+    // Only coins passing every condition can
+    // enter the TOP 7.
+    //================================================
 
-        for (
-            const symbol of COIN_LIST
-        ) {
+    const eligibleCoins = results.filter((coin) => {
+      if (!coin || !coin.trend4H || !coin.momentum1H || !coin.delta30M || !coin.trendHealth) {
+        return false;
+      }
 
-            try {
+      const trendState = coin.trend4H.trendState;
 
-                const result =
-                    await calculateCoinScore(
-                        symbol
-                    );
+      //================================================
+      // BULLISH TREND
+      //================================================
 
-                if (
-                    result
-                ) {
+      if (trendState === 1) {
+        // 1H momentum must be positive
 
-                    results.push(
-                        result
-                    );
+        const bullishMomentum = coin.momentum1H.direction === "POSITIVE";
 
-                }
+        // 30M delta must be positive
 
-            }
+        const bullishDelta = coin.delta30M.trend === "HIGHER POSITIVE" || coin.delta30M.trend === "LOWER POSITIVE";
 
-            catch (err) {
+        // Trend must be healthy
 
-                log(
-                    `Scanner Error ${symbol}: ${
-                        err.message
-                    }`
-                );
+        const healthy = coin.trendHealth.trend === "HEALTHY";
 
-            }
+        // Exhaustion must be low
 
+        const lowExhaustion = coin.trendHealth.exhaustion === "LOW";
+
+        const strongTrend = coin.trendQuality && coin.trendQuality.status === "STRONG TREND";
+
+        return bullishMomentum && bullishDelta && healthy && lowExhaustion && strongTrend;
+      }
+
+      //================================================
+      // BEARISH TREND
+      //================================================
+
+      if (trendState === -1) {
+        // 1H momentum must be negative
+
+        const bearishMomentum = coin.momentum1H.direction === "NEGATIVE";
+
+        // 30M delta must be negative
+
+        const bearishDelta = coin.delta30M.trend === "LOWER NEGATIVE" || coin.delta30M.trend === "HIGHER NEGATIVE";
+
+        // Trend must be healthy
+
+        const healthy = coin.trendHealth.trend === "HEALTHY";
+
+        // Exhaustion must be low
+
+        const lowExhaustion = coin.trendHealth.exhaustion === "LOW";
+
+        const strongTrend = coin.trendQuality && coin.trendQuality.status === "STRONG TREND";
+
+        return bearishMomentum && bearishDelta && healthy && lowExhaustion && strongTrend;
+      }
+
+      //================================================
+      // NEUTRAL 4H = NOT ELIGIBLE
+      //================================================
+
+      return false;
+    });
+
+    //================================================
+    // TOP 7
+    //
+    // Rank ONLY coins that passed ALL filters.
+    //
+    // 1. Highest alignment score
+    // 2. Strongest 30M delta movement breaks ties
+    //================================================
+
+    const top7 = eligibleCoins
+      .sort((a, b) => {
+        if (b.alignmentScore.score !== a.alignmentScore.score) {
+          return b.alignmentScore.score - a.alignmentScore.score;
         }
 
+        return b.orderFlowStrength - a.orderFlowStrength;
+      })
+      .slice(0, 7);
 
-        //================================================
-        // FILTER ELIGIBLE TRENDING COINS
-        //
-        // A coin MUST pass ALL conditions:
-        //
-        // 1. 4H TREND = BULLISH or BEARISH
-        // 2. 1H MOMENTUM agrees with 4H trend
-        // 3. 30M DELTA agrees with 4H trend
-        // 4. TREND = HEALTHY
-        // 5. EXHAUSTION = LOW
-        //
-        // Only coins passing every condition can
-        // enter the TOP 7.
-        //================================================
+    //================================================
+    // MESSAGE HEADER
+    //================================================
 
-        const eligibleCoins =
-            results.filter(
-                (
-                    coin
-                ) => {
-
-                    if (
-                        !coin ||
-                        !coin.trend4H ||
-                        !coin.momentum1H ||
-                        !coin.delta30M ||
-                        !coin.trendHealth
-                    ) {
-
-                        return false;
-
-                    }
-
-
-                    const trendState =
-                        coin.trend4H.trendState;
-
-
-                    //================================================
-                    // BULLISH TREND
-                    //================================================
-
-                    if (
-                        trendState === 1
-                    ) {
-
-                        // 1H momentum must be positive
-
-                        const bullishMomentum =
-                            coin.momentum1H.direction ===
-                            "POSITIVE";
-
-
-                        // 30M delta must be positive
-
-                        const bullishDelta =
-                            coin.delta30M.trend ===
-                                "HIGHER POSITIVE" ||
-
-                            coin.delta30M.trend ===
-                                "LOWER POSITIVE";
-
-
-                        // Trend must be healthy
-
-                        const healthy =
-                            coin.trendHealth.trend ===
-                            "HEALTHY";
-
-
-                        // Exhaustion must be low
-
-                        const lowExhaustion =
-                            coin.trendHealth.exhaustion ===
-                            "LOW";
-
-                        const strongTrend =
-                            coin.trendQuality &&
-                            coin.trendQuality.status ===
-                            "STRONG TREND";
-
-
-                        return (
-                            bullishMomentum &&
-                            bullishDelta &&
-                            healthy &&
-                            lowExhaustion &&
-                            strongTrend
-                        );
-
-                    }
-
-
-                    //================================================
-                    // BEARISH TREND
-                    //================================================
-
-                    if (
-                        trendState === -1
-                    ) {
-
-                        // 1H momentum must be negative
-
-                        const bearishMomentum =
-                            coin.momentum1H.direction ===
-                            "NEGATIVE";
-
-
-                        // 30M delta must be negative
-
-                        const bearishDelta =
-                            coin.delta30M.trend ===
-                                "LOWER NEGATIVE" ||
-
-                            coin.delta30M.trend ===
-                                "HIGHER NEGATIVE";
-
-
-                        // Trend must be healthy
-
-                        const healthy =
-                            coin.trendHealth.trend ===
-                            "HEALTHY";
-
-
-                        // Exhaustion must be low
-
-                        const lowExhaustion =
-                            coin.trendHealth.exhaustion ===
-                            "LOW";
-
-                        const strongTrend =
-                            coin.trendQuality &&
-                            coin.trendQuality.status ===
-                            "STRONG TREND";
-
-
-                        return (
-                            bearishMomentum &&
-                            bearishDelta &&
-                            healthy &&
-                            lowExhaustion &&
-                            strongTrend
-                        );
-
-                    }
-
-
-                    //================================================
-                    // NEUTRAL 4H = NOT ELIGIBLE
-                    //================================================
-
-                    return false;
-
-                }
-            );
-
-
-        //================================================
-        // TOP 7
-        //
-        // Rank ONLY coins that passed ALL filters.
-        //
-        // 1. Highest alignment score
-        // 2. Strongest 30M delta movement breaks ties
-        //================================================
-
-        const top7 =
-            eligibleCoins
-                .sort(
-                    (
-                        a,
-                        b
-                    ) => {
-
-                        if (
-                            b.alignmentScore.score !==
-                            a.alignmentScore.score
-                        ) {
-
-                            return (
-                                b.alignmentScore.score -
-                                a.alignmentScore.score
-                            );
-
-                        }
-
-
-                        return (
-                            b.orderFlowStrength -
-                            a.orderFlowStrength
-                        );
-
-                    }
-                )
-                .slice(
-                    0,
-                    7
-                );
-
-
-        //================================================
-        // MESSAGE HEADER
-        //================================================
-
-        let msg =
-`⚡ *COIN TREND REPORT*
+    let msg = `⚡ *COIN TREND REPORT*
 🕐 30-MINUTE UPDATE
 
 📊 4H = BROADER TREND
@@ -7443,17 +6394,12 @@ async function generateCoinScoreReport() {
 
 `;
 
+    //================================================
+    // NO ELIGIBLE COINS
+    //================================================
 
-        //================================================
-        // NO ELIGIBLE COINS
-        //================================================
-
-        if (
-            top7.length === 0
-        ) {
-
-            msg +=
-`⚪ *NO QUALIFYING COINS*
+    if (top7.length === 0) {
+      msg += `⚪ *NO QUALIFYING COINS*
 
 No coin currently satisfies all of the following:
 
@@ -7467,224 +6413,110 @@ No coin currently satisfies all of the following:
 The scanner is still monitoring all coins.
 
 `;
+    }
 
+    //================================================
+    // TOP 7 COINS
+    //================================================
+    else {
+      top7.forEach((coin, index) => {
+        const d30 = coin.delta30M;
+
+        const t4 = coin.trend4H;
+
+        const momentum = coin.momentum1H;
+
+        const health = coin.trendHealth;
+
+        //================================================
+        // 4H TREND
+        //================================================
+
+        const trendLabel = t4
+          ? t4.trendState === 1
+            ? "🟢 BULLISH"
+            : t4.trendState === -1
+              ? "🔴 BEARISH"
+              : "⚪ NEUTRAL"
+          : "⚪ UNKNOWN";
+
+        //================================================
+        // ATR ACTIVE SUPPORT / RESISTANCE
+        //================================================
+
+        let atrText = "⚪ N/A";
+
+        let distanceText = "N/A";
+
+        if (t4 && t4.activeLevel !== null) {
+          const distance = Math.abs(coin.currentPrice - Number(t4.activeLevel));
+
+          if (Number.isFinite(distance)) {
+            distanceText = distance.toFixed(6);
+          }
         }
 
+        if (t4) {
+          if (t4.trendState === 1) {
+            atrText = `🟢 SUPPORT @ ${t4.activeLevel !== null ? t4.activeLevel.toFixed(6) : "N/A"}`;
+          } else if (t4.trendState === -1) {
+            atrText = `🔴 RESISTANCE @ ${t4.activeLevel !== null ? t4.activeLevel.toFixed(6) : "N/A"}`;
+          }
+        }
 
         //================================================
-        // TOP 7 COINS
+        // 1H MOMENTUM
         //================================================
 
-        else {
+        let momentumText = "N/A";
 
-            top7.forEach(
-                (
-                    coin,
-                    index
-                ) => {
+        if (momentum) {
+          const momentumIcon = momentum.state === "DECELERATING" ? "🟡" : "🟢";
 
-                    const d30 =
-                        coin.delta30M;
+          const momentumValue = momentum.current >= 0 ? `+${momentum.current.toFixed(3)}` : momentum.current.toFixed(3);
 
-                    const t4 =
-                        coin.trend4H;
+          momentumText = `${momentumValue} ${momentumIcon}`;
+        }
 
-                    const momentum =
-                        coin.momentum1H;
+        //================================================
+        // 30M DELTA
+        //================================================
 
-                    const health =
-                        coin.trendHealth;
+        const flowText = d30 ? d30.trend : "N/A";
 
+        //================================================
+        // TREND QUALITY
+        //================================================
 
-                    //================================================
-                    // 4H TREND
-                    //================================================
+        const quality = coin.trendQuality || {
+          status: "UNKNOWN",
+          efficiency: 0,
+          atrRatio: 0,
+          emaSlopePct: 0,
+          structure: "UNKNOWN",
+        };
 
-                    const trendLabel =
-                        t4
-                            ? (
-                                t4.trendState === 1
-                                    ? "🟢 BULLISH"
-                                    : t4.trendState === -1
-                                        ? "🔴 BEARISH"
-                                        : "⚪ NEUTRAL"
-                            )
-                            : "⚪ UNKNOWN";
+        const qualityIcon = quality.status === "STRONG TREND" ? "🟢" : quality.status === "TRANSITION" ? "🟡" : "🔴";
 
+        const qualityText = `${qualityIcon} ${quality.status}`;
 
-                    //================================================
-                    // ATR ACTIVE SUPPORT / RESISTANCE
-                    //================================================
+        //================================================
+        // TREND HEALTH
+        //================================================
 
-                    let atrText =
-                        "⚪ N/A";
+        const trendIcon = health.trend === "HEALTHY" ? "🟢" : health.trend === "WEAKENING" ? "🟡" : "🔴";
 
-                    let distanceText =
-                        "N/A";
+        //================================================
+        // EXHAUSTION
+        //================================================
 
+        const exhaustionIcon = health.exhaustion === "LOW" ? "🟢" : health.exhaustion === "MODERATE" ? "🟡" : "🔴";
 
-                    if (
-                        t4 &&
-                        t4.activeLevel !== null
-                    ) {
+        //================================================
+        // REPORT ENTRY
+        //================================================
 
-                        const distance =
-                            Math.abs(
-                                coin.currentPrice -
-                                Number(
-                                    t4.activeLevel
-                                )
-                            );
-
-
-                        if (
-                            Number.isFinite(
-                                distance
-                            )
-                        ) {
-
-                            distanceText =
-                                distance.toFixed(
-                                    6
-                                );
-
-                        }
-
-                    }
-
-
-                    if (
-                        t4
-                    ) {
-
-                        if (
-                            t4.trendState === 1
-                        ) {
-
-                            atrText =
-                                `🟢 SUPPORT @ ${
-                                    t4.activeLevel !== null
-                                        ? t4.activeLevel.toFixed(6)
-                                        : "N/A"
-                                }`;
-
-                        }
-
-                        else if (
-                            t4.trendState === -1
-                        ) {
-
-                            atrText =
-                                `🔴 RESISTANCE @ ${
-                                    t4.activeLevel !== null
-                                        ? t4.activeLevel.toFixed(6)
-                                        : "N/A"
-                                }`;
-
-                        }
-
-                    }
-
-
-                    //================================================
-                    // 1H MOMENTUM
-                    //================================================
-
-                    let momentumText =
-                        "N/A";
-
-
-                    if (
-                        momentum
-                    ) {
-
-                        const momentumIcon =
-                            momentum.state ===
-                            "DECELERATING"
-                                ? "🟡"
-                                : "🟢";
-
-
-                        const momentumValue =
-                            momentum.current >= 0
-                                ? `+${momentum.current.toFixed(3)}`
-                                : momentum.current.toFixed(3);
-
-
-                        momentumText =
-                            `${momentumValue} ${momentumIcon}`;
-
-                    }
-
-
-                    //================================================
-                    // 30M DELTA
-                    //================================================
-
-                    const flowText =
-                        d30
-                            ? d30.trend
-                            : "N/A";
-
-
-                    //================================================
-                    // TREND QUALITY
-                    //================================================
-
-                    const quality =
-                        coin.trendQuality || {
-                            status: "UNKNOWN",
-                            efficiency: 0,
-                            atrRatio: 0,
-                            emaSlopePct: 0,
-                            structure: "UNKNOWN"
-                        };
-
-                    const qualityIcon =
-                        quality.status === "STRONG TREND"
-                            ? "🟢"
-                            : quality.status === "TRANSITION"
-                                ? "🟡"
-                                : "🔴";
-
-                    const qualityText =
-                        `${qualityIcon} ${quality.status}`;
-
-
-                    //================================================
-                    // TREND HEALTH
-                    //================================================
-
-                    const trendIcon =
-                        health.trend ===
-                        "HEALTHY"
-                            ? "🟢"
-                            : health.trend ===
-                              "WEAKENING"
-                                ? "🟡"
-                                : "🔴";
-
-
-                    //================================================
-                    // EXHAUSTION
-                    //================================================
-
-                    const exhaustionIcon =
-                        health.exhaustion ===
-                        "LOW"
-                            ? "🟢"
-                            : health.exhaustion ===
-                              "MODERATE"
-                                ? "🟡"
-                                : "🔴";
-
-
-                    //================================================
-                    // REPORT ENTRY
-                    //================================================
-
-                    msg +=
-`${index + 1}. *${coin.symbol}*
+        msg += `${index + 1}. *${coin.symbol}*
 
 📊 4H: ${trendLabel}
 🎯 ATR: ${atrText}
@@ -7699,35 +6531,23 @@ The scanner is still monitoring all coins.
 
 `;
 
+        //================================================
+        // SEPARATOR
+        //================================================
 
-                    //================================================
-                    // SEPARATOR
-                    //================================================
-
-                    if (
-                        index <
-                        top7.length - 1
-                    ) {
-
-                        msg +=
-`━━━━━━━━━━━━━━━━━━━━
+        if (index < top7.length - 1) {
+          msg += `━━━━━━━━━━━━━━━━━━━━
 
 `;
-
-                    }
-
-                }
-            );
-
         }
+      });
+    }
 
+    //================================================
+    // GUIDE
+    //================================================
 
-        //================================================
-        // GUIDE
-        //================================================
-
-        msg +=
-`━━━━━━━━━━━━━━━━━━━━
+    msg += `━━━━━━━━━━━━━━━━━━━━
 
 📌 *FILTER*
 4H trend must be established
@@ -7750,29 +6570,15 @@ Exhaustion must be LOW
 ⚠️ *INFORMATIONAL ONLY*
 `;
 
+    //================================================
+    // SEND TELEGRAM
+    //================================================
 
-        //================================================
-        // SEND TELEGRAM
-        //================================================
-
-        await sendMessage(
-            msg
-        );
-
-    }
-
-    catch (err) {
-
-        log(
-            `Order Flow Report Error: ${
-                err.message
-            }`
-        );
-
-    }
-
+    await sendMessage(msg);
+  } catch (err) {
+    log(`Order Flow Report Error: ${err.message}`);
+  }
 }
-
 
 //======================================================
 // INITIAL REPORT
@@ -7780,22 +6586,19 @@ Exhaustion must be LOW
 
 generateCoinScoreReport();
 
-
 //======================================================
 // RUN EVERY 30 MINUTES
 //======================================================
 
 setInterval(
+  generateCoinScoreReport,
 
-    generateCoinScoreReport,
-
-    30 * 60 * 1000
-
+  30 * 60 * 1000,
 );
 
 const ADMIN_CHAT_IDS = [
   "1718404728", // Existing admin
-  "6907653103"  // Additional admin authorized to control the bot
+  "6907653103", // Additional admin authorized to control the bot
 ];
 
 // Helper function to check admin
@@ -7830,7 +6633,9 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
   // Avoid opening a duplicate exposure or overwriting a currently tracked
   // position for this symbol. The normal executor persists positions by symbol.
   if (activePositions[symbol] && Object.keys(activePositions[symbol]).length > 0) {
-    await reply(`⛔ *${symbol}* already has a tracked open position. Manual entry cancelled to avoid duplicate exposure.`);
+    await reply(
+      `⛔ *${symbol}* already has a tracked open position. Manual entry cancelled to avoid duplicate exposure.`,
+    );
     return;
   }
 
@@ -7868,7 +6673,7 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     if (!direction15 || direction15 !== direction5) {
       await reply(
         `⛔ *${symbol}* manual trade cancelled: 15M/5M Delta are not aligned.\n` +
-        `• 15M: ${direction15 || "NEUTRAL"}\n• 5M: ${direction5 || "NEUTRAL"}`
+          `• 15M: ${direction15 || "NEUTRAL"}\n• 5M: ${direction5 || "NEUTRAL"}`,
       );
       return;
     }
@@ -7876,9 +6681,9 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     const direction = direction15;
     await reply(
       `✅ *${symbol} — Delta alignment confirmed: ${direction}*\n` +
-      `• 15M CumDelta: ${delta15.cumDelta.toFixed(2)} | MA: ${delta15.deltaMA.toFixed(2)}\n` +
-      `• 5M CumDelta: ${delta5.cumDelta.toFixed(2)} | MA: ${delta5.deltaMA.toFixed(2)}\n` +
-      `2️⃣ Checking 5M OBV in the aligned direction…`
+        `• 15M CumDelta: ${delta15.cumDelta.toFixed(2)} | MA: ${delta15.deltaMA.toFixed(2)}\n` +
+        `• 5M CumDelta: ${delta5.cumDelta.toFixed(2)} | MA: ${delta5.deltaMA.toFixed(2)}\n` +
+        `2️⃣ Checking 5M OBV in the aligned direction…`,
     );
 
     // The manual command intentionally skips the automatic setup/BOS/retest,
@@ -7886,7 +6691,7 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     if (!calculateOBVConfirmation(closed5, direction)) {
       await reply(
         `⛔ *${symbol}* manual trade cancelled: 5M OBV does not confirm *${direction}*.\n` +
-        `Expected OBV ${direction === "BUY" ? "above" : "below"} its ${OBV_EMA_LENGTH}-EMA.`
+          `Expected OBV ${direction === "BUY" ? "above" : "below"} its ${OBV_EMA_LENGTH}-EMA.`,
       );
       return;
     }
@@ -7912,9 +6717,9 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     if (!liquidity.passed) {
       await reply(
         `⛔ *${symbol}* manual trade cancelled: liquidity check failed.\n` +
-        `Reason: ${liquidity.reason}\n` +
-        `Spread: ${Number.isFinite(liquidity.spreadPct) ? `${liquidity.spreadPct.toFixed(3)}%` : "N/A"}\n` +
-        `24H volume: ${Number.isFinite(liquidity.quoteVolume24h) ? `${liquidity.quoteVolume24h.toLocaleString()} USDT` : "N/A"}`
+          `Reason: ${liquidity.reason}\n` +
+          `Spread: ${Number.isFinite(liquidity.spreadPct) ? `${liquidity.spreadPct.toFixed(3)}%` : "N/A"}\n` +
+          `24H volume: ${Number.isFinite(liquidity.quoteVolume24h) ? `${liquidity.quoteVolume24h.toLocaleString()} USDT` : "N/A"}`,
       );
       return;
     }
@@ -7935,13 +6740,15 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     } else {
       await reply(
         `⚠️ *${symbol} ${direction}: no orders were executed.*\n` +
-        `Attempted: ${executionResult.attempted} | Failed: ${executionResult.failed} | Skipped: ${executionResult.skipped}.\n` +
-        `Check the bot logs and user balances/limits before retrying.`
+          `Attempted: ${executionResult.attempted} | Failed: ${executionResult.failed} | Skipped: ${executionResult.skipped}.\n` +
+          `Check the bot logs and user balances/limits before retrying.`,
       );
     }
   } catch (err) {
     log(`Manual trade command failed for ${symbol}: ${err?.message || err}`);
-    await reply(`❌ *${symbol}* manual trade failed safely: ${err?.message || "unexpected error"}. No further execution was attempted.`);
+    await reply(
+      `❌ *${symbol}* manual trade failed safely: ${err?.message || "unexpected error"}. No further execution was attempted.`,
+    );
   }
 });
 
@@ -8001,7 +6808,9 @@ async function closeTrackedPositionOrder(client, symbol, pos) {
 // Shared close path for manual /close SYMBOL and automatic 15M OBV-divergence exits.
 // Both routes use the exact same tracked-position market-order helper and cleanup.
 async function closeTrackedSymbolPositions(symbol, reason = null) {
-  const normalizedSymbol = String(symbol || "").toUpperCase().trim();
+  const normalizedSymbol = String(symbol || "")
+    .toUpperCase()
+    .trim();
   if (!activePositions[normalizedSymbol]) {
     if (!reason) await sendMessage(`⚠️ No active position for *${normalizedSymbol}*`);
     return false;
@@ -8020,9 +6829,11 @@ async function closeTrackedSymbolPositions(symbol, reason = null) {
 
   delete activePositions[normalizedSymbol];
   saveActivePositions();
-  await sendMessage(reason
-    ? `✅ *${normalizedSymbol}* close routine completed. Reason: ${reason}.`
-    : `✅ *${normalizedSymbol}* fully closed for all users`);
+  await sendMessage(
+    reason
+      ? `✅ *${normalizedSymbol}* close routine completed. Reason: ${reason}.`
+      : `✅ *${normalizedSymbol}* fully closed for all users`,
+  );
   return true;
 }
 
@@ -8078,9 +6889,7 @@ async function deactivateSymbol(symbol, notify = true) {
   symbolActive[normalizedSymbol] = false;
 
   if (notify) {
-    await sendMessage(
-      `🚫 *${normalizedSymbol}* deactivated. No trades will be placed for this symbol.`
-    );
+    await sendMessage(`🚫 *${normalizedSymbol}* deactivated. No trades will be placed for this symbol.`);
   }
 
   return true;
@@ -8104,14 +6913,16 @@ bot.onText(/\/activate (\w+)/, async (msg, match) => {
     return;
   }
   symbolActive[symbol] = true;
-    await sendMessage(`✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M OBV/50 EMA cross is required before entry.`);
+  await sendMessage(
+    `✅ *${symbol}* activated. Trading resumed for this symbol. A fresh 5M OBV/50 EMA cross is required before entry.`,
+  );
 });
 
 bot.onText(/\/deactivateall/, async (msg) => {
   if (!isAdmin(msg)) return;
   COIN_LIST.forEach((symbol) => {
     symbolActive[symbol] = false;
-      });
+  });
   await sendMessage("🚫 All symbols deactivated. No trades will be placed for any symbol.");
 });
 
@@ -8142,10 +6953,10 @@ bot.onText(/^\/price\s+(\w+)\s+([\d.]+)$/i, async (msg, match) => {
 
   await sendMessage(
     `🎯 *PRICE ACTIVATION SET*\n\n` +
-    `🪙 Coin: *${symbol}*\n` +
-    `💰 Activation Price: *${activationPrice}*\n\n` +
-    `🔒 ${symbol} is now locked until price crosses the activation level.\n` +
-    `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`
+      `🪙 Coin: *${symbol}*\n` +
+      `💰 Activation Price: *${activationPrice}*\n\n` +
+      `🔒 ${symbol} is now locked until price crosses the activation level.\n` +
+      `After activation, the normal STC + Trend-Reset Delta strategy will decide the entry.`,
   );
 });
 
@@ -8166,8 +6977,8 @@ bot.onText(/^\/priceoff\s+(\w+)$/i, async (msg, match) => {
 
   await sendMessage(
     `🔓 *PRICE ACTIVATION REMOVED*\n\n` +
-    `🪙 *${symbol}* no longer has a price activation gate.\n` +
-    `Its normal /activate and /deactivate status remains unchanged.`
+      `🪙 *${symbol}* no longer has a price activation gate.\n` +
+      `Its normal /activate and /deactivate status remains unchanged.`,
   );
 });
 
@@ -8178,9 +6989,7 @@ bot.onText(/^\/pricestatus$/i, async (msg) => {
   const symbols = Object.keys(priceActivationLevels);
 
   if (!symbols.length) {
-    await sendMessage(
-      `🎯 *PRICE ACTIVATION STATUS*\n\nNo price activation levels are configured.`
-    );
+    await sendMessage(`🎯 *PRICE ACTIVATION STATUS*\n\nNo price activation levels are configured.`);
     return;
   }
 
@@ -8333,15 +7142,10 @@ bot.onText(/\/monthlyreport/, async (msg) => {
 
 bot.onText(/^\/activecoins$/, async (msg) => {
   try {
-    const activeCoins = COIN_LIST.filter(
-      symbol => symbolActive[symbol] !== false
-    );
+    const activeCoins = COIN_LIST.filter((symbol) => symbolActive[symbol] !== false);
 
     if (!activeCoins.length) {
-      await sendMessage(
-        "⚪ *ACTIVE COINS*\n\n" +
-        "No coins are currently active for trading."
-      );
+      await sendMessage("⚪ *ACTIVE COINS*\n\n" + "No coins are currently active for trading.");
       return;
     }
 
@@ -8371,13 +7175,10 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
 
     // Keep only today's trades. Older entries naturally fall
     // out of the displayed history when the date changes.
-    tradeHistory = tradeHistory.filter(trade => trade.date === today);
+    tradeHistory = tradeHistory.filter((trade) => trade.date === today);
 
     if (!tradeHistory.length) {
-      await sendMessage(
-        `📜 *TRADE HISTORY — ${today}*\n\n` +
-        "No trades have been placed today."
-      );
+      await sendMessage(`📜 *TRADE HISTORY — ${today}*\n\n` + "No trades have been placed today.");
       return;
     }
 
@@ -8389,7 +7190,7 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
-        hour12: false
+        hour12: false,
       }).format(new Date(trade.timestamp));
 
       message +=
