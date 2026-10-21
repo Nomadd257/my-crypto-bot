@@ -777,7 +777,7 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 //     a fresh 5M crossover is NOT required.
 // 15M: require a directional OBV/50-EMA crossover using the LIVE, still-forming
 //      15M candle. This is intentionally intrabar and does not wait for close.
-const OBV_EMA_LENGTH = 50;
+const OBV_EMA_LENGTH = 20;
 const OBV_CONFIRMATION_CANDLES = 1;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
