@@ -1,5 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
+// v55: requires closed-5M OBV directional confirmation plus a live/intrabar 15M OBV/50-EMA crossover; preserves v54 execution scanner and v53 classifier fix
 // v54: adds independent 10-second pending-setup execution scanner with OBV/expiry diagnostics; preserves v53 expansion-classifier reliability fix
 // v52: classifies post-consolidation breakouts as REAL EXPANSION or MARKET NOISE with Telegram alerts; preserves the consolidation detector and v51 manual trade command
 // v51: adds admin-only /manualtrade SYMBOL command — aligned 15M/5M delta direction → 5M OBV → liquidity → normal multi-user execution
@@ -771,10 +772,11 @@ const TR_DELTA_MA_LENGTH = 10;
 const DELTA_STRENGTH_THRESHOLD = 1.5;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
-// 5M OBV entry confirmation.
-// OBV is a directional confirmation only. A fresh crossover and minimum
-// separation are NOT required. The latest CLOSED 5M OBV only needs to be
-// on the correct side of its 50 EMA.
+// OBV entry confirmation.
+// 5M: latest CLOSED candle must have OBV on the correct side of its 50 EMA;
+//     a fresh 5M crossover is NOT required.
+// 15M: require a directional OBV/50-EMA crossover using the LIVE, still-forming
+//      15M candle. This is intentionally intrabar and does not wait for close.
 const OBV_EMA_LENGTH = 50;
 const OBV_CONFIRMATION_CANDLES = 1;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
@@ -2825,6 +2827,50 @@ function calculateOBVConfirmation(candles, direction) {
   if (direction === "SELL") return latestOBV < latestEMA;
 
   return false;
+}
+
+function calculateLive15MOBVCrossover(candles, direction) {
+  // Uses the latest API candle as the live/forming 15M candle. The previous
+  // candle establishes the pre-cross side; the live OBV/EMA must now be across.
+  // No 15M candle-close confirmation is required.
+  if (!Array.isArray(candles) || candles.length < OBV_EMA_LENGTH + 2) {
+    return { passed: false, status: "UNAVAILABLE", reason: "insufficient 15M candles" };
+  }
+
+  const obvSeries = calculateOBVSeries(candles);
+  if (!Array.isArray(obvSeries) || obvSeries.length !== candles.length) {
+    return { passed: false, status: "UNAVAILABLE", reason: "15M OBV series unavailable" };
+  }
+
+  const obvCandles = candles.map((candle, index) => ({ ...candle, close: obvSeries[index] }));
+  const obvEMA = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
+  if (!Array.isArray(obvEMA) || obvEMA.length !== candles.length) {
+    return { passed: false, status: "UNAVAILABLE", reason: "15M OBV EMA unavailable" };
+  }
+
+  const last = candles.length - 1;
+  const previousOBV = Number(obvSeries[last - 1]);
+  const currentOBV = Number(obvSeries[last]);
+  const previousEMA = Number(obvEMA[last - 1]);
+  const currentEMA = Number(obvEMA[last]);
+  if (![previousOBV, currentOBV, previousEMA, currentEMA].every(Number.isFinite)) {
+    return { passed: false, status: "UNAVAILABLE", reason: "non-finite 15M OBV values" };
+  }
+
+  const crossedUp = previousOBV <= previousEMA && currentOBV > currentEMA;
+  const crossedDown = previousOBV >= previousEMA && currentOBV < currentEMA;
+  const passed = direction === "BUY" ? crossedUp : direction === "SELL" ? crossedDown : false;
+  return {
+    passed,
+    status: passed ? "CROSS_CONFIRMED" : "WAITING_FOR_CROSS",
+    crossedUp,
+    crossedDown,
+    previousOBV,
+    currentOBV,
+    previousEMA,
+    currentEMA,
+    liveCandleTime: candles[last]?.time ?? candles[last]?.openTime ?? candles[last]?.open_time ?? candles[last]?.timestamp ?? null
+  };
 }
 
 // =====================================================
@@ -5353,18 +5399,35 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        const obvConfirmed = calculateOBVConfirmation(closedCandles5, direction);
-        if (!obvConfirmed) {
-          const obvKey = `OBV_FAIL:${candleKey}:${direction}`;
+        // Both OBV timeframes are mandatory at the OBV stage:
+        // 5M uses the latest CLOSED candle and needs only directional alignment;
+        // 15M uses the current FORMING candle and requires a live directional cross.
+        const obvConfirmed5 = calculateOBVConfirmation(closedCandles5, direction);
+        let candles15 = null;
+        let obv15 = { passed: false, status: "UNAVAILABLE", reason: "15M candle fetch not completed" };
+        try {
+          candles15 = await fetchFuturesKlines(symbol, "15m", 150);
+          obv15 = calculateLive15MOBVCrossover(candles15, direction);
+        } catch (obv15Err) {
+          obv15 = { passed: false, status: "UNAVAILABLE", reason: String(obv15Err?.message || obv15Err).slice(0, 160) };
+        }
+
+        if (!obvConfirmed5 || !obv15.passed) {
+          const obv15Reason = obv15.status === "UNAVAILABLE"
+            ? `15M live OBV cross unavailable (${obv15.reason || "unknown reason"})`
+            : `15M live OBV has not crossed its ${OBV_EMA_LENGTH}-EMA in the ${direction} direction`;
+          const obvKey = `OBV_FAIL:${candleKey}:${direction}:${obvConfirmed5 ? "5M_OK" : "5M_WAIT"}:${obv15.status}:${obv15.liveCandleTime ?? "NO_15M_KEY"}`;
           if (setup.executionScannerLastBlockKey !== obvKey) {
             setup.executionScannerLastBlockKey = obvKey;
             awaitSendScript2Checkpoint(
               `⏳ *OBV CONFIRMATION PENDING* — *${symbol}*\n` +
               `Direction: *${direction}*\n` +
-              `Latest CLOSED 5M OBV is not yet on the required side of its ${OBV_EMA_LENGTH}-EMA.\n` +
-              `The setup is retained and will be rechecked every 10 seconds; no fresh crossover is required.`
+              `5M closed-candle OBV: ${obvConfirmed5 ? "✅ passed (correct side of 50-EMA)" : "❌ pending (not on required side of 50-EMA)"}\n` +
+              `15M live-candle OBV cross: ${obv15.passed ? "✅ passed" : `❌ ${obv15Reason}`}\n` +
+              `The setup is retained and rechecked every 10 seconds. The 15M candle does not need to close; the 5M check uses only closed candles.`
             );
           }
+          setup.obvNotified = false;
           continue;
         }
 
@@ -5372,9 +5435,10 @@ async function monitorScript2ExecutionScanner() {
           setup.obvNotified = true;
           setup.executionScannerLastBlockKey = null;
           awaitSendScript2Checkpoint(
-            `📈 *OBV CONFIRMATION PASSED* — *${symbol}*\n` +
+            `📈 *DUAL-TIMEFRAME OBV CONFIRMATION PASSED* — *${symbol}*\n` +
             `Direction: *${direction}*\n` +
-            `Latest CLOSED 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh crossover not required.`
+            `5M: latest CLOSED OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh 5M cross not required.\n` +
+            `15M: live OBV crossed the ${OBV_EMA_LENGTH}-EMA in the ${direction} direction; no candle close required.`
           );
         }
 
