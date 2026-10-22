@@ -1,6 +1,6 @@
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// v58: 1H OBV vs 20 EMA sets directional bias; 15M/5M Delta alignment and 5M strength unlock setups; preserve remaining entry/expiry rules
+// v59: 30M OBV vs 20 EMA sets directional bias; remove 15M OBV entry gate; retain 5M OBV, 15M/5M Delta alignment and 5M strength unlock
 // v57: standardize existing OBV EMA checks to 20 periods; preserve v56 entry and expiry rules
 // v54: adds independent 10-second pending-setup execution scanner with OBV/expiry diagnostics; preserves v53 expansion-classifier reliability fix
 // v52: classifies post-consolidation breakouts as REAL EXPANSION or MARKET NOISE with Telegram alerts; preserves the consolidation detector and v51 manual trade command
@@ -776,9 +776,8 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 // OBV EMA period for existing OBV EMA checks: 20.
 // 5M: latest CLOSED candle must have OBV on the correct side of its 20 EMA;
 //     a fresh 5M crossover is NOT required.
-// 15M: require a directional OBV/20-EMA crossover using the LIVE, still-forming
-//      15M candle. This is intentionally intrabar and does not wait for close.
-// 1H OBV direction uses the latest CLOSED 1H candle relative to its 20 EMA; no fresh crossover required.
+// 15M OBV is not an entry confirmation requirement.
+// 30M OBV direction uses the latest CLOSED 30M candle relative to its 20 EMA; no fresh crossover required.
 const OBV_EMA_LENGTH = 20;
 const OBV_CONFIRMATION_CANDLES = 1;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
@@ -4793,7 +4792,7 @@ setInterval(async () => {
       // =====================================================
 // SCRIPT 2 ENTRY LOGIC — ZONE → REVERSAL OR CONTINUATION
 // =====================================================
-// 0) Latest CLOSED 1H OBV vs 20 EMA sets direction (above=BUY, below=SELL); no fresh cross required.
+// 0) Latest CLOSED 30M OBV vs 20 EMA sets direction (above=BUY, below=SELL); no fresh cross required.
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
@@ -4823,15 +4822,15 @@ if (!candles5 || candles5.length < 40) continue;
 // is evaluated separately against candles5[candles5.length - 1], the forming candle.
 const closedCandles5 = candles5.slice(0, -1);
 
-// The latest CLOSED 1H OBV position relative to its 20 EMA is the primary
+// The latest CLOSED 30M OBV position relative to its 20 EMA is the primary
 // direction authority for all automatic Script 2 setups. No fresh cross needed.
-const candles1hForBias = await fetchFuturesKlines(symbol, "1h", 150);
-const closedCandles1hForBias = Array.isArray(candles1hForBias) && candles1hForBias.length > 1
-  ? candles1hForBias.slice(0, -1)
+const candles30mForBias = await fetchFuturesKlines(symbol, "30m", 150);
+const closedCandles30mForBias = Array.isArray(candles30mForBias) && candles30mForBias.length > 1
+  ? candles30mForBias.slice(0, -1)
   : null;
-const obv1hBiasDirection = calculateOBVBiasDirection(closedCandles1hForBias);
-if (!obv1hBiasDirection) {
-  log(`ℹ️ ${symbol}: 1H OBV/20-EMA direction unavailable or exactly equal; new Script 2 setups remain locked.`);
+const obv30mBiasDirection = calculateOBVBiasDirection(closedCandles30mForBias);
+if (!obv30mBiasDirection) {
+  log(`ℹ️ ${symbol}: 30M OBV/20-EMA direction unavailable or exactly equal; new Script 2 setups remain locked.`);
 }
 
 // Global market-activity regime is informational only. All regimes may create
@@ -4878,9 +4877,9 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 }
 
 // -----------------------------------------------------
-// MASTER UNLOCK — 1H OBV DIRECTION → CLOSED 15M + 5M TREND-RESET DELTA
+// MASTER UNLOCK — 30M OBV DIRECTION → CLOSED 15M + 5M TREND-RESET DELTA
 // -----------------------------------------------------
-// Stage 0: latest CLOSED 1H OBV must establish direction relative to its 20 EMA.
+// Stage 0: latest CLOSED 30M OBV must establish direction relative to its 20 EMA.
 // Stage 1: 15M and 5M Delta must agree directionally relative to their own
 // Delta MAs. Send one Telegram message when a new alignment event begins.
 // Stage 2: the existing adaptive strength threshold must be met by the 5M
@@ -4924,12 +4923,12 @@ const rawAlignedDeltaDirection =
   delta15Direction && delta15Direction === delta5Direction
     ? delta15Direction
     : null;
-// Delta alignment only unlocks in the direction selected by 1H OBV.
-const alignedDeltaDirection = rawAlignedDeltaDirection && rawAlignedDeltaDirection === obv1hBiasDirection
+// Delta alignment only unlocks in the direction selected by 30M OBV.
+const alignedDeltaDirection = rawAlignedDeltaDirection && rawAlignedDeltaDirection === obv30mBiasDirection
   ? rawAlignedDeltaDirection
   : null;
-if (rawAlignedDeltaDirection && obv1hBiasDirection && rawAlignedDeltaDirection !== obv1hBiasDirection) {
-  log(`⛔ ${symbol}: 15M/5M Delta aligns ${rawAlignedDeltaDirection}, but 1H OBV bias is ${obv1hBiasDirection}; setup remains locked.`);
+if (rawAlignedDeltaDirection && obv30mBiasDirection && rawAlignedDeltaDirection !== obv30mBiasDirection) {
+  log(`⛔ ${symbol}: 15M/5M Delta aligns ${rawAlignedDeltaDirection}, but 30M OBV bias is ${obv30mBiasDirection}; setup remains locked.`);
 }
 
 let deltaGateState = script2DeltaGateState[symbol] || {
@@ -4969,8 +4968,8 @@ if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaD
   }
 
   await sendMessage(
-    `🧭 *1H OBV BIAS + 15M/5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
-    `• 1H OBV/20-EMA bias: *${obv1hBiasDirection}*\n` +
+    `🧭 *30M OBV BIAS + 15M/5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
+    `• 30M OBV/20-EMA bias: *${obv30mBiasDirection}*\n` +
     `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Aligned direction: *${alignedDeltaDirection}*\n` +
     `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
     `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
@@ -5456,37 +5455,37 @@ async function monitorScript2ExecutionScanner() {
           continue;
         }
 
-        // Recheck the primary 1H direction before any automatic order. If the
+        // Recheck the primary 30M direction before any automatic order. If the
         // bias has changed, retain the setup but do not execute against the bias.
-        let liveClosedCandles1h = null;
-        let liveObv1hBias = null;
+        let liveClosedCandles30m = null;
+        let liveObv30mBias = null;
         try {
-          const liveCandles1h = await fetchFuturesKlines(symbol, "1h", 150);
-          liveClosedCandles1h = Array.isArray(liveCandles1h) && liveCandles1h.length > 1
-            ? liveCandles1h.slice(0, -1)
+          const liveCandles30m = await fetchFuturesKlines(symbol, "30m", 150);
+          liveClosedCandles30m = Array.isArray(liveCandles30m) && liveCandles30m.length > 1
+            ? liveCandles30m.slice(0, -1)
             : null;
-          liveObv1hBias = calculateOBVBiasDirection(liveClosedCandles1h);
-        } catch (obv1hErr) {
-          log(`⚠️ ${symbol}: execution 1H OBV bias check failed: ${obv1hErr?.message || obv1hErr}`);
+          liveObv30mBias = calculateOBVBiasDirection(liveClosedCandles30m);
+        } catch (obv30mErr) {
+          log(`⚠️ ${symbol}: execution 30M OBV bias check failed: ${obv30mErr?.message || obv30mErr}`);
         }
-        if (!liveObv1hBias || liveObv1hBias !== direction) {
-          const biasBlockKey = `1H_OBV_BIAS:${candleKey}:${liveObv1hBias || "UNAVAILABLE"}:${direction}`;
+        if (!liveObv30mBias || liveObv30mBias !== direction) {
+          const biasBlockKey = `30M_OBV_BIAS:${candleKey}:${liveObv30mBias || "UNAVAILABLE"}:${direction}`;
           if (setup.executionScannerLastBiasBlockKey !== biasBlockKey) {
             setup.executionScannerLastBiasBlockKey = biasBlockKey;
             awaitSendScript2Checkpoint(
-              `⏳ *1H OBV DIRECTION GATE PENDING* — *${symbol}*\n` +
-              `Setup direction: *${direction}* | Current closed-1H OBV/20-EMA bias: *${liveObv1hBias || "UNAVAILABLE"}*\n` +
-              `The 1H bias must agree before execution. Setup retained; no order placed.`
+              `⏳ *30M OBV DIRECTION GATE PENDING* — *${symbol}*\n` +
+              `Setup direction: *${direction}* | Current closed-30M OBV/20-EMA bias: *${liveObv30mBias || "UNAVAILABLE"}*\n` +
+              `The 30M bias must agree before execution. Setup retained; no order placed.`
             );
           }
           continue;
         }
         setup.executionScannerLastBiasBlockKey = null;
-        if (!setup.obv1hBiasNotified) {
-          setup.obv1hBiasNotified = true;
+        if (!setup.obv30mBiasNotified) {
+          setup.obv30mBiasNotified = true;
           awaitSendScript2Checkpoint(
-            `🧭 *1H OBV DIRECTION PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}* | OBV is on the correct side of its ${OBV_EMA_LENGTH}-EMA on the latest closed 1H candle. No fresh crossover required.`
+            `🧭 *30M OBV DIRECTION PASSED* — *${symbol}*\n` +
+            `Direction: *${direction}* | OBV is on the correct side of its ${OBV_EMA_LENGTH}-EMA on the latest closed 30M candle. No fresh crossover required.`
           );
         }
 
@@ -5499,21 +5498,9 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // Both OBV timeframes are mandatory at the OBV stage:
-        // 5M uses the latest CLOSED candle and needs only directional alignment;
-        // 15M uses the current FORMING candle and requires a live directional cross.
+        // Entry OBV confirmation uses ONLY the latest CLOSED 5M candle.
+        // The 15M OBV crossover is intentionally removed as an entry blocker.
         const obvConfirmed5 = calculateOBVConfirmation(closedCandles5, direction);
-        let candles15 = null;
-        let obv15 = { passed: false, status: "UNAVAILABLE", reason: "15M candle fetch not completed" };
-        try {
-          candles15 = await fetchFuturesKlines(symbol, "15m", 150);
-          obv15 = calculateLive15MOBVCrossover(candles15, direction);
-        } catch (obv15Err) {
-          obv15 = { passed: false, status: "UNAVAILABLE", reason: String(obv15Err?.message || obv15Err).slice(0, 160) };
-        }
-
-        // Notify each OBV condition independently so the user can study the
-        // exact sequence in which the entry confirmations become available.
         if (obvConfirmed5 && !setup.obv5Notified) {
           setup.obv5Notified = true;
           awaitSendScript2Checkpoint(
@@ -5525,30 +5512,15 @@ async function monitorScript2ExecutionScanner() {
           setup.obv5Notified = false;
         }
 
-        if (obv15.passed && !setup.obv15Notified) {
-          setup.obv15Notified = true;
-          awaitSendScript2Checkpoint(
-            `📈 *15M LIVE OBV CROSS PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}*\n` +
-            `The forming 15M candle's OBV crossed its ${OBV_EMA_LENGTH}-EMA in the required direction.`
-          );
-        } else if (!obv15.passed) {
-          setup.obv15Notified = false;
-        }
-
-        if (!obvConfirmed5 || !obv15.passed) {
-          const obv15Reason = obv15.status === "UNAVAILABLE"
-            ? `15M live OBV cross unavailable (${obv15.reason || "unknown reason"})`
-            : `15M live OBV has not crossed its ${OBV_EMA_LENGTH}-EMA in the ${direction} direction`;
-          const obvKey = `OBV_FAIL:${candleKey}:${direction}:${obvConfirmed5 ? "5M_OK" : "5M_WAIT"}:${obv15.status}:${obv15.liveCandleTime ?? "NO_15M_KEY"}`;
+        if (!obvConfirmed5) {
+          const obvKey = `OBV_FAIL:${candleKey}:${direction}:5M_WAIT`;
           if (setup.executionScannerLastBlockKey !== obvKey) {
             setup.executionScannerLastBlockKey = obvKey;
             awaitSendScript2Checkpoint(
-              `⏳ *OBV CONFIRMATION PENDING* — *${symbol}*\n` +
+              `⏳ *5M OBV CONFIRMATION PENDING* — *${symbol}*\n` +
               `Direction: *${direction}*\n` +
-              `5M closed-candle OBV: ${obvConfirmed5 ? "✅ passed (correct side of 20-EMA)" : "❌ pending (not on required side of 20-EMA)"}\n` +
-              `15M live-candle OBV cross: ${obv15.passed ? "✅ passed" : `❌ ${obv15Reason}`}\n` +
-              `The setup is retained and rechecked every 10 seconds. The 15M candle does not need to close; the 5M check uses only closed candles.`
+              `5M closed-candle OBV: ❌ pending (not on required side of 20-EMA).\n` +
+              `15M OBV is not an entry requirement. The setup is retained and rechecked every 10 seconds.`
             );
           }
           setup.obvNotified = false;
@@ -5559,10 +5531,10 @@ async function monitorScript2ExecutionScanner() {
           setup.obvNotified = true;
           setup.executionScannerLastBlockKey = null;
           awaitSendScript2Checkpoint(
-            `📈 *DUAL-TIMEFRAME OBV CONFIRMATION PASSED* — *${symbol}*\n` +
+            `📈 *5M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
             `Direction: *${direction}*\n` +
-            `5M: latest CLOSED OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh 5M cross not required.\n` +
-            `15M: live OBV crossed the ${OBV_EMA_LENGTH}-EMA in the ${direction} direction; no candle close required.`
+            `Latest CLOSED 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; no fresh crossover required.\n` +
+            `15M OBV crossover is not required for entry.`
           );
         }
 
