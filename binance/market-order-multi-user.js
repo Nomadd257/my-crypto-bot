@@ -1,4 +1,3 @@
-// v62: enforce ordered execution gates: 30M OBV direction, 15M/5M Delta alignment + 5M strength, cached 70% imbalance, then BOS/momentum + 5M OBV and remaining safeguards.
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
 // v59: 30M OBV vs 20 EMA sets directional bias; remove 15M OBV entry gate; retain 5M OBV, 15M/5M Delta alignment and 5M strength unlock
@@ -8,11 +7,10 @@
 // v51: adds admin-only /manualtrade SYMBOL command — aligned 15M/5M delta direction → 5M OBV → liquidity → normal multi-user execution
 // v50: keeps monitoring staged continuation BOS/retest candidates when delta alignment weakens; retains setup if no user order executes
 // v45: strict order-flow gate — 15M/5M alignment + delta threshold + matching zone-volume delta before any reversal/continuation candidate
-// v36: confirmed opposing 15M OBV divergence auto-closes via the shared /close SYMBOL path; other progress metrics remain advisory
+// v59 baseline: 15M OBV divergence does not trigger automatic position closure; manual /close remains available
 // STC MONITOR: 1H STC = informational trend context; 5M volume imbalance + zone logic = execution
 // TP/SL/TRAILING STOP INTACT
-// v61: preserve 70% volume-imbalance entry gate; calculate/cache against latest CLOSED 5M candle only
-// v60: 15M OBV divergence is advisory only and cannot trigger automatic /close
+// Entry volume imbalance uses the current forming 5M candle; other closed-candle calculations remain unchanged
 // MAX TRADES = 7 per user
 // 2 HRS cooldown per symbol
 // =====================================================
@@ -772,7 +770,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 2.2;
+const DELTA_STRENGTH_THRESHOLD = 1.5;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
@@ -782,13 +780,9 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 // 30M OBV direction uses the latest CLOSED 30M candle relative to its 20 EMA; no fresh crossover required.
 const OBV_EMA_LENGTH = 20;
 const OBV_CONFIRMATION_CANDLES = 1;
-
-// Script 2 entry confirmation settings.
-// 70% directional volume imbalance is retained as an entry requirement.
-// The execution scanner caches the result per latest CLOSED 5M candle so it is not
-// repeatedly recalculated while the same candle remains current.
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
+// Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
 // becomes executable only after a CLOSED 5M candle breaks the relevant zone
 // with high directional momentum and sufficient ATR-relative candle size.
@@ -3681,8 +3675,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 // =====================================================
 // Scans every bot-opened position and reports whether the existing trend is
 // continuing, weakening, or showing failure risk. Progress metrics are advisory;
-// a confirmed 15M OBV divergence against the open position triggers the shared
-// /close SYMBOL position-close path.
+// OBV divergence is not an automatic close trigger. Manual /close remains available.
 //
 // It does NOT replace or modify the existing:
 // • SL
@@ -3919,102 +3912,6 @@ function getTradeProgressOBV(candles, direction) {
   };
 }
 
-// 15M OBV divergence is retained for advisory reporting only; it never closes a position.
-// A pivot is only accepted after two CLOSED candles have formed to its right.
-// BUY: price makes a higher high while OBV makes a lower high (bearish divergence).
-// SELL: price makes a lower low while OBV makes a higher low (bullish divergence).
-const OBV_DIVERGENCE_PIVOT_BARS = 2;
-const OBV_DIVERGENCE_LOOKBACK_CANDLES = 60;
-const OBV_DIVERGENCE_MAX_PIVOT_AGE = 8; // do not act on stale divergence (> 2 hours)
-
-function detect15MObvDivergenceAgainstTrade(candles, direction) {
-  if (!Array.isArray(candles) || candles.length < 20) {
-    return { confirmed: false, status: "UNAVAILABLE", text: "not enough closed 15M candles" };
-  }
-
-  const obv = calculateOBVSeries(candles);
-  if (!Array.isArray(obv) || obv.length !== candles.length ||
-      obv.some(value => !Number.isFinite(Number(value)))) {
-    return { confirmed: false, status: "UNAVAILABLE", text: "OBV unavailable" };
-  }
-
-  const leftRight = OBV_DIVERGENCE_PIVOT_BARS;
-  const start = Math.max(leftRight, candles.length - OBV_DIVERGENCE_LOOKBACK_CANDLES);
-  const end = candles.length - leftRight; // exclude pivots not yet confirmed by closed candles
-  const pivotIndices = [];
-  const field = direction === "BUY" ? "high" : "low";
-
-  for (let i = start; i < end; i++) {
-    const price = Number(candles[i]?.[field]);
-    if (!Number.isFinite(price)) continue;
-    let isPivot = true;
-    for (let offset = 1; offset <= leftRight; offset++) {
-      const before = Number(candles[i - offset]?.[field]);
-      const after = Number(candles[i + offset]?.[field]);
-      if (!Number.isFinite(before) || !Number.isFinite(after)) {
-        isPivot = false;
-        break;
-      }
-      // Strict pivots reduce false matches from flat/equal highs or lows.
-      if (direction === "BUY") {
-        if (!(price > before && price > after)) { isPivot = false; break; }
-      } else if (!(price < before && price < after)) {
-        isPivot = false;
-        break;
-      }
-    }
-    if (isPivot) pivotIndices.push(i);
-  }
-
-  if (pivotIndices.length < 2) {
-    return { confirmed: false, status: "NONE", text: "no two confirmed price pivots" };
-  }
-
-  const latestIndex = pivotIndices[pivotIndices.length - 1];
-  const previousIndex = [...pivotIndices].reverse().find(i => latestIndex - i >= leftRight + 1);
-  if (previousIndex === undefined) {
-    return { confirmed: false, status: "NONE", text: "confirmed pivots too close together" };
-  }
-  if ((candles.length - 1 - latestIndex) > OBV_DIVERGENCE_MAX_PIVOT_AGE) {
-    return { confirmed: false, status: "STALE", text: "latest divergence pivot is stale" };
-  }
-
-  const previousPrice = Number(candles[previousIndex][field]);
-  const latestPrice = Number(candles[latestIndex][field]);
-  const previousObv = Number(obv[previousIndex]);
-  const latestObv = Number(obv[latestIndex]);
-  if (![previousPrice, latestPrice, previousObv, latestObv].every(Number.isFinite)) {
-    return { confirmed: false, status: "UNAVAILABLE", text: "pivot values unavailable" };
-  }
-
-  const priceMovedAgainstTrade = direction === "BUY"
-    ? latestPrice > previousPrice
-    : latestPrice < previousPrice;
-  const obvMovedAgainstTrade = direction === "BUY"
-    ? latestObv < previousObv
-    : latestObv > previousObv;
-  const confirmed = priceMovedAgainstTrade && obvMovedAgainstTrade;
-  const priceChangePct = previousPrice !== 0
-    ? ((latestPrice - previousPrice) / previousPrice) * 100
-    : null;
-
-  return {
-    confirmed,
-    status: confirmed ? (direction === "BUY" ? "BEARISH" : "BULLISH") : "NONE",
-    type: direction === "BUY" ? "bearish" : "bullish",
-    previousIndex,
-    latestIndex,
-    previousPrice,
-    latestPrice,
-    previousObv,
-    latestObv,
-    priceChangePct,
-    text: confirmed
-      ? `${direction === "BUY" ? "bearish" : "bullish"} divergence confirmed on closed 15M candles`
-      : "no confirmed divergence against trade"
-  };
-}
-
 function formatTradeProgressState(state) {
   if (state === "HOLD") return "🟢 HOLD — MOMENTUM / STRUCTURE SUPPORT THE TRADE";
   if (state === "CAUTION") return "🟡 HOLD WITH CAUTION — CONFIRMATION IS WEAKENING";
@@ -4119,7 +4016,6 @@ async function monitorTradeProgress() {
         const structure = getTradeProgressStructure(closed15, side, 6);
         const delta = getTradeProgressDelta(closed15, side);
         const obv = getTradeProgressOBV(closed15, side);
-        const obvDivergence = detect15MObvDivergenceAgainstTrade(closed15, side);
         const absorption = getTradeProgressAbsorption(closed15, side);
         const structure5 = getTradeProgressStructure(closed5, side, 6);
 
@@ -4131,7 +4027,6 @@ async function monitorTradeProgress() {
           structure,
           delta,
           obv,
-          obvDivergence,
           absorption,
           structure5
         };
@@ -4154,7 +4049,6 @@ async function monitorTradeProgress() {
         data.progress = progress;
         const state = evaluateTradeProgress(side, data, previous);
 
-        // 15M OBV divergence is advisory only; it never triggers /close.
 
         const qualityText = higher.quality?.status || "N/A";
         const qualityScore = Number.isFinite(higher.quality?.score) ? higher.quality.score : null;
@@ -4195,11 +4089,10 @@ async function monitorTradeProgress() {
           `• Trend: ${obv.slope || "N/A"}\n` +
           `• Position vs ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.current) && Number.isFinite(obv.average) ? (obv.current > obv.average ? "above" : (obv.current < obv.average ? "below" : "at")) : "N/A"}\n` +
           `• OBV: ${Number.isFinite(obv.current) ? obv.current.toFixed(0) : "N/A"} | ${OBV_EMA_LENGTH}-EMA: ${Number.isFinite(obv.average) ? obv.average.toFixed(0) : "N/A"}\n` +
-          `• Divergence against trade: ${obvDivergence.confirmed ? `🚨 CONFIRMED ${obvDivergence.status}` : obvDivergence.text}\n\n` +
           `5️⃣ 5M PRICE STRUCTURE\n` +
           `• ${structure5.text}\n\n` +
           `⚠️ Absorption: ${absorption.text}\n\n` +
-          `🧭 Progress metrics are advisory. 15M OBV divergence does not trigger /close. Existing SL, trailing stop and runner rules remain otherwise unchanged.`;
+          `🧭 Progress metrics are advisory. OBV divergence does not auto-close positions. Manual /close, SL, trailing stop and runner rules remain available.`;
 
         await sendMessage(report);
         tradeProgressLastReport[groupKey] = slot;
@@ -4789,9 +4682,11 @@ setInterval(async () => {
 //    A mismatched qualifying absorption blocks continuation rather than
 //    being interpreted as continuation pressure.
 // 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
-//    Delta-unlocked direction creates the structure candidate; 70% directional
-//    volume imbalance is checked at execution using the latest CLOSED 5M candle.
-// 4) A direction-neutral market-activity gate must allow NEW setups.
+//    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
+//    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
+// 4) Entry setup creation uses the current FORMING 5M candle imbalance (70%).
+//    Execution eligibility rechecks the current candle; each new 5M candle stands alone.
+// 5) A direction-neutral market-activity gate must allow NEW setups.
 //    Adequate momentum keeps the original 0.25 threshold and 2-of-3 activity
 //    score; high momentum is classified at 0.40. Low momentum remains blocked.
 // 6) The 1H STC is NOT used to approve, delay, block or trigger execution.
@@ -4803,8 +4698,8 @@ setInterval(async () => {
 const candles5 = await fetchFuturesKlines(symbol, "5m", 150);
 if (!candles5 || candles5.length < 40) continue;
 
-// Closed candles remain the source for Delta/BOS/OBV and the 70% imbalance check.
-// Imbalance is checked at execution, not continuously on the forming candle.
+// Closed candles remain the source for Delta/BOS/OBV calculations. Entry imbalance
+// is evaluated separately against candles5[candles5.length - 1], the forming candle.
 const closedCandles5 = candles5.slice(0, -1);
 
 // The latest CLOSED 30M OBV position relative to its 20 EMA is the primary
@@ -5015,7 +4910,19 @@ const script2Zone = findScript2Zone(
   previousDayHigh,
   previousDayLow
 );
+let script2ZoneVolumeDelta = null;
+
 if (script2Zone) {
+  // Recalculate on every scan while the zone is active, not only when the
+  // one-time ZONE REACHED Telegram checkpoint is first sent.
+  script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
+
+  // Zone volume delta is observational only. Record it for an existing
+  // continuation if available, but never use it to unlock or block execution.
+  const stagedSetupForZoneDelta = script2PendingSetups[symbol];
+  if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
+    stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
+  }
   const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
   if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
     script2CheckpointState[symbol] = { zoneKey: zoneCheckpointKey, zoneNotified: false };
@@ -5026,7 +4933,8 @@ if (script2Zone) {
       `📍 *ZONE REACHED* — *${symbol}*\n` +
       `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
       `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
-      `ℹ️ Zone reach is informational only; it does not block setup creation.`
+      `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
+      `ℹ️ Zone reach and zone volume delta are informational only; they do not block setup creation.`
     );
   }
 
@@ -5086,6 +4994,9 @@ if (script2Zone) {
     );
 
     if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
+      const formingCandle5 = candles5[candles5.length - 1];
+      const volumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
+
       await sendMessage(
         `🛑 *ABSORPTION CONFIRMED* — *${symbol}*\n` +
         `🟢 ${absorption.type}\n` +
@@ -5099,28 +5010,54 @@ if (script2Zone) {
         `➡️ Direction: *${reversalDirection}*`
       );
 
-      // Absorption + aligned Delta create the reversal setup directly.
-      // 70% volume imbalance is checked at execution, not during setup discovery.
-      script2PendingSetups[symbol] = {
-        direction: reversalDirection,
-        setupType: "REVERSAL",
-        absorption,
-        zone: script2Zone,
-        detectedAt: Date.now(),
-        executionDirectionNotified: false,
-        obvNotified: false,
-        liquidityNotified: false
-      };
+      // Absorption is the sole authority for reversal direction. The current
+      // FORMING 5M candle's imbalance is a directional confirmation gate only;
+      // it must meet the 70% threshold in the already-selected absorption
+      // direction and must never choose or flip the reversal direction.
+      const reversalImbalancePct = Number(
+        volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"]
+      );
+
+      if (
+        Number.isFinite(reversalImbalancePct) &&
+        reversalImbalancePct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT
+      ) {
+        await sendMessage(
+          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+          `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${reversalImbalancePct.toFixed(1)}%*\n` +
+          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
+        );
+        script2PendingSetups[symbol] = {
+          direction: reversalDirection,
+          setupType: "REVERSAL",
+          absorption,
+          zone: script2Zone,
+          detectedAt: Date.now(),
+          executionDirectionNotified: false,
+          obvNotified: false,
+          liquidityNotified: false,
+          volumeImbalance: {
+            ...volumeImbalance,
+            direction: reversalDirection
+          }
+        };
+      }
     }
   }
+  }
+}
 
 // -----------------------------------------------------
-// STEP 2B — DELTA-UNLOCKED CONTINUATION STRUCTURE
+// STEP 2B — DELTA-UNLOCKED VOLUME-IMBALANCE CANDLE STRUCTURE
 // -----------------------------------------------------
 // Delta must already have unlocked this symbol before this section runs.
-// No volume-imbalance calculations are performed. Delta-unlocked direction
-// defines the continuation structure using the current 5M candle high/low.
-// Reversals still require their previous-day high/low absorption context.
+// The current FORMING 5M candle is measured for directional volume imbalance.
+// If imbalance reaches the existing 70% threshold, that candle snapshot defines
+// the continuation breakout structure: BUY breaks its high; SELL breaks its low.
+// Zone reach and zone-volume delta are informational only. Continuation
+// candidates can be created once the unlocked Delta direction and current
+// forming candle's imbalance agree. Reversals still require
+// their previous-day high/low absorption context.
 // Market regime is informational only; it does not gate continuation setup creation.
 { // Unconditional: market regime is informational only.
   const existing = script2PendingSetups[symbol];
@@ -5129,32 +5066,42 @@ if (script2Zone) {
 
   if (!activeContinuation && !activeReversal) {
     const formingCandle5 = candles5[candles5.length - 1];
-    const continuationDirection = deltaGateState.alignmentDirection || null;
-    const structureCandle = formingCandle5;
-    const structureCandleKey = getScript2CandleKey(
-      structureCandle,
+    const volumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
+    const continuationDirection = volumeImbalance?.direction || null;
+    // Snapshot the forming candle's current high/low when its imbalance first
+    // qualifies. BOS remains based on later CLOSED 5M candles in the existing scanner.
+    const imbalanceCandle = formingCandle5;
+    const imbalanceCandleKey = getScript2CandleKey(
+      imbalanceCandle,
       String(candles5.length - 1)
     );
 
-    // Delta-unlocked direction creates the candidate. The 70% volume-imbalance
-    // requirement is checked once per closed 5M candle at execution.
-    if (continuationDirection && structureCandle) {
+    // The unlocked 15M/5M delta direction is authoritative. Zone reach and
+    // zone-volume delta do not gate candidate creation; the current forming 5M
+    // imbalance direction must simply agree with the unlocked direction.
+    const deltaThresholdDirection = deltaGateState.alignmentDirection;
+    const continuationDirectionConfirmed = Boolean(
+      deltaThresholdDirection &&
+      continuationDirection === deltaThresholdDirection
+    );
+
+    if (continuationDirection && imbalanceCandle && continuationDirectionConfirmed) {
       const structurePrice = continuationDirection === "BUY"
-        ? Number(structureCandle.high)
-        : Number(structureCandle.low);
+        ? Number(imbalanceCandle.high)
+        : Number(imbalanceCandle.low);
 
       if (Number.isFinite(structurePrice) && structurePrice > 0) {
         const structureType = continuationDirection === "BUY"
-          ? "5M CANDLE HIGH"
-          : "5M CANDLE LOW";
+          ? "IMBALANCE CANDLE HIGH"
+          : "IMBALANCE CANDLE LOW";
         const anchoredZone = {
-          kind: "FORMING_5M_CANDLE",
+          kind: "IMBALANCE_CANDLE",
           type: structureType,
           price: structurePrice,
-          high: Number(structureCandle.high),
-          low: Number(structureCandle.low),
+          high: Number(imbalanceCandle.high),
+          low: Number(imbalanceCandle.low),
           direction: continuationDirection,
-          candleKey: structureCandleKey
+          candleKey: imbalanceCandleKey
         };
 
         script2PendingSetups[symbol] = {
@@ -5164,10 +5111,10 @@ if (script2Zone) {
           absorption: null,
           zone: anchoredZone,
           zoneLocked: true,
-          anchoredZoneKey: `${structureType}:${structurePrice}:${structureCandleKey}`,
+          anchoredZoneKey: `${structureType}:${structurePrice}:${imbalanceCandleKey}`,
           anchoredBoundary: structurePrice,
           detectedAt: Date.now(),
-          createdCandleKey: structureCandleKey,
+          createdCandleKey: imbalanceCandleKey,
           breakCandleKey: null,
           continuationMode: "PENDING",
           breakNotified: false,
@@ -5175,13 +5122,23 @@ if (script2Zone) {
           executionDirectionNotified: false,
           obvNotified: false,
           liquidityNotified: false,
+          volumeImbalanceNotified: false,
           candidateNotified: false,
+          zoneVolumeDeltaConfirmed: true,
+          zoneVolumeDelta: script2ZoneVolumeDelta,
+          volumeImbalance
         };
+
+        await sendMessage(
+          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
+          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
+        );
 
         await sendMessage(
           `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
           `Direction: *${continuationDirection}*\n` +
-          `🕯️ Structure candle: *forming 5M candle snapshot*\n` +
+          `🕯️ Structure candle: *forming 5M imbalance candle snapshot*\n` +
           `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
           `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`
         );
@@ -5190,7 +5147,7 @@ if (script2Zone) {
   }
 }
 
-// End new-setup creation gate. Existing staged continuation still advances below.
+} // End new-setup creation gate. Existing staged continuation still advances below.
 
 // -----------------------------------------------------
 // -----------------------------------------------------
@@ -5203,10 +5160,6 @@ if (!script2Zone) {
 }
 
 // Intentionally no order execution in the setup-discovery loop: one scanner owns execution.
-
-  } // close continuation setup block
-  } // close market-regime/zone observation block
-  } // close delta-confirmed setup block
 
     } catch (err) {
       log(`❌ Script 2 scan error ${symbol}: ${err?.message || err}`);
@@ -5245,9 +5198,9 @@ if (!script2Zone) {
 // =====================================================
 // SCRIPT 2 EXECUTION SCANNER — EVERY 10 SECONDS
 // =====================================================
-// This scanner only visits symbols with a pending setup. It enforces the 30M
-// direction, confirmed Delta state and cached 70% imbalance before evaluating
-// BOS/momentum, 5M OBV, liquidity and order safeguards.
+// This scanner only visits symbols with a pending setup. It independently
+// advances closed-5M BOS/retest state, confirms OBV, checks liquidity and
+// executes orders. It never weakens the existing entry conditions.
 async function monitorScript2ExecutionScanner() {
   if (script2ExecutionScannerRunning) return;
   script2ExecutionScannerRunning = true;
@@ -5284,7 +5237,26 @@ async function monitorScript2ExecutionScanner() {
         const closedCandles5 = candles5.slice(0, -1);
         const latestClosed = closedCandles5[closedCandles5.length - 1];
         const candleKey = getScript2CandleKey(latestClosed, String(closedCandles5.length - 1));
-        // Volume imbalance is an entry gate; its result is cached per closed 5M candle below.
+        const formingCandle5 = candles5[candles5.length - 1];
+        const formingCandleKey = getScript2CandleKey(formingCandle5, String(candles5.length - 1));
+        const liveVolumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
+        const liveImbalancePercent = setup.direction === "BUY"
+          ? Number(liveVolumeImbalance?.buyPct)
+          : Number(liveVolumeImbalance?.sellPct);
+        const liveImbalancePassed = liveVolumeImbalance?.direction === setup.direction &&
+          Number.isFinite(liveImbalancePercent) &&
+          liveImbalancePercent >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+
+        // Report the live gate independently for each forming 5M candle. A pass
+        // on an older candle never carries into the next candle.
+        if (liveImbalancePassed && setup.lastImbalancePassCandleKey !== formingCandleKey) {
+          setup.lastImbalancePassCandleKey = formingCandleKey;
+          awaitSendScript2Checkpoint(
+            `📊 *LIVE 5M VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+            `${setup.direction === "BUY" ? "🟢" : "🔴"} ${setup.direction}: *${liveImbalancePercent.toFixed(1)}%*\n` +
+            `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%* | Current forming candle only.`
+          );
+        }
 
         let currentPrice = Number(latestClosed?.close);
         try {
@@ -5300,6 +5272,42 @@ async function monitorScript2ExecutionScanner() {
 
         let direction = setup.direction;
         let continuationReady = setup.setupType !== "CONTINUATION";
+
+        if (setup.setupType === "CONTINUATION") {
+          const continuationDirection = await processScript2Continuation(
+            symbol, closedCandles5, now, currentPrice, "LOW_MOMENTUM"
+          );
+          // processScript2Continuation sends the one-time BOS/retest checkpoints and handles expiry.
+          if (script2PendingSetups[symbol] !== setup) continue;
+
+          continuationReady = Boolean(
+            setup.zoneVolumeDeltaConfirmed === true &&
+            (setup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" || setup.stage === "RETEST_CONFIRMED")
+          );
+          if (continuationDirection) direction = continuationDirection;
+
+          if (!continuationReady) {
+            const status = setup.stage === "BREAK_CONFIRMED"
+              ? "BOS confirmed; waiting for failed-reclaim retest"
+              : setup.stage === "CANDIDATE"
+                ? "waiting for a qualifying closed-5M BOS candle"
+                : `waiting for continuation confirmation (stage: ${setup.stage || "unknown"})`;
+            const priorKey = setup.executionScannerLastProgressKey || "";
+            const progressKey = `${candleKey}:${setup.stage || "CANDIDATE"}:${status}`;
+            if (priorKey !== progressKey) {
+              setup.executionScannerLastProgressKey = progressKey;
+              awaitSendScript2Checkpoint(
+                `⏳ *EXECUTION SCANNER STATUS* — *${symbol}*\n` +
+                `Direction: *${setup.direction}*\n` +
+                `Stage: ${status}.\n` +
+                `Structure: *${Number(setup.anchoredBoundary ?? getScript2ZoneBoundary(setup.zone, setup.direction)).toPrecision(8)}*\n` +
+                `Next check: within 10 seconds; BOS/retest remains based on CLOSED 5M candles.`
+              );
+            }
+            // Keep checking both OBV timeframes while BOS/retest is pending;
+            // only the order itself waits for continuationReady.
+          }
+        }
 
         if (!direction || !["BUY", "SELL"].includes(direction)) {
           const lastWarn = Number(setup.executionDirectionWarningAt || 0);
@@ -5370,95 +5378,6 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // Stage 2-3 execution safeguard: require the already-confirmed 15M/5M
-        // Delta alignment and 5M strength confirmation for this same direction
-        // before evaluating the cached 70% imbalance. The discovery scanner owns
-        // the closed-candle Delta calculation and confirmation notifications.
-        const executionDeltaState = script2DeltaGateState[symbol];
-        if (
-          !executionDeltaState?.confirmed ||
-          executionDeltaState.alignmentDirection !== direction
-        ) {
-          const deltaBlockKey = `DELTA_GATE:${candleKey}:${executionDeltaState?.alignmentDirection || "NONE"}:${direction}:${executionDeltaState?.confirmed ? "CONFIRMED" : "PENDING"}`;
-          if (setup.executionScannerLastDeltaBlockKey !== deltaBlockKey) {
-            setup.executionScannerLastDeltaBlockKey = deltaBlockKey;
-            awaitSendScript2Checkpoint(
-              `⏳ *DELTA ALIGNMENT / STRENGTH PENDING* — *${symbol}*\n` +
-              `Setup direction: *${direction}* | Confirmed Delta direction: *${executionDeltaState?.alignmentDirection || "NONE"}*\n` +
-              `15M and 5M Delta alignment plus the 5M ${DELTA_STRENGTH_THRESHOLD.toFixed(2)} strength threshold must be confirmed before imbalance/BOS/OBV checks.`
-            );
-          }
-          continue;
-        }
-        setup.executionScannerLastDeltaBlockKey = null;
-
-        // Preserve the 70% directional volume-imbalance entry requirement.
-        // Evaluate only the latest CLOSED 5M candle and cache by candle key;
-        // repeated 10-second scans reuse the result instead of recalculating it.
-        if (setup.volumeImbalanceCandleKey !== candleKey) {
-          setup.volumeImbalanceCandleKey = candleKey;
-          setup.volumeImbalancePassed = hasEntryVolumeImbalance(closedCandles5, direction);
-          setup.volumeImbalanceNotified = false;
-        }
-        if (!setup.volumeImbalancePassed) {
-          const imbalanceKey = `VOLUME_IMBALANCE_FAIL:${candleKey}:${direction}`;
-          if (setup.executionScannerLastImbalanceBlockKey !== imbalanceKey) {
-            setup.executionScannerLastImbalanceBlockKey = imbalanceKey;
-            awaitSendScript2Checkpoint(
-              `⏳ *70% VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}*\n` +
-              `Latest CLOSED 5M candle has not reached ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}% directional volume imbalance. ` +
-              `The requirement is retained; it will be checked again when a new 5M candle closes.`
-            );
-          }
-          continue;
-        }
-        if (!setup.volumeImbalanceNotified) {
-          setup.volumeImbalanceNotified = true;
-          setup.executionScannerLastImbalanceBlockKey = null;
-          awaitSendScript2Checkpoint(
-            `✅ *70% VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}* | Latest CLOSED 5M candle meets the ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}% directional threshold.`
-          );
-        }
-
-        // Stage 5: after the 30M direction, Delta alignment/strength and cached
-        // 70% imbalance gates pass, evaluate continuation BOS/momentum and 5M OBV
-        // in this same post-gate execution phase. The continuation state machine
-        // still advances on closed 5M candles and preserves its existing expiry rules.
-        if (setup.setupType === "CONTINUATION") {
-          const continuationDirection = await processScript2Continuation(
-            symbol, closedCandles5, now, currentPrice, "LOW_MOMENTUM"
-          );
-          if (script2PendingSetups[symbol] !== setup) continue;
-
-          continuationReady = Boolean(
-            setup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" || setup.stage === "RETEST_CONFIRMED"
-          );
-          if (continuationDirection) direction = continuationDirection;
-
-          if (!continuationReady) {
-            const status = setup.stage === "BREAK_CONFIRMED"
-              ? "BOS confirmed; waiting for failed-reclaim retest"
-              : setup.stage === "CANDIDATE"
-                ? "waiting for a qualifying closed-5M BOS candle"
-                : `waiting for continuation confirmation (stage: ${setup.stage || "unknown"})`;
-            const progressKey = `${candleKey}:${setup.stage || "CANDIDATE"}:${status}`;
-            if ((setup.executionScannerLastProgressKey || "") !== progressKey) {
-              setup.executionScannerLastProgressKey = progressKey;
-              awaitSendScript2Checkpoint(
-                `⏳ *EXECUTION SCANNER STATUS* — *${symbol}*\n` +
-                `Direction: *${setup.direction}*\n` +
-                `Stage: ${status}.\n` +
-                `Structure: *${Number(setup.anchoredBoundary ?? getScript2ZoneBoundary(setup.zone, setup.direction)).toPrecision(8)}*\n` +
-                `Next check: within 10 seconds; BOS/retest remains based on CLOSED 5M candles.`
-              );
-            }
-          }
-        }
-
-        // 5M OBV is evaluated after the initial direction/Delta/imbalance gates,
-        // alongside the BOS/momentum confirmation phase. 15M OBV is not an entry gate.
         // Entry OBV confirmation uses ONLY the latest CLOSED 5M candle.
         // The 15M OBV crossover is intentionally removed as an entry blocker.
         const obvConfirmed5 = calculateOBVConfirmation(closedCandles5, direction);
@@ -5499,7 +5418,25 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
+        // Current-candle imbalance is an execution requirement, not a setup-wide
+        // latch. Continue monitoring BOS/OBV while it is missing, but do not order.
+        if (!liveImbalancePassed) {
+          const imbalanceBlockKey = `LIVE_IMBALANCE_WAIT:${formingCandleKey}:${Number.isFinite(liveImbalancePercent) ? liveImbalancePercent.toFixed(1) : "NA"}`;
+          if (setup.executionScannerLastImbalanceBlockKey !== imbalanceBlockKey) {
+            setup.executionScannerLastImbalanceBlockKey = imbalanceBlockKey;
+            awaitSendScript2Checkpoint(
+              `⏳ *LIVE VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
+              `Direction: *${direction}* | Current forming 5M candle: *${Number.isFinite(liveImbalancePercent) ? `${liveImbalancePercent.toFixed(1)}%` : "unavailable"}*\n` +
+              `Required: *≥ ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%* in the trade direction.\n` +
+              `Other confirmed conditions are retained; the next 5M candle is evaluated independently.`
+            );
+          }
+          continue;
+        }
+        setup.executionScannerLastImbalanceBlockKey = null;
 
+        // OBV is monitored concurrently with BOS/retest, but continuation entries
+        // remain blocked until the existing momentum/BOS or BOS+retest path is ready.
         if (!continuationReady) continue;
 
         let estimatedTradeNotional = 0;
@@ -8345,8 +8282,8 @@ async function closeTrackedPositionOrder(client, symbol, pos) {
   throw new Error(`Unknown position side for ${symbol}: ${pos.side}`);
 }
 
-// Shared close path for manual /close SYMBOL only; OBV divergence cannot invoke it.
-// Both routes use the exact same tracked-position market-order helper and cleanup.
+// Shared close path for manual /close SYMBOL.
+// Uses the tracked-position market-order helper and cleanup.
 async function closeTrackedSymbolPositions(symbol, reason = null) {
   const normalizedSymbol = String(symbol || "").toUpperCase().trim();
   if (!activePositions[normalizedSymbol]) {
