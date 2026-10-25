@@ -1,3 +1,4 @@
+// v60: 1M OBV + 1M market-activity momentum; 70% imbalance tied to the BOS candle; early live potential-breakout alert.
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
 // v59: 30M OBV vs 20 EMA sets directional bias; remove 15M OBV entry gate; retain 5M OBV, 15M/5M Delta alignment and 5M strength unlock
@@ -528,6 +529,35 @@ async function monitorPriceActionDeltaPhases() {
 
         let phase = priceActionDeltaPhaseState[symbol];
 
+        // Early informational alert on the first live price break of an active
+        // consolidation boundary. It is one-shot per phase and does not classify
+        // expansion or trigger a trade; classification still waits for closed 15M.
+        if (phase && Array.isArray(phase.candles) && !phase.potentialBreakoutNotified) {
+          try {
+            const livePriceRes = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
+            if (livePriceRes.ok) {
+              const livePriceData = await livePriceRes.json();
+              const livePrice = Number(livePriceData?.price);
+              const upperLiveBreak = phase.high * (1 + PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
+              const lowerLiveBreak = phase.low * (1 - PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
+              if (Number.isFinite(livePrice) && livePrice > 0 && (livePrice > upperLiveBreak || livePrice < lowerLiveBreak)) {
+                const liveDirection = livePrice > upperLiveBreak ? "UPWARD" : "DOWNWARD";
+                phase.potentialBreakoutNotified = true;
+                phase.potentialBreakoutDirection = liveDirection;
+                await sendMessage(
+                  `👀 *POTENTIAL BREAKOUT — ${symbol}*\n\n` +
+                  `First live price break detected: *${liveDirection}*\n` +
+                  `Live price: *${livePrice}*\n` +
+                  `Consolidation boundary: *${liveDirection === "UPWARD" ? upperLiveBreak : lowerLiveBreak}*\n\n` +
+                  `_Early warning only. This is not a confirmed breakout or entry signal. The existing closed-15M detection and expansion/noise classification remain in place._`
+                );
+              }
+            }
+          } catch (potentialBreakoutError) {
+            log(`⚠️ Potential breakout check failed for ${symbol}: ${potentialBreakoutError?.message || potentialBreakoutError}`);
+          }
+        }
+
         if (phase && latest.time <= phase.lastCandleTime) {
           continue; // this closed candle has already been processed
         }
@@ -770,7 +800,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 1.5;
+const DELTA_STRENGTH_THRESHOLD = 1.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
@@ -842,8 +872,8 @@ const ATR_BAND_MULTIPLIER = 1;
 //
 // At least 2 of 3 must pass. The momentum score then separates adequate
 // (0.25+) from high momentum (0.40+).
-function getScript2MomentumRegime(closedCandles5) {
-  if (!Array.isArray(closedCandles5) || closedCandles5.length < 35) {
+function getScript2MomentumRegime(closedCandles) {
+  if (!Array.isArray(closedCandles) || closedCandles.length < 35) {
     return {
       allowed: false,
       regime: "LOW_MOMENTUM",
@@ -857,12 +887,12 @@ function getScript2MomentumRegime(closedCandles5) {
     };
   }
 
-  const recentCandles = closedCandles5.slice(-MARKET_REGIME_RECENT_RANGE_CANDLES);
+  const recentCandles = closedCandles.slice(-MARKET_REGIME_RECENT_RANGE_CANDLES);
   const baselineStart = -(MARKET_REGIME_RECENT_RANGE_CANDLES + MARKET_REGIME_BASELINE_CANDLES);
   const baselineEnd = -MARKET_REGIME_RECENT_RANGE_CANDLES;
-  const baselineCandles = closedCandles5.slice(baselineStart, baselineEnd);
-  const recentVolumeCandles = closedCandles5.slice(-MARKET_REGIME_RECENT_VOLUME_CANDLES);
-  const volumeBaselineCandles = closedCandles5.slice(
+  const baselineCandles = closedCandles.slice(baselineStart, baselineEnd);
+  const recentVolumeCandles = closedCandles.slice(-MARKET_REGIME_RECENT_VOLUME_CANDLES);
+  const volumeBaselineCandles = closedCandles.slice(
     -(MARKET_REGIME_RECENT_VOLUME_CANDLES + MARKET_REGIME_BASELINE_CANDLES),
     -MARKET_REGIME_RECENT_VOLUME_CANDLES
   );
@@ -894,17 +924,17 @@ function getScript2MomentumRegime(closedCandles5) {
   };
 
   const recentAtrValues = [];
-  const recentStartIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
-  for (let i = recentStartIndex; i < closedCandles5.length; i++) {
-    const tr = trueRange(closedCandles5[i], closedCandles5[i - 1]?.close);
+  const recentStartIndex = closedCandles.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
+  for (let i = recentStartIndex; i < closedCandles.length; i++) {
+    const tr = trueRange(closedCandles[i], closedCandles[i - 1]?.close);
     if (Number.isFinite(tr) && tr > 0) recentAtrValues.push(tr);
   }
 
   const baselineAtrValues = [];
-  const baselineStartIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES - MARKET_REGIME_BASELINE_CANDLES;
-  const baselineEndIndex = closedCandles5.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
+  const baselineStartIndex = closedCandles.length - MARKET_REGIME_RECENT_RANGE_CANDLES - MARKET_REGIME_BASELINE_CANDLES;
+  const baselineEndIndex = closedCandles.length - MARKET_REGIME_RECENT_RANGE_CANDLES;
   for (let i = baselineStartIndex; i < baselineEndIndex; i++) {
-    const tr = trueRange(closedCandles5[i], closedCandles5[i - 1]?.close);
+    const tr = trueRange(closedCandles[i], closedCandles[i - 1]?.close);
     if (Number.isFinite(tr) && tr > 0) baselineAtrValues.push(tr);
   }
 
@@ -4713,9 +4743,13 @@ if (!obv30mBiasDirection) {
   log(`ℹ️ ${symbol}: 30M OBV/20-EMA direction unavailable or exactly equal; new Script 2 setups remain locked.`);
 }
 
-// Global market-activity regime is informational only. All regimes may create
-// setups; continuation BOS handling uses the breakout candle's own momentum.
-const script2MomentumRegime = getScript2MomentumRegime(closedCandles5);
+// Global market-activity regime uses CLOSED 1M candles. Existing thresholds and
+// scoring are unchanged; 5M remains the structure/BOS timeframe.
+const candles1mForMomentum = await fetchFuturesKlines(symbol, "1m", 150);
+const closedCandles1mForMomentum = Array.isArray(candles1mForMomentum) && candles1mForMomentum.length > 1
+  ? candles1mForMomentum.slice(0, -1)
+  : [];
+const script2MomentumRegime = getScript2MomentumRegime(closedCandles1mForMomentum);
 const script2LatestClosedCandleKey = getScript2CandleKey(
   closedCandles5[closedCandles5.length - 1],
   String(closedCandles5.length - 1)
@@ -5048,16 +5082,13 @@ if (script2Zone) {
 }
 
 // -----------------------------------------------------
-// STEP 2B — DELTA-UNLOCKED VOLUME-IMBALANCE CANDLE STRUCTURE
+// STEP 2B — DELTA-UNLOCKED CONTINUATION STRUCTURE
 // -----------------------------------------------------
 // Delta must already have unlocked this symbol before this section runs.
-// The current FORMING 5M candle is measured for directional volume imbalance.
-// If imbalance reaches the existing 70% threshold, that candle snapshot defines
-// the continuation breakout structure: BUY breaks its high; SELL breaks its low.
-// Zone reach and zone-volume delta are informational only. Continuation
-// candidates can be created once the unlocked Delta direction and current
-// forming candle's imbalance agree. Reversals still require
-// their previous-day high/low absorption context.
+// Delta alignment creates the candidate and a 5M structure snapshot; the 70%
+// imbalance is evaluated only on the exact closed BOS candle at execution.
+// Zone reach and zone-volume delta are informational only. Reversals still
+// require their previous-day high/low absorption context.
 // Market regime is informational only; it does not gate continuation setup creation.
 { // Unconditional: market regime is informational only.
   const existing = script2PendingSetups[symbol];
@@ -5066,24 +5097,16 @@ if (script2Zone) {
 
   if (!activeContinuation && !activeReversal) {
     const formingCandle5 = candles5[candles5.length - 1];
-    const volumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
-    const continuationDirection = volumeImbalance?.direction || null;
-    // Snapshot the forming candle's current high/low when its imbalance first
-    // qualifies. BOS remains based on later CLOSED 5M candles in the existing scanner.
+    // Delta alignment supplies the candidate direction. Do not calculate or
+    // gate on a separate forming-candle 70% imbalance here: that requirement is
+    // calculated once at execution from the exact closed BOS candle.
+    const continuationDirection = deltaGateState.alignmentDirection || null;
     const imbalanceCandle = formingCandle5;
     const imbalanceCandleKey = getScript2CandleKey(
       imbalanceCandle,
       String(candles5.length - 1)
     );
-
-    // The unlocked 15M/5M delta direction is authoritative. Zone reach and
-    // zone-volume delta do not gate candidate creation; the current forming 5M
-    // imbalance direction must simply agree with the unlocked direction.
-    const deltaThresholdDirection = deltaGateState.alignmentDirection;
-    const continuationDirectionConfirmed = Boolean(
-      deltaThresholdDirection &&
-      continuationDirection === deltaThresholdDirection
-    );
+    const continuationDirectionConfirmed = Boolean(continuationDirection); 
 
     if (continuationDirection && imbalanceCandle && continuationDirectionConfirmed) {
       const structurePrice = continuationDirection === "BUY"
@@ -5126,19 +5149,13 @@ if (script2Zone) {
           candidateNotified: false,
           zoneVolumeDeltaConfirmed: true,
           zoneVolumeDelta: script2ZoneVolumeDelta,
-          volumeImbalance
+          volumeImbalance: null
         };
 
         await sendMessage(
-          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${continuationDirection === "BUY" ? "🟢" : "🔴"} ${continuationDirection}: *${Number(volumeImbalance[continuationDirection === "BUY" ? "buyPct" : "sellPct"] || 0).toFixed(1)}%*\n` +
-          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
-        );
-
-        await sendMessage(
           `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
-          `Direction: *${continuationDirection}*\n` +
-          `🕯️ Structure candle: *forming 5M imbalance candle snapshot*\n` +
+          `Direction: *${continuationDirection}* (from aligned Delta)\n` +
+          `🕯️ Structure candle: *forming 5M structure snapshot; 70% imbalance will be checked on the closed BOS candle*\n` +
           `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
           `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`
         );
@@ -5238,25 +5255,6 @@ async function monitorScript2ExecutionScanner() {
         const latestClosed = closedCandles5[closedCandles5.length - 1];
         const candleKey = getScript2CandleKey(latestClosed, String(closedCandles5.length - 1));
         const formingCandle5 = candles5[candles5.length - 1];
-        const formingCandleKey = getScript2CandleKey(formingCandle5, String(candles5.length - 1));
-        const liveVolumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
-        const liveImbalancePercent = setup.direction === "BUY"
-          ? Number(liveVolumeImbalance?.buyPct)
-          : Number(liveVolumeImbalance?.sellPct);
-        const liveImbalancePassed = liveVolumeImbalance?.direction === setup.direction &&
-          Number.isFinite(liveImbalancePercent) &&
-          liveImbalancePercent >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
-
-        // Report the live gate independently for each forming 5M candle. A pass
-        // on an older candle never carries into the next candle.
-        if (liveImbalancePassed && setup.lastImbalancePassCandleKey !== formingCandleKey) {
-          setup.lastImbalancePassCandleKey = formingCandleKey;
-          awaitSendScript2Checkpoint(
-            `📊 *LIVE 5M VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-            `${setup.direction === "BUY" ? "🟢" : "🔴"} ${setup.direction}: *${liveImbalancePercent.toFixed(1)}%*\n` +
-            `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%* | Current forming candle only.`
-          );
-        }
 
         let currentPrice = Number(latestClosed?.close);
         try {
@@ -5378,29 +5376,33 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // Entry OBV confirmation uses ONLY the latest CLOSED 5M candle.
-        // The 15M OBV crossover is intentionally removed as an entry blocker.
-        const obvConfirmed5 = calculateOBVConfirmation(closedCandles5, direction);
-        if (obvConfirmed5 && !setup.obv5Notified) {
-          setup.obv5Notified = true;
+        // Automatic entry OBV confirmation uses the latest CLOSED 1M candles.
+        // The 30M OBV directional bias above remains the higher-timeframe gate.
+        const candles1mForObv = await fetchFuturesKlines(symbol, "1m", 150);
+        const closedCandles1mForObv = Array.isArray(candles1mForObv) && candles1mForObv.length > 1
+          ? candles1mForObv.slice(0, -1)
+          : [];
+        const obvConfirmed1 = calculateOBVConfirmation(closedCandles1mForObv, direction);
+        if (obvConfirmed1 && !setup.obv1Notified) {
+          setup.obv1Notified = true;
           awaitSendScript2Checkpoint(
-            `📈 *5M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
+            `📈 *1M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
             `Direction: *${direction}*\n` +
-            `Latest CLOSED 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh crossover not required.`
+            `Latest CLOSED 1M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh crossover not required.`
           );
-        } else if (!obvConfirmed5) {
-          setup.obv5Notified = false;
+        } else if (!obvConfirmed1) {
+          setup.obv1Notified = false;
         }
 
-        if (!obvConfirmed5) {
-          const obvKey = `OBV_FAIL:${candleKey}:${direction}:5M_WAIT`;
+        if (!obvConfirmed1) {
+          const obvKey = `OBV_FAIL:${getScript2CandleKey(closedCandles1mForObv[closedCandles1mForObv.length - 1])}:${direction}:1M_WAIT`;
           if (setup.executionScannerLastBlockKey !== obvKey) {
             setup.executionScannerLastBlockKey = obvKey;
             awaitSendScript2Checkpoint(
-              `⏳ *5M OBV CONFIRMATION PENDING* — *${symbol}*\n` +
+              `⏳ *1M OBV CONFIRMATION PENDING* — *${symbol}*\n` +
               `Direction: *${direction}*\n` +
-              `5M closed-candle OBV: ❌ pending (not on required side of 20-EMA).\n` +
-              `15M OBV is not an entry requirement. The setup is retained and rechecked every 10 seconds.`
+              `1M closed-candle OBV: ❌ pending (not on required side of 20-EMA).\n` +
+              `The setup is retained and rechecked every 10 seconds.`
             );
           }
           setup.obvNotified = false;
@@ -5411,24 +5413,38 @@ async function monitorScript2ExecutionScanner() {
           setup.obvNotified = true;
           setup.executionScannerLastBlockKey = null;
           awaitSendScript2Checkpoint(
-            `📈 *5M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
+            `📈 *1M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
             `Direction: *${direction}*\n` +
-            `Latest CLOSED 5M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; no fresh crossover required.\n` +
-            `15M OBV crossover is not required for entry.`
+            `Latest CLOSED 1M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; no fresh crossover required.`
           );
         }
 
-        // Current-candle imbalance is an execution requirement, not a setup-wide
-        // latch. Continue monitoring BOS/OBV while it is missing, but do not order.
-        if (!liveImbalancePassed) {
-          const imbalanceBlockKey = `LIVE_IMBALANCE_WAIT:${formingCandleKey}:${Number.isFinite(liveImbalancePercent) ? liveImbalancePercent.toFixed(1) : "NA"}`;
+        // The 70% imbalance is evaluated once from the exact 5M BOS candle
+        // (not from a separate, later forming candle). For continuation setups,
+        // resolve the stored BOS candle key; otherwise use the latest closed 5M
+        // candle as the setup's confirmed trigger candle.
+        const bosCandle = setup.breakCandleKey
+          ? closedCandles5.find(c => getScript2CandleKey(c) === String(setup.breakCandleKey))
+          : latestClosed;
+        const bosVolumeImbalance = bosCandle
+          ? calculateOneCandleVolumeImbalance([bosCandle])
+          : null;
+        const bosImbalancePercent = direction === "BUY"
+          ? Number(bosVolumeImbalance?.buyPct)
+          : Number(bosVolumeImbalance?.sellPct);
+        const bosImbalancePassed = bosVolumeImbalance?.direction === direction &&
+          Number.isFinite(bosImbalancePercent) &&
+          bosImbalancePercent >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
+        const bosImbalanceKey = bosCandle ? getScript2CandleKey(bosCandle) : "MISSING_BOS";
+        if (!bosImbalancePassed) {
+          const imbalanceBlockKey = `BOS_IMBALANCE_WAIT:${bosImbalanceKey}:${Number.isFinite(bosImbalancePercent) ? bosImbalancePercent.toFixed(1) : "NA"}`;
           if (setup.executionScannerLastImbalanceBlockKey !== imbalanceBlockKey) {
             setup.executionScannerLastImbalanceBlockKey = imbalanceBlockKey;
             awaitSendScript2Checkpoint(
-              `⏳ *LIVE VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}* | Current forming 5M candle: *${Number.isFinite(liveImbalancePercent) ? `${liveImbalancePercent.toFixed(1)}%` : "unavailable"}*\n` +
-              `Required: *≥ ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%* in the trade direction.\n` +
-              `Other confirmed conditions are retained; the next 5M candle is evaluated independently.`
+              `⏳ *BOS-CANDLE VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
+              `Direction: *${direction}* | BOS candle: *${bosCandle ? new Date(Number(bosCandle.time)).toISOString() : "unavailable"}*\n` +
+              `Measured directional imbalance: *${Number.isFinite(bosImbalancePercent) ? `${bosImbalancePercent.toFixed(1)}%` : "unavailable"}*; required: *≥ ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*.\n` +
+              `No separate forming-candle imbalance is used for this check.`
             );
           }
           continue;
