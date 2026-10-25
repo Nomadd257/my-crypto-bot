@@ -8707,3 +8707,57 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
     log(`❌ /tradehistory error: ${err?.message || err}`);
   }
 });
+
+// Admin-only command to expire all pending Script 2 setups.
+// Does not close open positions or cancel exchange orders.
+// Usage: /expirepending
+
+bot.onText(/^\/expirepending(?:@\w+)?\s*$/i, async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  const pendingEntries = Object.entries(script2PendingSetups || {});
+
+  if (pendingEntries.length === 0) {
+    await bot.sendMessage(
+      msg.chat.id,
+      "ℹ️ Script 2 has no pending setups to expire."
+    );
+    return;
+  }
+
+  const expired = [];
+
+  for (const [symbol, setup] of pendingEntries) {
+    if (script2PendingSetups[symbol] !== setup) continue;
+
+    delete script2PendingSetups[symbol];
+
+    expired.push({
+      symbol,
+      direction: setup?.direction || "UNKNOWN",
+      setupType: setup?.setupType || "SETUP",
+    });
+  }
+
+  if (expired.length === 0) {
+    await bot.sendMessage(
+      msg.chat.id,
+      "ℹ️ No pending setups remained to expire."
+    );
+    return;
+  }
+
+  const lines = expired.map(({ symbol, direction, setupType }) =>
+    `• ${symbol} — ${direction} (${setupType})`
+  );
+
+  const report =
+    `🧹 SCRIPT 2 — PENDING SETUPS EXPIRED\n` +
+    `Expired: ${expired.length}\n\n` +
+    lines.join("\n") +
+    `\n\nScanner remains active. Open positions and exchange orders were not changed.`;
+
+  await bot.sendMessage(msg.chat.id, report);
+  await sendMessage(report);
+});
+
