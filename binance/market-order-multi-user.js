@@ -800,7 +800,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 1.8;
+const DELTA_STRENGTH_THRESHOLD = 2;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
@@ -2831,10 +2831,121 @@ function has5MSTCDivergence(candles, divergenceType) {
   return false;
 }
 
+function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
+  if (!setup || !Array.isArray(closedCandles1m) || closedCandles1m.length < OBV_EMA_LENGTH + 2) {
+    return { status: "WAIT", reason: "INSUFFICIENT_1M_DATA" };
+  }
+
+  const latest = closedCandles1m[closedCandles1m.length - 1];
+  const latestTime = Number(latest?.time ?? latest?.openTime ?? latest?.timestamp);
+  if (!Number.isFinite(latestTime)) return { status: "WAIT", reason: "INVALID_1M_TIME" };
+
+  // Use the first three CLOSED 1M candles in each 5M window: offsets 0, 1m, 2m.
+  const fiveMinuteBucket = Math.floor(latestTime / 300000) * 300000;
+  const offset = latestTime - fiveMinuteBucket;
+  const latestKey = getScript2CandleKey(latest);
+
+  if (setup.script2SequenceBucket !== fiveMinuteBucket) {
+    setup.script2SequenceBucket = fiveMinuteBucket;
+    setup.script2SequenceStage = "WAIT_CANDLE_1";
+    setup.script2SequenceFailed = false;
+    setup.script2SequenceReady = false;
+    setup.script2SequenceCandle1Key = null;
+    setup.script2SequenceCandle2Key = null;
+    setup.script2SequenceCandle3Key = null;
+    setup.script2SequenceFailureReason = null;
+  }
+
+  if (setup.script2SequenceFailed) {
+    return { status: "FAILED", reason: setup.script2SequenceFailureReason || "CYCLE_FAILED", fiveMinuteBucket, offset };
+  }
+  if (setup.script2SequenceReady) {
+    return { status: "READY", fiveMinuteBucket, offset, direction: setup.direction };
+  }
+
+  const failCycle = (reason) => {
+    setup.script2SequenceFailed = true;
+    setup.script2SequenceFailureReason = reason;
+    setup.script2SequenceStage = "FAILED_WAIT_NEXT_5M";
+    return { status: "FAILED", reason, fiveMinuteBucket, offset };
+  };
+
+  if (setup.script2SequenceStage === "WAIT_CANDLE_1") {
+    if (offset !== 0) return { status: "WAIT", reason: "WAIT_NEXT_5M_CANDLE_1", fiveMinuteBucket, offset };
+    const imbalance = calculateOneCandleVolumeImbalance([latest]);
+    const directionalPct = setup.direction === "BUY" ? Number(imbalance?.buyPct) : Number(imbalance?.sellPct);
+    if (imbalance?.direction !== setup.direction || !Number.isFinite(directionalPct) || directionalPct < ENTRY_VOLUME_IMBALANCE_MIN_PERCENT) {
+      return failCycle("CANDLE_1_VOLUME_IMBALANCE_FAILED");
+    }
+
+    const high = Number(latest.high);
+    const low = Number(latest.low);
+    const boundary = setup.direction === "BUY" ? high : low;
+    if (![high, low, boundary].every(Number.isFinite) || boundary <= 0) return failCycle("CANDLE_1_INVALID_STRUCTURE");
+
+    // Candle 1 locks the 70% directional imbalance and the BOS boundary for this 5M cycle.
+    setup.anchoredBoundary = boundary;
+    setup.createdCandleKey = latestKey;
+    setup.anchoredZoneKey = `1M_CANDLE_1:${setup.direction}:${boundary}:${latestKey}`;
+    setup.zone = {
+      kind: "IMBALANCE_CANDLE",
+      type: setup.direction === "BUY" ? "CANDLE 1 HIGH" : "CANDLE 1 LOW",
+      price: boundary,
+      high,
+      low,
+      direction: setup.direction,
+      candleKey: latestKey
+    };
+    setup.script2SequenceCandle1Key = latestKey;
+    setup.script2SequenceCandle1ImbalancePercent = directionalPct;
+    setup.script2SequenceStage = "WAIT_CANDLE_2";
+    return { status: "STAGE_1_PASSED", fiveMinuteBucket, offset, boundary, imbalancePercent: directionalPct };
+  }
+
+  if (setup.script2SequenceStage === "WAIT_CANDLE_2") {
+    if (offset < 60000) return { status: "WAIT", reason: "WAIT_CANDLE_2", fiveMinuteBucket, offset };
+    if (offset !== 60000) return failCycle("CANDLE_2_MISSED_OR_NOT_CONSECUTIVE");
+    const candle2 = latest;
+    const open = Number(candle2.open);
+    const high = Number(candle2.high);
+    const low = Number(candle2.low);
+    const close = Number(candle2.close);
+    const range = high - low;
+    const momentum = range > 0 && [open, high, low, close].every(Number.isFinite) ? (close - open) / range : null;
+    const bosPassed = setup.direction === "BUY" ? close > Number(setup.anchoredBoundary) : close < Number(setup.anchoredBoundary);
+    const momentumPassed = setup.direction === "BUY"
+      ? Number.isFinite(momentum) && momentum >= ADEQUATE_MOMENTUM_THRESHOLD
+      : Number.isFinite(momentum) && momentum <= -ADEQUATE_MOMENTUM_THRESHOLD;
+    if (!bosPassed) return failCycle("CANDLE_2_BOS_FAILED");
+    if (!momentumPassed) return failCycle("CANDLE_2_MOMENTUM_FAILED");
+    setup.script2SequenceCandle2Key = latestKey;
+    setup.script2SequenceCandle2Momentum = momentum;
+    setup.script2SequenceStage = "WAIT_CANDLE_3_OBV";
+    setup.stage = "ONE_MINUTE_BOS_MOMENTUM_CONFIRMED";
+    setup.breakCandleKey = latestKey;
+    setup.breakBoundary = Number(setup.anchoredBoundary);
+    return { status: "STAGE_2_PASSED", fiveMinuteBucket, offset, boundary: setup.anchoredBoundary, momentum };
+  }
+
+  if (setup.script2SequenceStage === "WAIT_CANDLE_3_OBV") {
+    if (offset < 120000) return { status: "WAIT", reason: "WAIT_CANDLE_3_OBV", fiveMinuteBucket, offset };
+    if (offset !== 120000) return failCycle("CANDLE_3_MISSED_OR_NOT_CONSECUTIVE");
+    const obvPassed = calculateOBVConfirmation(closedCandles1m, setup.direction);
+    if (!obvPassed) return failCycle("CANDLE_3_OBV_FAILED");
+    setup.script2SequenceCandle3Key = latestKey;
+    setup.script2SequenceStage = "READY";
+    setup.script2SequenceReady = true;
+    setup.stage = "THREE_CANDLE_ENTRY_READY";
+    setup.confirmedAt = Date.now();
+    return { status: "READY", fiveMinuteBucket, offset, direction: setup.direction };
+  }
+
+  return { status: "WAIT", reason: setup.script2SequenceStage || "UNKNOWN_STAGE", fiveMinuteBucket, offset };
+}
+
 function calculateOBVConfirmation(candles, direction) {
-  // OBV confirmation uses ONLY the latest CLOSED 5M candle.
-  // A fresh crossover is NOT required. OBV only needs to be on the
-  // correct side of its 20 EMA for the requested trade direction.
+  // OBV confirmation uses the supplied CLOSED candles. A fresh crossover is NOT required;
+  // OBV only needs to be on the correct side of its 20 EMA for the requested direction.
   if (!candles || candles.length < OBV_EMA_LENGTH + 2) return false;
 
   const obvSeries = calculateOBVSeries(candles);
@@ -5153,11 +5264,10 @@ if (script2Zone) {
         };
 
         await sendMessage(
-          `➡️ *CONTINUATION CANDIDATE CREATED* — *${symbol}*\n` +
+          `🧭 *PRELIMINARY CONTINUATION SETUP QUEUED* — *${symbol}*\n` +
           `Direction: *${continuationDirection}* (from aligned Delta)\n` +
-          `🕯️ Structure candle: *forming 5M structure snapshot; 70% imbalance will be checked on the closed BOS candle*\n` +
-          `${continuationDirection === "BUY" ? "⬆️ Break above candle high" : "⬇️ Break below candle low"}: *${structurePrice.toPrecision(8)}*\n` +
-          `🔒 Structure locked until breakout, cancellation, or existing distance expiry.`
+          `The first CLOSED 1M candle of a 5M window must confirm the 70% directional imbalance; its high/low then becomes the locked BOS level.\n` +
+          `No entry is allowed until Candle 2 confirms BOS + momentum and Candle 3 confirms OBV.`
         );
       }
     }
@@ -5215,9 +5325,9 @@ if (!script2Zone) {
 // =====================================================
 // SCRIPT 2 EXECUTION SCANNER — EVERY 10 SECONDS
 // =====================================================
-// This scanner only visits symbols with a pending setup. It independently
-// advances closed-5M BOS/retest state, confirms OBV, checks liquidity and
-// executes orders. It never weakens the existing entry conditions.
+// This scanner only visits symbols with a pending setup. Entry confirmation is a
+// staged sequence of three CLOSED 1M candles inside one 5M window; liquidity,
+// higher-timeframe OBV bias, risk checks and duplicate-order protection remain active.
 async function monitorScript2ExecutionScanner() {
   if (script2ExecutionScannerRunning) return;
   script2ExecutionScannerRunning = true;
@@ -5228,6 +5338,44 @@ async function monitorScript2ExecutionScanner() {
     for (const symbol of pendingSymbols) {
       const setup = script2PendingSetups[symbol];
       if (!setup || script2ExecutionScannerLocks[symbol]) continue;
+
+      // Universal stale-structure guard: check every pending setup type on every
+      // scanner cycle, before pause/activation/cooldown gates. The reference is
+      // the setup's original locked boundary; never move it as price changes.
+      const structureLevelCandidate = Number.isFinite(Number(setup.anchoredBoundary))
+        ? Number(setup.anchoredBoundary)
+        : Number(getScript2ZoneBoundary(setup.zone, setup.direction));
+      if (Number.isFinite(structureLevelCandidate) && structureLevelCandidate > 0) {
+        let livePriceForExpiry = null;
+        try {
+          const expiryPriceRes = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
+          if (expiryPriceRes.ok) {
+            const expiryPriceData = await expiryPriceRes.json();
+            const candidatePrice = Number(expiryPriceData?.price);
+            if (Number.isFinite(candidatePrice) && candidatePrice > 0) livePriceForExpiry = candidatePrice;
+          }
+        } catch (expiryPriceErr) {
+          log(`⚠️ Pending-setup distance check failed for ${symbol}: ${expiryPriceErr?.message || expiryPriceErr}`);
+        }
+
+        if (livePriceForExpiry !== null) {
+          const structureDistancePct = Math.abs(livePriceForExpiry - structureLevelCandidate) / structureLevelCandidate * 100;
+          if (structureDistancePct >= SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT) {
+            // Remove only this pending setup. This does not touch open positions,
+            // exchange orders, scanner activation, or other symbols' setups.
+            if (script2PendingSetups[symbol] === setup) delete script2PendingSetups[symbol];
+            const expiryReport =
+              `⏳ *PENDING SETUP EXPIRED — ${symbol}*\n` +
+              `Reason: price moved *${structureDistancePct.toFixed(3)}%* from its original structure level (limit: *${SCRIPT2_CONTINUATION_MAX_DISTANCE_PERCENT.toFixed(2)}%*).\n` +
+              `Direction: *${setup.direction || "UNKNOWN"}* | Type: *${setup.setupType || "SETUP"}*\n` +
+              `Structure: *${structureLevelCandidate.toPrecision(8)}*\n` +
+              `Current price: *${livePriceForExpiry.toPrecision(8)}*\n` +
+              `No entry was placed; open positions and exchange orders were not changed.`;
+            awaitSendScript2Checkpoint(expiryReport);
+            continue;
+          }
+        }
+      }
 
       // Respect the same global/per-symbol activation and cooldown controls as the main scanner.
       if (BOT_PAUSED || (symbolActive[symbol] ?? true) !== true) continue;
@@ -5244,7 +5392,7 @@ async function monitorScript2ExecutionScanner() {
             setup.executionDataWarningAt = now;
             awaitSendScript2Checkpoint(
               `⚠️ *EXECUTION SCANNER WAITING* — *${symbol}*\n` +
-              `Reason: insufficient 5M candle data for OBV/BOS confirmation.\n` +
+              `Reason: insufficient 5M context data for the execution scanner.\n` +
               `The setup is retained; no trade was placed.`
             );
           }
@@ -5269,44 +5417,8 @@ async function monitorScript2ExecutionScanner() {
         }
 
         let direction = setup.direction;
-        let continuationReady = setup.setupType !== "CONTINUATION";
-
-        if (setup.setupType === "CONTINUATION") {
-          const continuationDirection = await processScript2Continuation(
-            symbol, closedCandles5, now, currentPrice, "LOW_MOMENTUM"
-          );
-          // processScript2Continuation sends the one-time BOS/retest checkpoints and handles expiry.
-          if (script2PendingSetups[symbol] !== setup) continue;
-
-          continuationReady = Boolean(
-            setup.zoneVolumeDeltaConfirmed === true &&
-            (setup.stage === "HIGH_MOMENTUM_BREAK_CONFIRMED" || setup.stage === "RETEST_CONFIRMED")
-          );
-          if (continuationDirection) direction = continuationDirection;
-
-          if (!continuationReady) {
-            const status = setup.stage === "BREAK_CONFIRMED"
-              ? "BOS confirmed; waiting for failed-reclaim retest"
-              : setup.stage === "CANDIDATE"
-                ? "waiting for a qualifying closed-5M BOS candle"
-                : `waiting for continuation confirmation (stage: ${setup.stage || "unknown"})`;
-            const priorKey = setup.executionScannerLastProgressKey || "";
-            const progressKey = `${candleKey}:${setup.stage || "CANDIDATE"}:${status}`;
-            if (priorKey !== progressKey) {
-              setup.executionScannerLastProgressKey = progressKey;
-              awaitSendScript2Checkpoint(
-                `⏳ *EXECUTION SCANNER STATUS* — *${symbol}*\n` +
-                `Direction: *${setup.direction}*\n` +
-                `Stage: ${status}.\n` +
-                `Structure: *${Number(setup.anchoredBoundary ?? getScript2ZoneBoundary(setup.zone, setup.direction)).toPrecision(8)}*\n` +
-                `Next check: within 10 seconds; BOS/retest remains based on CLOSED 5M candles.`
-              );
-            }
-            // Keep checking both OBV timeframes while BOS/retest is pending;
-            // only the order itself waits for continuationReady.
-          }
-        }
-
+        // All Script 2 pending entries now use the same three-closed-1M-candle sequence.
+        // The legacy closed-5M BOS/retest state machine is intentionally not advanced here.
         if (!direction || !["BUY", "SELL"].includes(direction)) {
           const lastWarn = Number(setup.executionDirectionWarningAt || 0);
           if (now - lastWarn >= 60 * 1000) {
@@ -5382,7 +5494,28 @@ async function monitorScript2ExecutionScanner() {
         const closedCandles1mForObv = Array.isArray(candles1mForObv) && candles1mForObv.length > 1
           ? candles1mForObv.slice(0, -1)
           : [];
-        const obvConfirmed1 = calculateOBVConfirmation(closedCandles1mForObv, direction);
+        const sequence = evaluateScript2ThreeCandleSequence(setup, closedCandles1mForObv);
+        if (sequence.status !== "READY") {
+          const sequenceStatusText = sequence.status === "FAILED"
+            ? `This 5M cycle failed (${sequence.reason}); waiting for the next 5M candle to restart.`
+            : sequence.status === "STAGE_1_PASSED"
+              ? `Candle 1 passed: directional volume imbalance ${Number(sequence.imbalancePercent).toFixed(1)}%; BOS level locked at ${Number(sequence.boundary).toPrecision(8)}. Waiting for Candle 2 BOS + momentum.`
+              : sequence.status === "STAGE_2_PASSED"
+                ? `Candle 2 passed: BOS + momentum (${Number(sequence.momentum).toFixed(2)}). Waiting for Candle 3 OBV.`
+                : `Waiting for the 3-candle 1M sequence (${sequence.reason || setup.script2SequenceStage || "Candle 1"}).`;
+          const progressKey = `${sequence.fiveMinuteBucket || "NA"}:${sequence.status}:${sequence.reason || ""}:${setup.script2SequenceStage || ""}`;
+          if (setup.script2SequenceLastProgressKey !== progressKey) {
+            setup.script2SequenceLastProgressKey = progressKey;
+            awaitSendScript2Checkpoint(
+              `⏳ *THREE-CANDLE ENTRY SEQUENCE* — *${symbol}*\n` +
+              `Direction: *${direction}*\n${sequenceStatusText}\n` +
+              `No trade is placed unless Candle 1 imbalance, Candle 2 BOS + momentum, and Candle 3 OBV all pass in order within the same 5M window.`
+            );
+          }
+          continue;
+        }
+        setup.script2SequenceLastProgressKey = null;
+        const obvConfirmed1 = true; // Candle 3 OBV has already passed in the staged sequence.
         if (obvConfirmed1 && !setup.obv1Notified) {
           setup.obv1Notified = true;
           awaitSendScript2Checkpoint(
@@ -5419,41 +5552,10 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // The 70% imbalance is evaluated once from the exact 5M BOS candle
-        // (not from a separate, later forming candle). For continuation setups,
-        // resolve the stored BOS candle key; otherwise use the latest closed 5M
-        // candle as the setup's confirmed trigger candle.
-        const bosCandle = setup.breakCandleKey
-          ? closedCandles5.find(c => getScript2CandleKey(c) === String(setup.breakCandleKey))
-          : latestClosed;
-        const bosVolumeImbalance = bosCandle
-          ? calculateOneCandleVolumeImbalance([bosCandle])
-          : null;
-        const bosImbalancePercent = direction === "BUY"
-          ? Number(bosVolumeImbalance?.buyPct)
-          : Number(bosVolumeImbalance?.sellPct);
-        const bosImbalancePassed = bosVolumeImbalance?.direction === direction &&
-          Number.isFinite(bosImbalancePercent) &&
-          bosImbalancePercent >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT;
-        const bosImbalanceKey = bosCandle ? getScript2CandleKey(bosCandle) : "MISSING_BOS";
-        if (!bosImbalancePassed) {
-          const imbalanceBlockKey = `BOS_IMBALANCE_WAIT:${bosImbalanceKey}:${Number.isFinite(bosImbalancePercent) ? bosImbalancePercent.toFixed(1) : "NA"}`;
-          if (setup.executionScannerLastImbalanceBlockKey !== imbalanceBlockKey) {
-            setup.executionScannerLastImbalanceBlockKey = imbalanceBlockKey;
-            awaitSendScript2Checkpoint(
-              `⏳ *BOS-CANDLE VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}* | BOS candle: *${bosCandle ? new Date(Number(bosCandle.time)).toISOString() : "unavailable"}*\n` +
-              `Measured directional imbalance: *${Number.isFinite(bosImbalancePercent) ? `${bosImbalancePercent.toFixed(1)}%` : "unavailable"}*; required: *≥ ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*.\n` +
-              `No separate forming-candle imbalance is used for this check.`
-            );
-          }
-          continue;
-        }
-        setup.executionScannerLastImbalanceBlockKey = null;
+        // Candle 1's directional 70% volume imbalance was checked once and stored
+        // by evaluateScript2ThreeCandleSequence. Do not recalculate it from 5M candles.
+        if (!setup.script2SequenceReady) continue;
 
-        // OBV is monitored concurrently with BOS/retest, but continuation entries
-        // remain blocked until the existing momentum/BOS or BOS+retest path is ready.
-        if (!continuationReady) continue;
 
         let estimatedTradeNotional = 0;
         for (const client of Object.values(userClients)) {
@@ -8245,6 +8347,57 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
   }
 });
 
+// Admin-only cleanup command: expire every currently pending Script 2 setup.
+// This only clears Script 2 pending-setup state. It does not close positions,
+// cancel exchange orders, pause the scanner, or modify unrelated trade state.
+// Usage: /expirepending
+bot.onText(/^\/expirepending(?:@\w+)?\s*$/i, async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  const pendingEntries = Object.entries(script2PendingSetups || {});
+  if (pendingEntries.length === 0) {
+    await bot.sendMessage(msg.chat.id, "ℹ️ Script 2 has no pending setups to expire.");
+    return;
+  }
+
+  const expired = [];
+  for (const [symbol, setup] of pendingEntries) {
+    // Guard against replacing/removing a setup that changed during this command.
+    if (script2PendingSetups[symbol] !== setup) continue;
+    delete script2PendingSetups[symbol];
+    expired.push({
+      symbol,
+      direction: setup?.direction || "UNKNOWN",
+      setupType: setup?.setupType || "SETUP",
+    });
+  }
+
+  if (expired.length === 0) {
+    await bot.sendMessage(msg.chat.id, "ℹ️ No pending setups remained to expire.");
+    return;
+  }
+
+  const lines = expired.map(({ symbol, direction, setupType }) =>
+    `• ${symbol} — ${direction} (${setupType})`
+  );
+  const report =
+    `🧹 SCRIPT 2 — PENDING SETUPS EXPIRED\n` +
+    `Expired: ${expired.length}\n\n` +
+    lines.join("\n") +
+    `\n\nScanner remains active. Open positions and exchange orders were not changed.`;
+
+  try {
+    await bot.sendMessage(msg.chat.id, report);
+  } catch (err) {
+    log(`Expire-pending command reply failed: ${err?.message || err}`);
+  }
+  try {
+    await sendMessage(report);
+  } catch (err) {
+    log(`Expire-pending broadcast failed: ${err?.message || err}`);
+  }
+});
+
 // Pause bot completely
 bot.onText(/\/pause/, async (msg) => {
   if (!isAdmin(msg)) return;
@@ -8707,57 +8860,3 @@ bot.onText(/^\/tradehistory$/, async (msg) => {
     log(`❌ /tradehistory error: ${err?.message || err}`);
   }
 });
-
-// Admin-only command to expire all pending Script 2 setups.
-// Does not close open positions or cancel exchange orders.
-// Usage: /expirepending
-
-bot.onText(/^\/expirepending(?:@\w+)?\s*$/i, async (msg) => {
-  if (!isAdmin(msg)) return;
-
-  const pendingEntries = Object.entries(script2PendingSetups || {});
-
-  if (pendingEntries.length === 0) {
-    await bot.sendMessage(
-      msg.chat.id,
-      "ℹ️ Script 2 has no pending setups to expire."
-    );
-    return;
-  }
-
-  const expired = [];
-
-  for (const [symbol, setup] of pendingEntries) {
-    if (script2PendingSetups[symbol] !== setup) continue;
-
-    delete script2PendingSetups[symbol];
-
-    expired.push({
-      symbol,
-      direction: setup?.direction || "UNKNOWN",
-      setupType: setup?.setupType || "SETUP",
-    });
-  }
-
-  if (expired.length === 0) {
-    await bot.sendMessage(
-      msg.chat.id,
-      "ℹ️ No pending setups remained to expire."
-    );
-    return;
-  }
-
-  const lines = expired.map(({ symbol, direction, setupType }) =>
-    `• ${symbol} — ${direction} (${setupType})`
-  );
-
-  const report =
-    `🧹 SCRIPT 2 — PENDING SETUPS EXPIRED\n` +
-    `Expired: ${expired.length}\n\n` +
-    lines.join("\n") +
-    `\n\nScanner remains active. Open positions and exchange orders were not changed.`;
-
-  await bot.sendMessage(msg.chat.id, report);
-  await sendMessage(report);
-});
-
