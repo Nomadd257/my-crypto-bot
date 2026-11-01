@@ -227,6 +227,7 @@ let script2ZoneAbsorptionState = {}; // observation-only state for liquidity-zon
 let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
 let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
 let script2DeltaGateState = {}; // per-symbol 15M/5M delta alignment and confirmation state
+let script2ObvAlignmentNotified = {}; // last 4H/30M OBV direction announced per symbol
 // Independent price-action consolidation detector; delta is measured only after phase completion.
 let priceActionDeltaPhaseState = {}; // per-symbol active consolidation phase and cooldown state
 let priceActionDeltaPhaseMonitorRunning = false;
@@ -4849,7 +4850,7 @@ setInterval(async () => {
       // =====================================================
 // SCRIPT 2 ENTRY LOGIC — ZONE → REVERSAL OR CONTINUATION
 // =====================================================
-// 0) Latest CLOSED 30M OBV vs 20 EMA sets direction (above=BUY, below=SELL); no fresh cross required.
+// 0) Latest CLOSED 4H and 30M OBV must agree vs their 20 EMAs; no fresh cross required.
 // 1) Price must first interact with a potential liquidity level
 //    or order block that is located at/near an ATR high/low area
 //    associated with the current-day or previous-day high/low.
@@ -4879,15 +4880,37 @@ if (!candles5 || candles5.length < 40) continue;
 // is evaluated separately against candles5[candles5.length - 1], the forming candle.
 const closedCandles5 = candles5.slice(0, -1);
 
-// The latest CLOSED 30M OBV position relative to its 20 EMA is the primary
-// direction authority for all automatic Script 2 setups. No fresh cross needed.
-const candles30mForBias = await fetchFuturesKlines(symbol, "30m", 150);
+// Stage 1 higher-timeframe direction gate: latest CLOSED 4H and 30M OBV
+// must both be on the same side of their 20 EMA. No fresh crossover is required.
+const [candles4hForBias, candles30mForBias] = await Promise.all([
+  fetchFuturesKlines(symbol, "4h", 100),
+  fetchFuturesKlines(symbol, "30m", 150)
+]);
+const closedCandles4hForBias = Array.isArray(candles4hForBias) && candles4hForBias.length > 1
+  ? candles4hForBias.slice(0, -1)
+  : null;
 const closedCandles30mForBias = Array.isArray(candles30mForBias) && candles30mForBias.length > 1
   ? candles30mForBias.slice(0, -1)
   : null;
+const obv4hBiasDirection = calculateOBVBiasDirection(closedCandles4hForBias);
 const obv30mBiasDirection = calculateOBVBiasDirection(closedCandles30mForBias);
-if (!obv30mBiasDirection) {
-  log(`ℹ️ ${symbol}: 30M OBV/20-EMA direction unavailable or exactly equal; new Script 2 setups remain locked.`);
+const higherTimeframeObvDirection = obv4hBiasDirection && obv4hBiasDirection === obv30mBiasDirection
+  ? obv4hBiasDirection
+  : null;
+if (!higherTimeframeObvDirection) {
+  log(`🔒 ${symbol}: 4H/30M OBV alignment unavailable or conflicting (4H=${obv4hBiasDirection || "N/A"}, 30M=${obv30mBiasDirection || "N/A"}); new Script 2 setups remain locked.`);
+} else if (script2ObvAlignmentNotified[symbol] !== higherTimeframeObvDirection) {
+  const obvBiasEmoji = higherTimeframeObvDirection === "BUY" ? "🟢" : "🔴";
+  await sendMessage(
+    `✅ *4H + 30M OBV ALIGNMENT CONFIRMED*\n\n` +
+    `*Symbol:* ${symbol}\n` +
+    `*4H OBV:* ${obvBiasEmoji} ${higherTimeframeObvDirection}\n` +
+    `*30M OBV:* ${obvBiasEmoji} ${higherTimeframeObvDirection}\n` +
+    `*Higher-Timeframe Bias:* ${obvBiasEmoji} *${higherTimeframeObvDirection === "BUY" ? "BULLISH" : "BEARISH"}*\n\n` +
+    `*Status:* ✅ OBV alignment confirmed\n` +
+    `*Next step:* Waiting for 15M + 5M Delta alignment.`
+  );
+  script2ObvAlignmentNotified[symbol] = higherTimeframeObvDirection;
 }
 
 // Global market-activity regime uses CLOSED 1M candles. Existing thresholds and
@@ -4938,12 +4961,13 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 }
 
 // -----------------------------------------------------
-// MASTER UNLOCK — 30M OBV DIRECTION → CLOSED 15M + 5M TREND-RESET DELTA
+// MASTER UNLOCK — 4H + 30M OBV ALIGNMENT → 15M + 5M DELTA ALIGNMENT → DELTA THRESHOLD
 // -----------------------------------------------------
-// Stage 0: latest CLOSED 30M OBV must establish direction relative to its 20 EMA.
-// Stage 1: 15M and 5M Delta must agree directionally relative to their own
-// Delta MAs. Send one Telegram message when a new alignment event begins.
-// Stage 2: the existing adaptive strength threshold must be met by the 5M
+// Stage 1: latest CLOSED 4H and 30M OBV must agree relative to their 20 EMAs.
+// Stage 2: 15M and 5M Delta must agree directionally relative to their own
+// Delta MAs, and agree with the higher-timeframe OBV direction. Send one
+// Telegram message when a new alignment event begins.
+// Stage 3: the existing adaptive strength threshold must be met by the 5M
 // Delta before creating NEW Script 2 setups. Once a continuation candidate
 // exists, keep monitoring its anchored BOS/retest state even if alignment
 // later weakens; delta unlock must not interrupt an already-staged candidate.
@@ -4984,12 +5008,12 @@ const rawAlignedDeltaDirection =
   delta15Direction && delta15Direction === delta5Direction
     ? delta15Direction
     : null;
-// Delta alignment only unlocks in the direction selected by 30M OBV.
-const alignedDeltaDirection = rawAlignedDeltaDirection && rawAlignedDeltaDirection === obv30mBiasDirection
+// Delta alignment only unlocks in the direction shared by both 4H and 30M OBV.
+const alignedDeltaDirection = rawAlignedDeltaDirection && rawAlignedDeltaDirection === higherTimeframeObvDirection
   ? rawAlignedDeltaDirection
   : null;
-if (rawAlignedDeltaDirection && obv30mBiasDirection && rawAlignedDeltaDirection !== obv30mBiasDirection) {
-  log(`⛔ ${symbol}: 15M/5M Delta aligns ${rawAlignedDeltaDirection}, but 30M OBV bias is ${obv30mBiasDirection}; setup remains locked.`);
+if (rawAlignedDeltaDirection && higherTimeframeObvDirection && rawAlignedDeltaDirection !== higherTimeframeObvDirection) {
+  log(`⛔ ${symbol}: 15M/5M Delta aligns ${rawAlignedDeltaDirection}, but 4H/30M OBV aligns ${higherTimeframeObvDirection}; setup remains locked.`);
 }
 
 let deltaGateState = script2DeltaGateState[symbol] || {
@@ -5029,12 +5053,13 @@ if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaD
   }
 
   await sendMessage(
-    `🧭 *30M OBV BIAS + 15M/5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
+    `🧭 *4H/30M OBV + 15M/5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
+    `• 4H OBV/20-EMA bias: *${obv4hBiasDirection}*\n` +
     `• 30M OBV/20-EMA bias: *${obv30mBiasDirection}*\n` +
     `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Aligned direction: *${alignedDeltaDirection}*\n` +
     `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
     `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
-    `⏳ Waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
+    `⏳ Stage 3: waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
     `🔒 Setups remain locked until confirmation.`
   );
 }
@@ -5057,7 +5082,7 @@ if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
     `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
     `📊 5M Delta strength: *${delta5ForGate.deltaStrength.toFixed(2)}*\n` +
     `🎯 Required threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
-    `🔓 *${alignedDeltaDirection} setups unlocked.* Existing setup, OBV, liquidity and execution checks remain in force.`
+    `🔓 *${alignedDeltaDirection} setups unlocked.* Existing three-candle entry, setup, liquidity and execution checks remain in force.`
   );
 }
 
