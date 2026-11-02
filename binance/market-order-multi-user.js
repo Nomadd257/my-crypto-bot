@@ -802,7 +802,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 1.5;
+const DELTA_STRENGTH_THRESHOLD = 2;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
@@ -812,7 +812,7 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 // 30M OBV direction uses the latest CLOSED 30M candle relative to its 20 EMA; no fresh crossover required.
 const OBV_EMA_LENGTH = 20;
 const OBV_CONFIRMATION_CANDLES = 1;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
 
 // Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
