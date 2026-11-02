@@ -512,6 +512,52 @@ function getPriceActionPhaseStats(candles) {
   };
 }
 
+async function classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDirection) {
+  // Informational only: this helper is called by the all-COIN_LIST price-action
+  // monitor, not by the activated-symbol trade-entry path.
+  try {
+    const [raw4h, raw30m] = await Promise.all([
+      fetchFuturesKlines(symbol, "4h", 100),
+      fetchFuturesKlines(symbol, "30m", 150)
+    ]);
+    const closed4h = Array.isArray(raw4h) && raw4h.length > 1 ? raw4h.slice(0, -1) : null;
+    const closed30m = Array.isArray(raw30m) && raw30m.length > 1 ? raw30m.slice(0, -1) : null;
+    const obv4h = calculateOBVBiasDirection(closed4h);
+    const obv30m = calculateOBVBiasDirection(closed30m);
+
+    if (!obv4h || !obv30m || obv4h !== obv30m) {
+      return {
+        label: "HTF BIAS UNCLEAR — BREAKOUT UNCLASSIFIED",
+        emoji: "⚪",
+        obv4h: obv4h || "UNAVAILABLE",
+        obv30m: obv30m || "UNAVAILABLE",
+        alignedBias: null
+      };
+    }
+
+    const breakoutDirection = liveDirection === "UPWARD" ? "BUY" : "SELL";
+    const isWithTrend = breakoutDirection === obv4h;
+    return {
+      label: isWithTrend
+        ? "POTENTIAL TREND CONTINUATION EXTENSION"
+        : "POTENTIAL TREND RETRACEMENT",
+      emoji: isWithTrend ? "📈" : "↩️",
+      obv4h: obv4h,
+      obv30m: obv30m,
+      alignedBias: obv4h
+    };
+  } catch (error) {
+    log(`⚠️ Higher-timeframe OBV classification failed for ${symbol}: ${error?.message || error}`);
+    return {
+      label: "HTF BIAS UNCLEAR — BREAKOUT UNCLASSIFIED",
+      emoji: "⚪",
+      obv4h: "UNAVAILABLE",
+      obv30m: "UNAVAILABLE",
+      alignedBias: null
+    };
+  }
+}
+
 async function monitorPriceActionDeltaPhases() {
   if (priceActionDeltaPhaseMonitorRunning) return;
   priceActionDeltaPhaseMonitorRunning = true;
@@ -544,14 +590,21 @@ async function monitorPriceActionDeltaPhases() {
               const lowerLiveBreak = phase.low * (1 - PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
               if (Number.isFinite(livePrice) && livePrice > 0 && (livePrice > upperLiveBreak || livePrice < lowerLiveBreak)) {
                 const liveDirection = livePrice > upperLiveBreak ? "UPWARD" : "DOWNWARD";
+                // Classify against closed-candle 4H and 30M OBV for every symbol
+                // scanned by this monitor, whether activated for trading or not.
+                // This only changes the alert text; it does not affect execution.
+                const trendClassification = await classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDirection);
                 phase.potentialBreakoutNotified = true;
                 phase.potentialBreakoutDirection = liveDirection;
                 await sendMessage(
-                  `👀 *POTENTIAL BREAKOUT — ${symbol}*\n\n` +
+                  `${trendClassification.emoji} *${trendClassification.label} — ${symbol}*\n\n` +
                   `First live price break detected: *${liveDirection}*\n` +
+                  `4H OBV bias: *${trendClassification.obv4h}*\n` +
+                  `30M OBV bias: *${trendClassification.obv30m}*\n` +
+                  `Higher-timeframe bias: *${trendClassification.alignedBias || "UNCLEAR / UNAVAILABLE"}*\n` +
                   `Live price: *${livePrice}*\n` +
                   `Consolidation boundary: *${liveDirection === "UPWARD" ? upperLiveBreak : lowerLiveBreak}*\n\n` +
-                  `_Early warning only. This is not a confirmed breakout or entry signal. The existing closed-15M detection and expansion/noise classification remain in place._`
+                  `_Informational classification only. A counter-trend break may be a retracement or a genuine reversal; this is not a confirmed breakout or entry signal. Trade execution logic is unchanged._`
                 );
               }
             }
@@ -802,7 +855,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 2;
+const DELTA_STRENGTH_THRESHOLD = 1.5;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
