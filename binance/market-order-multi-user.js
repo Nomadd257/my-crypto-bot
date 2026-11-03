@@ -863,7 +863,7 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 //     a fresh 5M crossover is NOT required.
 // 15M OBV is not an entry confirmation requirement.
 // 30M OBV direction uses the latest CLOSED 30M candle relative to its 20 EMA; no fresh crossover required.
-const OBV_EMA_LENGTH = 20;
+const OBV_EMA_LENGTH = 10;
 const OBV_CONFIRMATION_CANDLES = 1;
 const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
 
