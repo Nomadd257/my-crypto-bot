@@ -1,4 +1,4 @@
-// v60: 1M OBV + 1M market-activity momentum; 70% imbalance tied to the BOS candle; early live potential-breakout alert.
+// v61: removes Candle 2 momentum gating from execution; retains BOS + Candle 3 OBV; 60% imbalance and early live breakout alert.
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
 // v59: 30M OBV vs 20 EMA sets directional bias; remove 15M OBV entry gate; retain 5M OBV, 15M/5M Delta alignment and 5M strength unlock
@@ -2938,7 +2938,7 @@ function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
     const boundary = setup.direction === "BUY" ? high : low;
     if (![high, low, boundary].every(Number.isFinite) || boundary <= 0) return failCycle("CANDLE_1_INVALID_STRUCTURE");
 
-    // Candle 1 locks the 70% directional imbalance and the BOS boundary for this 5M cycle.
+    // Candle 1 locks the 60% directional imbalance and the BOS boundary for this 5M cycle.
     setup.anchoredBoundary = boundary;
     setup.createdCandleKey = latestKey;
     setup.anchoredZoneKey = `1M_CANDLE_1:${setup.direction}:${boundary}:${latestKey}`;
@@ -2966,20 +2966,16 @@ function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
     const low = Number(candle2.low);
     const close = Number(candle2.close);
     const range = high - low;
-    const momentum = range > 0 && [open, high, low, close].every(Number.isFinite) ? (close - open) / range : null;
+    // Execution no longer waits for or rejects Candle 2 based on momentum.
+    // The directional BOS close remains required, followed by Candle 3 OBV.
     const bosPassed = setup.direction === "BUY" ? close > Number(setup.anchoredBoundary) : close < Number(setup.anchoredBoundary);
-    const momentumPassed = setup.direction === "BUY"
-      ? Number.isFinite(momentum) && momentum >= ADEQUATE_MOMENTUM_THRESHOLD
-      : Number.isFinite(momentum) && momentum <= -ADEQUATE_MOMENTUM_THRESHOLD;
     if (!bosPassed) return failCycle("CANDLE_2_BOS_FAILED");
-    if (!momentumPassed) return failCycle("CANDLE_2_MOMENTUM_FAILED");
     setup.script2SequenceCandle2Key = latestKey;
-    setup.script2SequenceCandle2Momentum = momentum;
     setup.script2SequenceStage = "WAIT_CANDLE_3_OBV";
-    setup.stage = "ONE_MINUTE_BOS_MOMENTUM_CONFIRMED";
+    setup.stage = "ONE_MINUTE_BOS_CONFIRMED";
     setup.breakCandleKey = latestKey;
     setup.breakBoundary = Number(setup.anchoredBoundary);
-    return { status: "STAGE_2_PASSED", fiveMinuteBucket, offset, boundary: setup.anchoredBoundary, momentum };
+    return { status: "STAGE_2_PASSED", fiveMinuteBucket, offset, boundary: setup.anchoredBoundary };
   }
 
   if (setup.script2SequenceStage === "WAIT_CANDLE_3_OBV") {
@@ -4915,7 +4911,7 @@ setInterval(async () => {
 // 3) CONTINUATION is evaluated ONLY when no qualifying absorption exists.
 //    At ATR HIGH, BUY imbalance can create a BUY continuation candidate;
 //    at ATR LOW, SELL imbalance can create a SELL continuation candidate.
-// 4) Entry setup creation uses the current FORMING 5M candle imbalance (70%).
+// 4) Entry setup creation uses the current FORMING 5M candle imbalance (60%).
 //    Execution eligibility rechecks the current candle; each new 5M candle stands alone.
 // 5) A direction-neutral market-activity gate must allow NEW setups.
 //    Adequate momentum keeps the original 0.25 threshold and 2-of-3 activity
@@ -5271,7 +5267,7 @@ if (script2Zone) {
 
       // Absorption is the sole authority for reversal direction. The current
       // FORMING 5M candle's imbalance is a directional confirmation gate only;
-      // it must meet the 70% threshold in the already-selected absorption
+      // it must meet the 60% threshold in the already-selected absorption
       // direction and must never choose or flip the reversal direction.
       const reversalImbalancePct = Number(
         volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"]
@@ -5310,7 +5306,7 @@ if (script2Zone) {
 // STEP 2B — DELTA-UNLOCKED CONTINUATION STRUCTURE
 // -----------------------------------------------------
 // Delta must already have unlocked this symbol before this section runs.
-// Delta alignment creates the candidate and a 5M structure snapshot; the 70%
+// Delta alignment creates the candidate and a 5M structure snapshot; the 60%
 // imbalance is evaluated only on the exact closed BOS candle at execution.
 // Zone reach and zone-volume delta are informational only. Reversals still
 // require their previous-day high/low absorption context.
@@ -5323,7 +5319,7 @@ if (script2Zone) {
   if (!activeContinuation && !activeReversal) {
     const formingCandle5 = candles5[candles5.length - 1];
     // Delta alignment supplies the candidate direction. Do not calculate or
-    // gate on a separate forming-candle 70% imbalance here: that requirement is
+    // gate on a separate forming-candle 60% imbalance here: that requirement is
     // calculated once at execution from the exact closed BOS candle.
     const continuationDirection = deltaGateState.alignmentDirection || null;
     const imbalanceCandle = formingCandle5;
@@ -5380,7 +5376,7 @@ if (script2Zone) {
         await sendMessage(
           `🧭 *PRELIMINARY CONTINUATION SETUP QUEUED* — *${symbol}*\n` +
           `Direction: *${continuationDirection}* (from aligned Delta)\n` +
-          `The first CLOSED 1M candle of a 5M window must confirm the 70% directional imbalance; its high/low then becomes the locked BOS level.\n` +
+          `The first CLOSED 1M candle of a 5M window must confirm the 60% directional imbalance; its high/low then becomes the locked BOS level.\n` +
           `No entry is allowed until Candle 2 confirms BOS + momentum and Candle 3 confirms OBV.`
         );
       }
@@ -5666,7 +5662,7 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // Candle 1's directional 70% volume imbalance was checked once and stored
+        // Candle 1's directional 60% volume imbalance was checked once and stored
         // by evaluateScript2ThreeCandleSequence. Do not recalculate it from 5M candles.
         if (!setup.script2SequenceReady) continue;
 
