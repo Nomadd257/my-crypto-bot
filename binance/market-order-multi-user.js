@@ -99,7 +99,6 @@ const COIN_LIST = [
   "BCHUSDT",
   "AAVEUSDT",
   "ADAUSDT",
-  "TONUSDT",
   "FILUSDT",
   "LINKUSDT",
   "XLMUSDT",
@@ -111,7 +110,6 @@ const COIN_LIST = [
   "DOTUSDT",
   "ZECUSDT",
   "HBARUSDT",
-  "WLFIUSDT",
   "ASTERUSDT",
   "ICPUSDT",
   "ONDOUSDT",
@@ -119,20 +117,15 @@ const COIN_LIST = [
   "POLUSDT",
   "ENAUSDT",
   "ALGOUSDT",
-  "MORPHOUSDT",
   "QNTUSDT",
   "RENDERUSDT",
   "ZROUSDT",
   "DASHUSDT",
   "RIVERUSDT",
   "POWERUSDT",
-  "PHAUSDT",
   "PIPPINUSDT",
-  "XAGUSDT",
   "SAHARAUSDT",
-  "ARCUSDT",
   "FORMUSDT",
-  "ARBUSDT",
   "AKTUSDT",
   "GRTUSDT",
   "STRKUSDT",
@@ -2886,18 +2879,26 @@ function has5MSTCDivergence(candles, divergenceType) {
   return false;
 }
 
-function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
-  if (!setup || !Array.isArray(closedCandles1m) || closedCandles1m.length < OBV_EMA_LENGTH + 2) {
+function evaluateScript2ThreeCandleSequence(setup, closedCandles1m, liveCandle1m = null) {
+  if (!setup || !Array.isArray(closedCandles1m) || closedCandles1m.length < 3) {
     return { status: "WAIT", reason: "INSUFFICIENT_1M_DATA" };
   }
 
-  const latest = closedCandles1m[closedCandles1m.length - 1];
-  const latestTime = Number(latest?.time ?? latest?.openTime ?? latest?.timestamp);
-  if (!Number.isFinite(latestTime)) return { status: "WAIT", reason: "INVALID_1M_TIME" };
+  // Stage 1 and Stage 2 use closed candles. Stage 3 may use the currently forming 1M candle.
+  const latestClosed = closedCandles1m[closedCandles1m.length - 1];
+  const liveTime = Number(liveCandle1m?.time ?? liveCandle1m?.openTime ?? liveCandle1m?.timestamp);
+  const clockCandle = liveCandle1m && Number.isFinite(liveTime) ? liveCandle1m : latestClosed;
+  const clockTime = Number(clockCandle?.time ?? clockCandle?.openTime ?? clockCandle?.timestamp);
+  if (!Number.isFinite(clockTime)) return { status: "WAIT", reason: "INVALID_1M_TIME" };
 
-  // Use the first three CLOSED 1M candles in each 5M window: offsets 0, 1m, 2m.
-  const fiveMinuteBucket = Math.floor(latestTime / 300000) * 300000;
-  const offset = latestTime - fiveMinuteBucket;
+  // The 5M sequence is anchored to the live 1M clock. Candle 1 and Candle 2
+  // are read from closed bars; Candle 3 is evaluated live while it is forming.
+  const fiveMinuteBucket = Math.floor(clockTime / 300000) * 300000;
+  const offset = clockTime - fiveMinuteBucket;
+  const candle1 = closedCandles1m.find(c => Number(c?.time ?? c?.openTime ?? c?.timestamp) === fiveMinuteBucket);
+  const candle2 = closedCandles1m.find(c => Number(c?.time ?? c?.openTime ?? c?.timestamp) === fiveMinuteBucket + 60000);
+  const latest = setup.script2SequenceStage === "WAIT_CANDLE_3_LIVE_STRENGTH" ? (liveCandle1m || latestClosed) :
+    setup.script2SequenceStage === "WAIT_CANDLE_2" ? (candle2 || latestClosed) : (candle1 || latestClosed);
   const latestKey = getScript2CandleKey(latest);
 
   if (setup.script2SequenceBucket !== fiveMinuteBucket) {
@@ -2926,22 +2927,24 @@ function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
   };
 
   if (setup.script2SequenceStage === "WAIT_CANDLE_1") {
-    if (offset !== 0) return { status: "WAIT", reason: "WAIT_NEXT_5M_CANDLE_1", fiveMinuteBucket, offset };
-    const imbalance = calculateOneCandleVolumeImbalance([latest]);
+    if (offset > 60000) return { status: "WAIT", reason: "WAIT_NEXT_5M_CANDLE_1", fiveMinuteBucket, offset };
+    if (offset !== 60000 || !candle1) return { status: "WAIT", reason: "WAIT_CANDLE_1_CLOSE", fiveMinuteBucket, offset };
+    const candle = candle1;
+    const imbalance = calculateOneCandleVolumeImbalance([candle]);
     const directionalPct = setup.direction === "BUY" ? Number(imbalance?.buyPct) : Number(imbalance?.sellPct);
     if (imbalance?.direction !== setup.direction || !Number.isFinite(directionalPct) || directionalPct < ENTRY_VOLUME_IMBALANCE_MIN_PERCENT) {
       return failCycle("CANDLE_1_VOLUME_IMBALANCE_FAILED");
     }
 
-    const high = Number(latest.high);
-    const low = Number(latest.low);
+    const high = Number(candle.high);
+    const low = Number(candle.low);
     const boundary = setup.direction === "BUY" ? high : low;
     if (![high, low, boundary].every(Number.isFinite) || boundary <= 0) return failCycle("CANDLE_1_INVALID_STRUCTURE");
 
     // Candle 1 locks the 60% directional imbalance and the BOS boundary for this 5M cycle.
     setup.anchoredBoundary = boundary;
-    setup.createdCandleKey = latestKey;
-    setup.anchoredZoneKey = `1M_CANDLE_1:${setup.direction}:${boundary}:${latestKey}`;
+    setup.createdCandleKey = getScript2CandleKey(candle);
+    setup.anchoredZoneKey = `1M_CANDLE_1:${setup.direction}:${boundary}:${setup.createdCandleKey}`;
     setup.zone = {
       kind: "IMBALANCE_CANDLE",
       type: setup.direction === "BUY" ? "CANDLE 1 HIGH" : "CANDLE 1 LOW",
@@ -2949,46 +2952,60 @@ function evaluateScript2ThreeCandleSequence(setup, closedCandles1m) {
       high,
       low,
       direction: setup.direction,
-      candleKey: latestKey
+      candleKey: setup.createdCandleKey
     };
-    setup.script2SequenceCandle1Key = latestKey;
+    setup.script2SequenceCandle1Key = setup.createdCandleKey;
     setup.script2SequenceCandle1ImbalancePercent = directionalPct;
     setup.script2SequenceStage = "WAIT_CANDLE_2";
     return { status: "STAGE_1_PASSED", fiveMinuteBucket, offset, boundary, imbalancePercent: directionalPct };
   }
 
   if (setup.script2SequenceStage === "WAIT_CANDLE_2") {
-    if (offset < 60000) return { status: "WAIT", reason: "WAIT_CANDLE_2", fiveMinuteBucket, offset };
-    if (offset !== 60000) return failCycle("CANDLE_2_MISSED_OR_NOT_CONSECUTIVE");
-    const candle2 = latest;
-    const open = Number(candle2.open);
-    const high = Number(candle2.high);
-    const low = Number(candle2.low);
-    const close = Number(candle2.close);
+    if (offset < 120000) return { status: "WAIT", reason: "WAIT_CANDLE_2", fiveMinuteBucket, offset };
+    if (offset !== 120000 || !candle2) return failCycle("CANDLE_2_MISSED_OR_NOT_CONSECUTIVE");
+    const candle2Closed = candle2;
+    const open = Number(candle2Closed.open);
+    const high = Number(candle2Closed.high);
+    const low = Number(candle2Closed.low);
+    const close = Number(candle2Closed.close);
     const range = high - low;
-    // Execution no longer waits for or rejects Candle 2 based on momentum.
-    // The directional BOS close remains required, followed by Candle 3 OBV.
+    // Execution does not apply a Candle 2 momentum threshold. The directional BOS close remains required.
     const bosPassed = setup.direction === "BUY" ? close > Number(setup.anchoredBoundary) : close < Number(setup.anchoredBoundary);
     if (!bosPassed) return failCycle("CANDLE_2_BOS_FAILED");
-    setup.script2SequenceCandle2Key = latestKey;
-    setup.script2SequenceStage = "WAIT_CANDLE_3_OBV";
+    setup.script2SequenceCandle2Key = getScript2CandleKey(candle2Closed);
+    setup.script2SequenceStage = "WAIT_CANDLE_3_LIVE_STRENGTH";
     setup.stage = "ONE_MINUTE_BOS_CONFIRMED";
     setup.breakCandleKey = latestKey;
     setup.breakBoundary = Number(setup.anchoredBoundary);
     return { status: "STAGE_2_PASSED", fiveMinuteBucket, offset, boundary: setup.anchoredBoundary };
   }
 
-  if (setup.script2SequenceStage === "WAIT_CANDLE_3_OBV") {
-    if (offset < 120000) return { status: "WAIT", reason: "WAIT_CANDLE_3_OBV", fiveMinuteBucket, offset };
-    if (offset !== 120000) return failCycle("CANDLE_3_MISSED_OR_NOT_CONSECUTIVE");
-    const obvPassed = calculateOBVConfirmation(closedCandles1m, setup.direction);
-    if (!obvPassed) return failCycle("CANDLE_3_OBV_FAILED");
+  if (setup.script2SequenceStage === "WAIT_CANDLE_3_LIVE_STRENGTH") {
+    if (offset < 120000) return { status: "WAIT", reason: "WAIT_CANDLE_3", fiveMinuteBucket, offset };
+    if (offset !== 120000 || !liveCandle1m) return failCycle("CANDLE_3_MISSED_OR_NOT_CONSECUTIVE");
+
+    // Hybrid trigger: evaluate the forming third 1M candle without waiting for its close.
+    // Use the existing adequate-momentum threshold (0.25); no 1M OBV gate is applied.
+    const open = Number(latest.open);
+    const high = Number(latest.high);
+    const low = Number(latest.low);
+    const close = Number(latest.close);
+    const range = high - low;
+    if (![open, high, low, close, range].every(Number.isFinite) || range <= 0) {
+      return { status: "WAIT", reason: "CANDLE_3_LIVE_DATA_PENDING", fiveMinuteBucket, offset };
+    }
+    const signedMomentum = (close - open) / range;
+    const directionalMomentum = setup.direction === "BUY" ? signedMomentum : -signedMomentum;
+    if (directionalMomentum < ADEQUATE_MOMENTUM_THRESHOLD) {
+      return { status: "WAIT", reason: "CANDLE_3_LIVE_STRENGTH_PENDING", fiveMinuteBucket, offset, momentum: directionalMomentum };
+    }
+
     setup.script2SequenceCandle3Key = latestKey;
     setup.script2SequenceStage = "READY";
     setup.script2SequenceReady = true;
     setup.stage = "THREE_CANDLE_ENTRY_READY";
     setup.confirmedAt = Date.now();
-    return { status: "READY", fiveMinuteBucket, offset, direction: setup.direction };
+    return { status: "READY", fiveMinuteBucket, offset, direction: setup.direction, live: true, momentum: directionalMomentum };
   }
 
   return { status: "WAIT", reason: setup.script2SequenceStage || "UNKNOWN_STAGE", fiveMinuteBucket, offset };
@@ -5574,7 +5591,7 @@ async function monitorScript2ExecutionScanner() {
             setup.executionScannerLastBiasBlockKey = biasBlockKey;
             awaitSendScript2Checkpoint(
               `⏳ *30M OBV DIRECTION GATE PENDING* — *${symbol}*\n` +
-              `Setup direction: *${direction}* | Current closed-30M OBV/20-EMA bias: *${liveObv30mBias || "UNAVAILABLE"}*\n` +
+              `Setup direction: *${direction}* | Current closed-30M OBV/${OBV_EMA_LENGTH}-EMA bias: *${liveObv30mBias || "UNAVAILABLE"}*\n` +
               `The 30M bias must agree before execution. Setup retained; no order placed.`
             );
           }
@@ -5600,67 +5617,36 @@ async function monitorScript2ExecutionScanner() {
 
         // Automatic entry OBV confirmation uses the latest CLOSED 1M candles.
         // The 30M OBV directional bias above remains the higher-timeframe gate.
-        const candles1mForObv = await fetchFuturesKlines(symbol, "1m", 150);
-        const closedCandles1mForObv = Array.isArray(candles1mForObv) && candles1mForObv.length > 1
-          ? candles1mForObv.slice(0, -1)
+        const candles1mForEntry = await fetchFuturesKlines(symbol, "1m", 150);
+        const closedCandles1mForEntry = Array.isArray(candles1mForEntry) && candles1mForEntry.length > 1
+          ? candles1mForEntry.slice(0, -1)
           : [];
-        const sequence = evaluateScript2ThreeCandleSequence(setup, closedCandles1mForObv);
+        const liveCandle1mForEntry = Array.isArray(candles1mForEntry) && candles1mForEntry.length > 0
+          ? candles1mForEntry[candles1mForEntry.length - 1]
+          : null;
+        const sequence = evaluateScript2ThreeCandleSequence(setup, closedCandles1mForEntry, liveCandle1mForEntry);
         if (sequence.status !== "READY") {
           const sequenceStatusText = sequence.status === "FAILED"
             ? `This 5M cycle failed (${sequence.reason}); waiting for the next 5M candle to restart.`
             : sequence.status === "STAGE_1_PASSED"
-              ? `Candle 1 passed: directional volume imbalance ${Number(sequence.imbalancePercent).toFixed(1)}%; BOS level locked at ${Number(sequence.boundary).toPrecision(8)}. Waiting for Candle 2 BOS + momentum.`
+              ? `Candle 1 passed: directional volume imbalance ${Number(sequence.imbalancePercent).toFixed(1)}%; BOS level locked at ${Number(sequence.boundary).toPrecision(8)}. Waiting for Candle 2 BOS.`
               : sequence.status === "STAGE_2_PASSED"
-                ? `Candle 2 passed: BOS + momentum (${Number(sequence.momentum).toFixed(2)}). Waiting for Candle 3 OBV.`
-                : `Waiting for the 3-candle 1M sequence (${sequence.reason || setup.script2SequenceStage || "Candle 1"}).`;
+                ? `Candle 2 passed: directional BOS confirmed. Waiting for the live Candle 3 continuation-strength trigger.`
+                : sequence.reason === "CANDLE_3_LIVE_STRENGTH_PENDING"
+                  ? `Live Candle 3 strength is ${Number(sequence.momentum).toFixed(2)}; waiting for at least ${ADEQUATE_MOMENTUM_THRESHOLD.toFixed(2)} in the trade direction.`
+                  : `Waiting for the 3-candle 1M sequence (${sequence.reason || setup.script2SequenceStage || "Candle 1"}).`;
           const progressKey = `${sequence.fiveMinuteBucket || "NA"}:${sequence.status}:${sequence.reason || ""}:${setup.script2SequenceStage || ""}`;
           if (setup.script2SequenceLastProgressKey !== progressKey) {
             setup.script2SequenceLastProgressKey = progressKey;
             awaitSendScript2Checkpoint(
               `⏳ *THREE-CANDLE ENTRY SEQUENCE* — *${symbol}*\n` +
               `Direction: *${direction}*\n${sequenceStatusText}\n` +
-              `No trade is placed unless Candle 1 imbalance, Candle 2 BOS + momentum, and Candle 3 OBV all pass in order within the same 5M window.`
+              `Candle 1 imbalance, Candle 2 BOS and live Candle 3 strength must pass in order within the same 5M window. 1M OBV is not an execution gate.`
             );
           }
           continue;
         }
         setup.script2SequenceLastProgressKey = null;
-        const obvConfirmed1 = true; // Candle 3 OBV has already passed in the staged sequence.
-        if (obvConfirmed1 && !setup.obv1Notified) {
-          setup.obv1Notified = true;
-          awaitSendScript2Checkpoint(
-            `📈 *1M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}*\n` +
-            `Latest CLOSED 1M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; fresh crossover not required.`
-          );
-        } else if (!obvConfirmed1) {
-          setup.obv1Notified = false;
-        }
-
-        if (!obvConfirmed1) {
-          const obvKey = `OBV_FAIL:${getScript2CandleKey(closedCandles1mForObv[closedCandles1mForObv.length - 1])}:${direction}:1M_WAIT`;
-          if (setup.executionScannerLastBlockKey !== obvKey) {
-            setup.executionScannerLastBlockKey = obvKey;
-            awaitSendScript2Checkpoint(
-              `⏳ *1M OBV CONFIRMATION PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}*\n` +
-              `1M closed-candle OBV: ❌ pending (not on required side of 20-EMA).\n` +
-              `The setup is retained and rechecked every 10 seconds.`
-            );
-          }
-          setup.obvNotified = false;
-          continue;
-        }
-
-        if (!setup.obvNotified) {
-          setup.obvNotified = true;
-          setup.executionScannerLastBlockKey = null;
-          awaitSendScript2Checkpoint(
-            `📈 *1M OBV CONFIRMATION PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}*\n` +
-            `Latest CLOSED 1M OBV is on the correct side of the ${OBV_EMA_LENGTH}-EMA; no fresh crossover required.`
-          );
-        }
 
         // Candle 1's directional 60% volume imbalance was checked once and stored
         // by evaluateScript2ThreeCandleSequence. Do not recalculate it from 5M candles.
