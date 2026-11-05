@@ -1,7 +1,7 @@
-// v61: removes Candle 2 momentum gating from execution; retains BOS + Candle 3 OBV; 60% imbalance and early live breakout alert.
+// v63: removes automatic 15M/5M Delta directional alignment; 4H+30M OBV set direction and signed 5M Delta strength unlocks; retains 60% imbalance and live Candle 3.
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
-// v59: 30M OBV vs 20 EMA sets directional bias; remove 15M OBV entry gate; retain 5M OBV, 15M/5M Delta alignment and 5M strength unlock
+// v59 baseline: historical OBV and Delta strategy notes; current automatic setup unlock is defined in v63 above.
 // v57: standardize existing OBV EMA checks to 20 periods; preserve v56 entry and expiry rules
 // v54: adds independent 10-second pending-setup execution scanner with OBV/expiry diagnostics; preserves v53 expansion-classifier reliability fix
 // v52: classifies post-consolidation breakouts as REAL EXPANSION or MARKET NOISE with Telegram alerts; preserves the consolidation detector and v51 manual trade command
@@ -123,9 +123,9 @@ const COIN_LIST = [
   "DASHUSDT",
   "RIVERUSDT",
   "POWERUSDT",
-  "PIPPINUSDT",
   "SAHARAUSDT",
   "FORMUSDT",
+  "ARBUSDT",
   "AKTUSDT",
   "GRTUSDT",
   "STRKUSDT",
@@ -848,7 +848,7 @@ const TR_DELTA_MA_LENGTH = 10;
 // Minimum adaptive Delta strength required for a new entry.
 // 1.5 = Delta must reach at least 150% of the recent average
 // absolute bar-delta movement beyond the Delta MA.
-const DELTA_STRENGTH_THRESHOLD = 1.5;
+const DELTA_STRENGTH_THRESHOLD = 1.8;
 const DELTA_STRENGTH_LOOKBACK = 20;
 
 // OBV EMA period for existing OBV EMA checks: 20.
@@ -858,7 +858,7 @@ const DELTA_STRENGTH_LOOKBACK = 20;
 // 30M OBV direction uses the latest CLOSED 30M candle relative to its 20 EMA; no fresh crossover required.
 const OBV_EMA_LENGTH = 10;
 const OBV_CONFIRMATION_CANDLES = 1;
-const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 60;
+const ENTRY_VOLUME_IMBALANCE_MIN_PERCENT = 70;
 
 // Script 2 continuation confirmation settings.
 // A directional 1-candle imbalance creates a candidate only. Continuation
@@ -4974,7 +4974,7 @@ if (!higherTimeframeObvDirection) {
     `*30M OBV:* ${obvBiasEmoji} ${higherTimeframeObvDirection}\n` +
     `*Higher-Timeframe Bias:* ${obvBiasEmoji} *${higherTimeframeObvDirection === "BUY" ? "BULLISH" : "BEARISH"}*\n\n` +
     `*Status:* ✅ OBV alignment confirmed\n` +
-    `*Next step:* Waiting for 15M + 5M Delta alignment.`
+    `*Next step:* Waiting for directional 5M Delta strength threshold.`
   );
   script2ObvAlignmentNotified[symbol] = higherTimeframeObvDirection;
 }
@@ -5027,381 +5027,107 @@ if (candles15ForAbsorption && candles15ForAbsorption.length >= 26) {
 }
 
 // -----------------------------------------------------
-// MASTER UNLOCK — 4H + 30M OBV ALIGNMENT → 15M + 5M DELTA ALIGNMENT → DELTA THRESHOLD
+// MASTER UNLOCK — 4H + 30M OBV ALIGNMENT → DIRECTIONAL 5M DELTA STRENGTH
 // -----------------------------------------------------
-// Stage 1: latest CLOSED 4H and 30M OBV must agree relative to their 20 EMAs.
-// Stage 2: 15M and 5M Delta must agree directionally relative to their own
-// Delta MAs, and agree with the higher-timeframe OBV direction. Send one
-// Telegram message when a new alignment event begins.
-// Stage 3: the existing adaptive strength threshold must be met by the 5M
-// Delta before creating NEW Script 2 setups. Once a continuation candidate
-// exists, keep monitoring its anchored BOS/retest state even if alignment
-// later weakens; delta unlock must not interrupt an already-staged candidate.
-// All delta inputs below use CLOSED candles only.
+// Stage 1: latest CLOSED 4H and 30M OBV must agree.
+// Stage 2: the existing 5M Trend-Reset Delta strength must reach the
+// existing threshold IN THE SAME direction as the aligned OBV bias.
+// 15M Delta and 5M Delta-vs-Delta-MA alignment are not entry gates.
+// Once unlocked, the direction remains permitted while the 4H/30M OBV
+// alignment remains unchanged. Existing candidates continue to be monitored.
+// Delta strength is calculated from CLOSED 5M candles, as before.
 const activeContinuationBeforeDeltaGate =
   script2PendingSetups[symbol]?.setupType === "CONTINUATION";
-const closedCandles15ForDelta =
-  candles15ForAbsorption && candles15ForAbsorption.length > 1
-    ? candles15ForAbsorption.slice(0, -1)
-    : null;
-
-if (!closedCandles15ForDelta || closedCandles15ForDelta.length < 30) {
-  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: 15M delta data unavailable; continuing monitoring of existing continuation setup.`);
-}
-
-const delta15ForGate = closedCandles15ForDelta && closedCandles15ForDelta.length >= 30
-  ? calculateTrendResetCumulativeDelta(closedCandles15ForDelta)
-  : null;
 const delta5ForGate = calculateTrendResetCumulativeDelta(closedCandles5);
-
-if (!delta15ForGate || !delta5ForGate) {
-  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
-  if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: delta unavailable; continuing monitoring of existing continuation setup.`);
-}
-
-const getDeltaPositionDirection = (delta) => {
-  if (delta.cumDelta > 0 && delta.cumDelta > delta.deltaMA) return "BUY";
-  if (delta.cumDelta < 0 && delta.cumDelta < delta.deltaMA) return "SELL";
-  return null;
-};
-
-const delta15Direction = delta15ForGate ? getDeltaPositionDirection(delta15ForGate) : null;
-const delta5Direction = delta5ForGate ? getDeltaPositionDirection(delta5ForGate) : null;
-const rawAlignedDeltaDirection =
-  delta15Direction && delta15Direction === delta5Direction
-    ? delta15Direction
-    : null;
-// Delta alignment only unlocks in the direction shared by both 4H and 30M OBV.
-const alignedDeltaDirection = rawAlignedDeltaDirection && rawAlignedDeltaDirection === higherTimeframeObvDirection
-  ? rawAlignedDeltaDirection
-  : null;
-if (rawAlignedDeltaDirection && higherTimeframeObvDirection && rawAlignedDeltaDirection !== higherTimeframeObvDirection) {
-  log(`⛔ ${symbol}: 15M/5M Delta aligns ${rawAlignedDeltaDirection}, but 4H/30M OBV aligns ${higherTimeframeObvDirection}; setup remains locked.`);
-}
+const deltaDirectionForGate = higherTimeframeObvDirection;
 
 let deltaGateState = script2DeltaGateState[symbol] || {
   alignmentDirection: null,
   confirmed: false
 };
 
-if (!alignedDeltaDirection) {
-  if (deltaGateState.alignmentDirection && !deltaGateState.confirmed) {
-    log(`⛔ ${symbol} 15M/5M Delta alignment broke before 5M strength confirmation; pending NEW-SETUP confirmation cancelled.`);
-  }
-  script2DeltaGateState[symbol] = {
-    alignmentDirection: null,
-    confirmed: false
-  };
+// A changed or unavailable higher-timeframe bias invalidates the previous unlock.
+if (!deltaDirectionForGate) {
+  script2DeltaGateState[symbol] = { alignmentDirection: null, confirmed: false };
   deltaGateState = script2DeltaGateState[symbol];
   if (!activeContinuationBeforeDeltaGate) continue;
-  log(`ℹ️ ${symbol}: 15M/5M delta alignment is currently absent; monitoring existing continuation BOS/retest anyway.`);
-}
-
-if (alignedDeltaDirection && deltaGateState.alignmentDirection !== alignedDeltaDirection) {
+  log(`ℹ️ ${symbol}: 4H/30M OBV alignment unavailable; monitoring existing continuation setup only.`);
+} else if (deltaGateState.alignmentDirection !== deltaDirectionForGate) {
   deltaGateState = {
-    alignmentDirection: alignedDeltaDirection,
+    alignmentDirection: deltaDirectionForGate,
     confirmed: false,
     alignmentStartedAt: Date.now()
   };
   script2DeltaGateState[symbol] = deltaGateState;
-
-  // Do not carry a staged setup in the opposite direction into a new
-  // directional Delta alignment event.
-  if (
-    script2PendingSetups[symbol] &&
-    script2PendingSetups[symbol].setupType !== "CONTINUATION" &&
-    script2PendingSetups[symbol].direction !== alignedDeltaDirection
-  ) {
-    delete script2PendingSetups[symbol];
-  }
-
-  await sendMessage(
-    `🧭 *4H/30M OBV + 15M/5M DELTA ALIGNMENT* — *${symbol}*\n\n` +
-    `• 4H OBV/20-EMA bias: *${obv4hBiasDirection}*\n` +
-    `• 30M OBV/20-EMA bias: *${obv30mBiasDirection}*\n` +
-    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Aligned direction: *${alignedDeltaDirection}*\n` +
-    `• 15M Delta: ${delta15Direction} (CumDelta ${delta15ForGate.cumDelta.toFixed(2)} vs MA ${delta15ForGate.deltaMA.toFixed(2)})\n` +
-    `• 5M Delta: ${delta5Direction} (CumDelta ${delta5ForGate.cumDelta.toFixed(2)} vs MA ${delta5ForGate.deltaMA.toFixed(2)})\n\n` +
-    `⏳ Stage 3: waiting for 5M Delta strength confirmation (threshold: ${DELTA_STRENGTH_THRESHOLD.toFixed(2)}).\n` +
-    `🔒 Setups remain locked until confirmation.`
-  );
 }
 
-// The 5M threshold is the second-stage confirmation. It is evaluated only
-// after directional 15M/5M alignment has been established.
-const delta5StrengthConfirmed = Boolean(delta5ForGate && alignedDeltaDirection) && (
-  alignedDeltaDirection === "BUY"
+// Directional Delta strength is the only Delta qualification:
+// BUY requires positive strength >= threshold; SELL requires negative strength <= -threshold.
+const deltaStrengthConfirmed = Boolean(delta5ForGate && deltaDirectionForGate) && (
+  deltaDirectionForGate === "BUY"
     ? delta5ForGate.deltaStrength >= DELTA_STRENGTH_THRESHOLD
     : delta5ForGate.deltaStrength <= -DELTA_STRENGTH_THRESHOLD
 );
 
-if (!deltaGateState.confirmed && delta5StrengthConfirmed) {
+if (deltaDirectionForGate && !deltaGateState.confirmed && deltaStrengthConfirmed) {
   deltaGateState.confirmed = true;
   deltaGateState.confirmedAt = Date.now();
   script2DeltaGateState[symbol] = deltaGateState;
-
   await sendMessage(
-    `✅ *5M DELTA STRENGTH CONFIRMED* — *${symbol}*\n\n` +
-    `${alignedDeltaDirection === "BUY" ? "🟢" : "🔴"} Direction: *${alignedDeltaDirection}*\n` +
-    `📊 5M Delta strength: *${delta5ForGate.deltaStrength.toFixed(2)}*\n` +
-    `🎯 Required threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
-    `🔓 *${alignedDeltaDirection} setups unlocked.* Existing three-candle entry, setup, liquidity and execution checks remain in force.`
+    `✅ *DIRECTIONAL DELTA STRENGTH CONFIRMED* — *${symbol}*\n\n` +
+    `${deltaDirectionForGate === "BUY" ? "🟢" : "🔴"} Direction: *${deltaDirectionForGate}* (from aligned 4H/30M OBV)\n` +
+    `📊 5M Delta strength: *${Number(delta5ForGate.deltaStrength).toFixed(2)}*\n` +
+    `🎯 Required directional threshold: *${DELTA_STRENGTH_THRESHOLD.toFixed(2)}*\n\n` +
+    `🔓 *${deltaDirectionForGate} setups unlocked.* 15M/5M Delta directional alignment is not required.`
   );
 }
 
-if (!deltaGateState.confirmed && !activeContinuationBeforeDeltaGate) {
+if (deltaDirectionForGate && !deltaGateState.confirmed && !activeContinuationBeforeDeltaGate) {
+  log(`⏳ ${symbol}: ${deltaDirectionForGate} setups locked; waiting for directional 5M Delta strength ${DELTA_STRENGTH_THRESHOLD.toFixed(2)} (current: ${Number.isFinite(delta5ForGate?.deltaStrength) ? delta5ForGate.deltaStrength.toFixed(2) : "N/A"}).`);
   continue;
 }
 
 if (!deltaGateState.confirmed && activeContinuationBeforeDeltaGate) {
-  log(`ℹ️ ${symbol}: delta gate is not currently confirmed; new setup creation remains locked, existing continuation monitoring stays active.`);
+  log(`ℹ️ ${symbol}: directional Delta threshold not yet confirmed; monitoring existing continuation setup.`);
 }
 
-// Existing candidates may be monitored without a live delta unlock, but
-// new reversal/continuation candidates must still pass the master delta gate.
+// The aligned 4H/30M OBV direction is the permitted setup direction.
+// Delta strength unlocks that direction; it does not choose the direction.
+const alignedDeltaDirection = deltaGateState.confirmed
+  ? deltaGateState.alignmentDirection
+  : null;
+
 if (deltaGateState.confirmed) {
-// -----------------------------------------------------
-// STEP 1 — ZONE REACH
-// -----------------------------------------------------
-
-const currentDayCandle = dailyCandles[dailyCandles.length - 1];
-const currentDayHigh = Number(currentDayCandle?.high);
-const currentDayLow = Number(currentDayCandle?.low);
-const previousDayHigh = Number(lastClosedDaily?.high);
-const previousDayLow = Number(lastClosedDaily?.low);
-
-const script2Zone = findScript2Zone(
-  closedCandles5,
-  script2CurrentPrice,
-  atr,
-  currentDayHigh,
-  currentDayLow,
-  previousDayHigh,
-  previousDayLow
-);
-let script2ZoneVolumeDelta = null;
-
-if (script2Zone) {
-  // Recalculate on every scan while the zone is active, not only when the
-  // one-time ZONE REACHED Telegram checkpoint is first sent.
-  script2ZoneVolumeDelta = calculateScript2ZoneVolumeDelta(closedCandles5, script2Zone);
-
-  // Zone volume delta is observational only. Record it for an existing
-  // continuation if available, but never use it to unlock or block execution.
-  const stagedSetupForZoneDelta = script2PendingSetups[symbol];
-  if (stagedSetupForZoneDelta?.setupType === "CONTINUATION") {
-    stagedSetupForZoneDelta.zoneVolumeDelta = script2ZoneVolumeDelta;
-  }
-  const zoneCheckpointKey = getScript2ZoneObservationKey(script2Zone);
-  if (script2CheckpointState[symbol]?.zoneKey !== zoneCheckpointKey) {
-    script2CheckpointState[symbol] = { zoneKey: zoneCheckpointKey, zoneNotified: false };
-  }
-  if (!script2CheckpointState[symbol].zoneNotified) {
-    script2CheckpointState[symbol].zoneNotified = true;
-    await sendMessage(
-      `📍 *ZONE REACHED* — *${symbol}*\n` +
-      `📍 ${script2Zone.atrLocation?.name || `ATR ${script2Zone.atrLocation?.side || "ZONE"}`}\n` +
-      `🏦 ${script2Zone.kind === "ORDER_BLOCK" ? `ORDER BLOCK — ${script2Zone.type || "ORDER BLOCK"}` : `LIQUIDITY — ${script2Zone.type || "LIQUIDITY"}`}\n\n` +
-      `${formatScript2ZoneVolumeDelta(script2ZoneVolumeDelta)}\n\n` +
-      `ℹ️ Zone reach and zone volume delta are informational only; they do not block setup creation.`
-    );
-  }
-
-  // Observation-only liquidity-zone absorption tracking.
-  await observeScript2ZoneAbsorption(symbol, closedCandles5, script2Zone, now);
-
-  // ---------------------------------------------------
-  // STEP 2 — DETERMINE REVERSAL OR CONTINUATION
-  // ---------------------------------------------------
-  // Market regime is informational only; it does not gate reversal setup creation.
-  { // Unconditional: market regime is informational only.
-  const atrSide = script2Zone.atrLocation?.side;
-  const absorption = detectScript2Absorption(closedCandles5, script2Zone);
-  const latestClosedCandle = closedCandles5[closedCandles5.length - 1];
-  const latestClosedCandleKey = getScript2CandleKey(
-    latestClosedCandle,
-    String(closedCandles5.length - 1)
-  );
-
-  // ===================================================
-  // DECISION GATE — PREVIOUS-DAY REVERSAL / ALL-DAY CONTINUATION
-  // ===================================================
-  // Previous-day high/low (PDH/PDL) can produce either a reversal
-  // or a continuation. Current-day high/low (CDH/CDL) can produce
-  // continuation only.
-  //
-  // The selected ATR location is authoritative because getScript2AtrLocation()
-  // already chooses the nearest qualifying current/previous-day level.
-  const liquiditySource = String(script2Zone.atrLocation?.name || "");
-  const isPreviousDayLiquidity = liquiditySource === "PREVIOUS DAY HIGH" ||
-    liquiditySource === "PREVIOUS DAY LOW";
-  const hasAbsorption = Boolean(absorption?.direction);
-  const reversalEligible = isPreviousDayLiquidity && hasAbsorption;
-
-  if (reversalEligible) {
-    // Only qualifying absorption at PDH/PDL may create a reversal.
-    // A mismatched absorption is not continuation evidence.
-    // IMPORTANT: never cancel an already-active continuation setup merely
-    // because ATR expansion/reselection now points at another zone. The
-    // active continuation owns its anchored zone until success or expiry.
-    const activeContinuationSetup = script2PendingSetups[symbol]?.setupType === "CONTINUATION";
-    if (!activeContinuationSetup) {
-      delete script2PendingSetups[symbol];
-    }
-
-    const reversalDirection =
-      atrSide === "LOW" && absorption.direction === "BUY" ? "BUY" :
-      atrSide === "HIGH" && absorption.direction === "SELL" ? "SELL" :
-      null;
-
-    // Absorption selects reversal direction. It must agree with the already-
-    // unlocked 15M/5M delta direction. Zone volume delta is informational only
-    // and must not delay or reject an otherwise-valid reversal candidate.
-    const reversalOrderFlowConfirmed = Boolean(
-      reversalDirection &&
-      reversalDirection === alignedDeltaDirection
-    );
-
-    if (reversalOrderFlowConfirmed && !activeContinuationSetup) {
-      const formingCandle5 = candles5[candles5.length - 1];
-      const volumeImbalance = calculateOneCandleVolumeImbalance([formingCandle5]);
-
-      await sendMessage(
-        `🛑 *ABSORPTION CONFIRMED* — *${symbol}*\n` +
-        `🟢 ${absorption.type}\n` +
-        `📊 Volume: *${Number(absorption.effortRatio).toFixed(2)}x average*\n` +
-        `📏 Body/Range: *${(Number(absorption.bodyRatio) * 100).toFixed(1)}%*\n` +
-        `↩️ Wick/Range: *${(Number(absorption.wickRatio) * 100).toFixed(1)}%*`
-      );
-
-      await sendMessage(
-        `🔄 *REVERSAL DIRECTION CONFIRMED* — *${symbol}*\n` +
-        `➡️ Direction: *${reversalDirection}*`
-      );
-
-      // Absorption is the sole authority for reversal direction. The current
-      // FORMING 5M candle's imbalance is a directional confirmation gate only;
-      // it must meet the 60% threshold in the already-selected absorption
-      // direction and must never choose or flip the reversal direction.
-      const reversalImbalancePct = Number(
-        volumeImbalance?.[reversalDirection === "BUY" ? "buyPct" : "sellPct"]
-      );
-
-      if (
-        Number.isFinite(reversalImbalancePct) &&
-        reversalImbalancePct >= ENTRY_VOLUME_IMBALANCE_MIN_PERCENT
-      ) {
-        await sendMessage(
-          `📊 *VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
-          `${reversalDirection === "BUY" ? "🟢" : "🔴"} ${reversalDirection}: *${reversalImbalancePct.toFixed(1)}%*\n` +
-          `🎯 Threshold: *${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}%*`
-        );
-        script2PendingSetups[symbol] = {
-          direction: reversalDirection,
-          setupType: "REVERSAL",
-          absorption,
-          zone: script2Zone,
-          detectedAt: Date.now(),
-          executionDirectionNotified: false,
-          obvNotified: false,
-          liquidityNotified: false,
-          volumeImbalance: {
-            ...volumeImbalance,
-            direction: reversalDirection
-          }
-        };
-      }
-    }
-  }
-  }
-}
-
-// -----------------------------------------------------
-// STEP 2B — DELTA-UNLOCKED CONTINUATION STRUCTURE
-// -----------------------------------------------------
-// Delta must already have unlocked this symbol before this section runs.
-// Delta alignment creates the candidate and a 5M structure snapshot; the 60%
-// imbalance is evaluated only on the exact closed BOS candle at execution.
-// Zone reach and zone-volume delta are informational only. Reversals still
-// require their previous-day high/low absorption context.
-// Market regime is informational only; it does not gate continuation setup creation.
-{ // Unconditional: market regime is informational only.
+  const direction = deltaGateState.alignmentDirection;
   const existing = script2PendingSetups[symbol];
-  const activeContinuation = existing?.setupType === "CONTINUATION";
-  const activeReversal = existing?.setupType === "REVERSAL";
 
-  if (!activeContinuation && !activeReversal) {
-    const formingCandle5 = candles5[candles5.length - 1];
-    // Delta alignment supplies the candidate direction. Do not calculate or
-    // gate on a separate forming-candle 60% imbalance here: that requirement is
-    // calculated once at execution from the exact closed BOS candle.
-    const continuationDirection = deltaGateState.alignmentDirection || null;
-    const imbalanceCandle = formingCandle5;
-    const imbalanceCandleKey = getScript2CandleKey(
-      imbalanceCandle,
-      String(candles5.length - 1)
+  // A directional Delta-strength unlock creates a simple pending entry setup.
+  // The only remaining market-entry confirmation is >=70% directional volume
+  // imbalance on the latest CLOSED 5M candle; liquidity is checked afterward.
+  if (!existing || existing.direction !== direction || existing.stage !== "WAITING_FOR_CLOSED_5M_IMBALANCE") {
+    script2PendingSetups[symbol] = {
+      direction,
+      setupType: "CONTINUATION",
+      stage: "WAITING_FOR_CLOSED_5M_IMBALANCE",
+      detectedAt: Date.now(),
+      executionDirectionNotified: false,
+      obv30mBiasNotified: false,
+      liquidityNotified: false,
+      volumeImbalanceCandleKey: null,
+      volumeImbalancePassed: false,
+      executionInProgress: false
+    };
+    await sendMessage(
+      `🔓 *SCRIPT 2 SETUP UNLOCKED* — *${symbol}*\n\n` +
+      `Direction: *${direction}* (4H + 30M OBV aligned; directional 5M Delta strength passed).\n` +
+      `Next: wait for at least *70% directional volume imbalance* on a CLOSED 5M candle, then check liquidity and execute.`
     );
-    const continuationDirectionConfirmed = Boolean(continuationDirection); 
-
-    if (continuationDirection && imbalanceCandle && continuationDirectionConfirmed) {
-      const structurePrice = continuationDirection === "BUY"
-        ? Number(imbalanceCandle.high)
-        : Number(imbalanceCandle.low);
-
-      if (Number.isFinite(structurePrice) && structurePrice > 0) {
-        const structureType = continuationDirection === "BUY"
-          ? "IMBALANCE CANDLE HIGH"
-          : "IMBALANCE CANDLE LOW";
-        const anchoredZone = {
-          kind: "IMBALANCE_CANDLE",
-          type: structureType,
-          price: structurePrice,
-          high: Number(imbalanceCandle.high),
-          low: Number(imbalanceCandle.low),
-          direction: continuationDirection,
-          candleKey: imbalanceCandleKey
-        };
-
-        script2PendingSetups[symbol] = {
-          direction: continuationDirection,
-          setupType: "CONTINUATION",
-          stage: "CANDIDATE",
-          absorption: null,
-          zone: anchoredZone,
-          zoneLocked: true,
-          anchoredZoneKey: `${structureType}:${structurePrice}:${imbalanceCandleKey}`,
-          anchoredBoundary: structurePrice,
-          detectedAt: Date.now(),
-          createdCandleKey: imbalanceCandleKey,
-          breakCandleKey: null,
-          continuationMode: "PENDING",
-          breakNotified: false,
-          highMomentumNotified: false,
-          executionDirectionNotified: false,
-          obvNotified: false,
-          liquidityNotified: false,
-          volumeImbalanceNotified: false,
-          candidateNotified: false,
-          zoneVolumeDeltaConfirmed: true,
-          zoneVolumeDelta: script2ZoneVolumeDelta,
-          volumeImbalance: null
-        };
-
-        await sendMessage(
-          `🧭 *PRELIMINARY CONTINUATION SETUP QUEUED* — *${symbol}*\n` +
-          `Direction: *${continuationDirection}* (from aligned Delta)\n` +
-          `The first CLOSED 1M candle of a 5M window must confirm the 60% directional imbalance; its high/low then becomes the locked BOS level.\n` +
-          `No entry is allowed until Candle 2 confirms BOS + momentum and Candle 3 confirms OBV.`
-        );
-      }
-    }
   }
 }
 
-} // End new-setup creation gate. Existing staged continuation still advances below.
+// No 1M three-candle sequence, BOS, retest, ATR-zone, or absorption condition
+// is required for this automatic entry path. Those diagnostics are not entry gates.
+
 
 // -----------------------------------------------------
 // -----------------------------------------------------
@@ -5544,8 +5270,7 @@ async function monitorScript2ExecutionScanner() {
         }
 
         let direction = setup.direction;
-        // All Script 2 pending entries now use the same three-closed-1M-candle sequence.
-        // The legacy closed-5M BOS/retest state machine is intentionally not advanced here.
+        // Pending Script 2 entries wait only for a qualifying CLOSED 5M volume-imbalance candle.
         if (!direction || !["BUY", "SELL"].includes(direction)) {
           const lastWarn = Number(setup.executionDirectionWarningAt || 0);
           if (now - lastWarn >= 60 * 1000) {
@@ -5615,43 +5340,33 @@ async function monitorScript2ExecutionScanner() {
           );
         }
 
-        // Automatic entry OBV confirmation uses the latest CLOSED 1M candles.
-        // The 30M OBV directional bias above remains the higher-timeframe gate.
-        const candles1mForEntry = await fetchFuturesKlines(symbol, "1m", 150);
-        const closedCandles1mForEntry = Array.isArray(candles1mForEntry) && candles1mForEntry.length > 1
-          ? candles1mForEntry.slice(0, -1)
-          : [];
-        const liveCandle1mForEntry = Array.isArray(candles1mForEntry) && candles1mForEntry.length > 0
-          ? candles1mForEntry[candles1mForEntry.length - 1]
-          : null;
-        const sequence = evaluateScript2ThreeCandleSequence(setup, closedCandles1mForEntry, liveCandle1mForEntry);
-        if (sequence.status !== "READY") {
-          const sequenceStatusText = sequence.status === "FAILED"
-            ? `This 5M cycle failed (${sequence.reason}); waiting for the next 5M candle to restart.`
-            : sequence.status === "STAGE_1_PASSED"
-              ? `Candle 1 passed: directional volume imbalance ${Number(sequence.imbalancePercent).toFixed(1)}%; BOS level locked at ${Number(sequence.boundary).toPrecision(8)}. Waiting for Candle 2 BOS.`
-              : sequence.status === "STAGE_2_PASSED"
-                ? `Candle 2 passed: directional BOS confirmed. Waiting for the live Candle 3 continuation-strength trigger.`
-                : sequence.reason === "CANDLE_3_LIVE_STRENGTH_PENDING"
-                  ? `Live Candle 3 strength is ${Number(sequence.momentum).toFixed(2)}; waiting for at least ${ADEQUATE_MOMENTUM_THRESHOLD.toFixed(2)} in the trade direction.`
-                  : `Waiting for the 3-candle 1M sequence (${sequence.reason || setup.script2SequenceStage || "Candle 1"}).`;
-          const progressKey = `${sequence.fiveMinuteBucket || "NA"}:${sequence.status}:${sequence.reason || ""}:${setup.script2SequenceStage || ""}`;
-          if (setup.script2SequenceLastProgressKey !== progressKey) {
-            setup.script2SequenceLastProgressKey = progressKey;
+        // Entry confirmation: latest CLOSED 5M candle must show >=70%
+        // directional taker-volume imbalance. Never inspect the forming candle.
+        if (setup.volumeImbalanceCandleKey !== candleKey) {
+          setup.volumeImbalanceCandleKey = candleKey;
+          setup.volumeImbalancePassed = hasEntryVolumeImbalance(closedCandles5, direction);
+          setup.volumeImbalanceNotified = false;
+        }
+        if (!setup.volumeImbalancePassed) {
+          const imbalanceKey = `CLOSED_5M_IMBALANCE_PENDING:${candleKey}:${direction}`;
+          if (setup.executionScannerLastImbalanceBlockKey !== imbalanceKey) {
+            setup.executionScannerLastImbalanceBlockKey = imbalanceKey;
             awaitSendScript2Checkpoint(
-              `⏳ *THREE-CANDLE ENTRY SEQUENCE* — *${symbol}*\n` +
-              `Direction: *${direction}*\n${sequenceStatusText}\n` +
-              `Candle 1 imbalance, Candle 2 BOS and live Candle 3 strength must pass in order within the same 5M window. 1M OBV is not an execution gate.`
+              `⏳ *70% CLOSED 5M VOLUME IMBALANCE PENDING* — *${symbol}*\n` +
+              `Direction: *${direction}*\n` +
+              `Latest completed 5M candle has not reached ${ENTRY_VOLUME_IMBALANCE_MIN_PERCENT}% directional taker-volume imbalance. Waiting for the next closed 5M candle.`
             );
           }
           continue;
         }
-        setup.script2SequenceLastProgressKey = null;
-
-        // Candle 1's directional 60% volume imbalance was checked once and stored
-        // by evaluateScript2ThreeCandleSequence. Do not recalculate it from 5M candles.
-        if (!setup.script2SequenceReady) continue;
-
+        setup.executionScannerLastImbalanceBlockKey = null;
+        if (!setup.volumeImbalanceNotified) {
+          setup.volumeImbalanceNotified = true;
+          awaitSendScript2Checkpoint(
+            `✅ *70% CLOSED 5M VOLUME IMBALANCE PASSED* — *${symbol}*\n` +
+            `Direction: *${direction}* | Latest closed 5M candle confirmed the required threshold.`
+          );
+        }
 
         let estimatedTradeNotional = 0;
         for (const client of Object.values(userClients)) {
