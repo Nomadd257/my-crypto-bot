@@ -551,6 +551,138 @@ async function classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDi
   }
 }
 
+// ======================================================
+// CONSOLIDATION DEPLOYMENT EARLY-WATCH (INFORMATIONAL ONLY)
+// Uses closed 2H/30M candles and the existing OBV 10 EMA.
+// The 30M neutral band is 5% of the range of its latest 20
+// closed OBV values. This feature never gates or changes entries.
+// ======================================================
+const DEPLOYMENT_WATCH_30M_RANGE_CANDLES = 20;
+const DEPLOYMENT_WATCH_30M_NEUTRAL_RANGE_FRACTION = 0.05;
+
+function getDeploymentWatchOBVStatus(closedCandles, useNeutralBand = false) {
+  if (!Array.isArray(closedCandles) || closedCandles.length < OBV_EMA_LENGTH + 2) {
+    return { status: "UNAVAILABLE", reason: "insufficient closed candles" };
+  }
+
+  const obvSeries = calculateOBVSeries(closedCandles);
+  if (!Array.isArray(obvSeries) || obvSeries.length !== closedCandles.length ||
+      obvSeries.some(value => !Number.isFinite(value))) {
+    return { status: "UNAVAILABLE", reason: "invalid OBV series" };
+  }
+
+  const obvCandles = closedCandles.map((candle, index) => ({ ...candle, close: obvSeries[index] }));
+  const emaSeries = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
+  const latestOBV = Number(obvSeries[obvSeries.length - 1]);
+  const latestEMA = Number(emaSeries[emaSeries.length - 1]);
+  if (!Number.isFinite(latestOBV) || !Number.isFinite(latestEMA)) {
+    return { status: "UNAVAILABLE", reason: "invalid OBV EMA" };
+  }
+
+  if (!useNeutralBand) {
+    if (latestOBV > latestEMA) return { status: "BUY", obv: latestOBV, ema: latestEMA };
+    if (latestOBV < latestEMA) return { status: "SELL", obv: latestOBV, ema: latestEMA };
+    return { status: "UNAVAILABLE", reason: "OBV equals EMA" };
+  }
+
+  if (closedCandles.length < DEPLOYMENT_WATCH_30M_RANGE_CANDLES + 1) {
+    return { status: "UNAVAILABLE", reason: "insufficient 30M history for neutral band" };
+  }
+  const recentOBV = obvSeries.slice(-DEPLOYMENT_WATCH_30M_RANGE_CANDLES);
+  if (recentOBV.length !== DEPLOYMENT_WATCH_30M_RANGE_CANDLES || recentOBV.some(value => !Number.isFinite(value))) {
+    return { status: "UNAVAILABLE", reason: "invalid 30M OBV range" };
+  }
+  const obvRange = Math.max(...recentOBV) - Math.min(...recentOBV);
+  if (!Number.isFinite(obvRange) || obvRange <= 0) {
+    return { status: "UNAVAILABLE", reason: "zero or invalid 30M OBV range" };
+  }
+  const neutralBand = obvRange * DEPLOYMENT_WATCH_30M_NEUTRAL_RANGE_FRACTION;
+  const distance = latestOBV - latestEMA;
+  if (Math.abs(distance) <= neutralBand) {
+    return { status: "NEUTRAL", obv: latestOBV, ema: latestEMA, neutralBand, obvRange };
+  }
+  return {
+    status: distance > 0 ? "BUY" : "SELL",
+    obv: latestOBV,
+    ema: latestEMA,
+    neutralBand,
+    obvRange
+  };
+}
+
+async function getConsolidationDeploymentWatchBias(symbol) {
+  try {
+    const [raw2h, raw30m] = await Promise.all([
+      fetchFuturesKlines(symbol, "2h", 100),
+      fetchFuturesKlines(symbol, "30m", 150)
+    ]);
+    const closed2h = Array.isArray(raw2h) && raw2h.length > 1 ? raw2h.slice(0, -1) : null;
+    const closed30m = Array.isArray(raw30m) && raw30m.length > 1 ? raw30m.slice(0, -1) : null;
+    return {
+      obv2h: getDeploymentWatchOBVStatus(closed2h, false),
+      obv30m: getDeploymentWatchOBVStatus(closed30m, true)
+    };
+  } catch (error) {
+    log(`⚠️ Deployment early-watch OBV check failed for ${symbol}: ${error?.message || error}`);
+    return {
+      obv2h: { status: "UNAVAILABLE", reason: "fetch/calculation error" },
+      obv30m: { status: "UNAVAILABLE", reason: "fetch/calculation error" }
+    };
+  }
+}
+
+async function startConsolidationDeploymentEarlyWatch(symbol, phase) {
+  const bias = await getConsolidationDeploymentWatchBias(symbol);
+  const direction = bias.obv2h.status;
+  if ((direction !== "BUY" && direction !== "SELL") || bias.obv30m.status !== "NEUTRAL") return;
+
+  phase.deploymentWatch = {
+    direction,
+    status: "EARLY_WATCH",
+    startedAt: Date.now()
+  };
+  await sendMessage(
+    `${direction === "BUY" ? "🟢" : "🔴"} *EARLY ${direction === "BUY" ? "BULLISH" : "BEARISH"} DEPLOYMENT WATCH — ${symbol}*\n\n` +
+    `Price action: *15M consolidation detected*\n` +
+    `2H OBV: *${direction}* ( ${OBV_EMA_LENGTH}-EMA )\n` +
+    `30M OBV: *NEUTRAL* (within the approved 5% range band around its ${OBV_EMA_LENGTH}-EMA)\n\n` +
+    `_Early heads-up only. This is not an entry signal and does not activate the robot or change any execution conditions. Wait for the existing strategy's normal setup and entry checks._`
+  );
+}
+
+async function updateConsolidationDeploymentEarlyWatch(symbol, phase) {
+  const watch = phase?.deploymentWatch;
+  if (!watch || watch.status !== "EARLY_WATCH") return;
+
+  const bias = await getConsolidationDeploymentWatchBias(symbol);
+  const twoHour = bias.obv2h.status;
+  const thirtyMinute = bias.obv30m.status;
+  // Missing data is not treated as neutral or as an invalidation.
+  if (twoHour === "UNAVAILABLE" || thirtyMinute === "UNAVAILABLE") return;
+
+  if (twoHour !== watch.direction || thirtyMinute === (watch.direction === "BUY" ? "SELL" : "BUY")) {
+    watch.status = "INVALIDATED";
+    watch.invalidatedAt = Date.now();
+    await sendMessage(
+      `⚪ *EARLY ${watch.direction === "BUY" ? "BULLISH" : "BEARISH"} WATCH INVALIDATED — ${symbol}*\n\n` +
+      `2H OBV: *${twoHour}*\n30M OBV: *${thirtyMinute}*\n` +
+      `_The original early-watch conditions no longer hold. Informational only; trade execution logic is unchanged._`
+    );
+    return;
+  }
+
+  if (thirtyMinute === watch.direction) {
+    watch.status = "CONFIRMED";
+    watch.confirmedAt = Date.now();
+    await sendMessage(
+      `${watch.direction === "BUY" ? "📈" : "📉"} *${watch.direction === "BUY" ? "BULLISH" : "BEARISH"} MOMENTUM CONFIRMATION — ${symbol}*\n\n` +
+      `2H OBV: *${twoHour}*\n30M OBV: *${thirtyMinute}*\n` +
+      `The 30M OBV has moved out of its neutral band and aligned with the 2H bias.\n\n` +
+      `_Informational confirmation only. This does not activate the robot or bypass any existing entry checks._`
+    );
+  }
+}
+
 async function monitorPriceActionDeltaPhases() {
   if (priceActionDeltaPhaseMonitorRunning) return;
   priceActionDeltaPhaseMonitorRunning = true;
@@ -569,6 +701,14 @@ async function monitorPriceActionDeltaPhases() {
         if (!latest || !Number.isFinite(latest.time)) continue;
 
         let phase = priceActionDeltaPhaseState[symbol];
+
+        if (phase && Array.isArray(phase.candles)) {
+          try {
+            await updateConsolidationDeploymentEarlyWatch(symbol, phase);
+          } catch (watchUpdateError) {
+            log(`⚠️ Deployment early-watch update failed for ${symbol}: ${watchUpdateError?.message || watchUpdateError}`);
+          }
+        }
 
         // Early informational alert on the first live price break of an active
         // consolidation boundary. It is one-shot per phase and does not classify
@@ -745,6 +885,14 @@ async function monitorPriceActionDeltaPhases() {
           low: stats.low,
           lastStatusMessageTime: latest.time
         };
+
+        // Add an informational deployment heads-up using the same consolidation trigger.
+        // This does not affect activation, setup qualification, or order execution.
+        try {
+          await startConsolidationDeploymentEarlyWatch(symbol, priceActionDeltaPhaseState[symbol]);
+        } catch (watchStartError) {
+          log(`⚠️ Deployment early-watch start failed for ${symbol}: ${watchStartError?.message || watchStartError}`);
+        }
       } catch (err) {
         log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
       }
