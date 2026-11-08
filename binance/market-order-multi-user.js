@@ -551,138 +551,6 @@ async function classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDi
   }
 }
 
-// ======================================================
-// CONSOLIDATION DEPLOYMENT EARLY-WATCH (INFORMATIONAL ONLY)
-// Uses closed 2H/30M candles and the existing OBV 10 EMA.
-// The 30M neutral band is 5% of the range of its latest 20
-// closed OBV values. This feature never gates or changes entries.
-// ======================================================
-const DEPLOYMENT_WATCH_30M_RANGE_CANDLES = 20;
-const DEPLOYMENT_WATCH_30M_NEUTRAL_RANGE_FRACTION = 0.05;
-
-function getDeploymentWatchOBVStatus(closedCandles, useNeutralBand = false) {
-  if (!Array.isArray(closedCandles) || closedCandles.length < OBV_EMA_LENGTH + 2) {
-    return { status: "UNAVAILABLE", reason: "insufficient closed candles" };
-  }
-
-  const obvSeries = calculateOBVSeries(closedCandles);
-  if (!Array.isArray(obvSeries) || obvSeries.length !== closedCandles.length ||
-      obvSeries.some(value => !Number.isFinite(value))) {
-    return { status: "UNAVAILABLE", reason: "invalid OBV series" };
-  }
-
-  const obvCandles = closedCandles.map((candle, index) => ({ ...candle, close: obvSeries[index] }));
-  const emaSeries = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
-  const latestOBV = Number(obvSeries[obvSeries.length - 1]);
-  const latestEMA = Number(emaSeries[emaSeries.length - 1]);
-  if (!Number.isFinite(latestOBV) || !Number.isFinite(latestEMA)) {
-    return { status: "UNAVAILABLE", reason: "invalid OBV EMA" };
-  }
-
-  if (!useNeutralBand) {
-    if (latestOBV > latestEMA) return { status: "BUY", obv: latestOBV, ema: latestEMA };
-    if (latestOBV < latestEMA) return { status: "SELL", obv: latestOBV, ema: latestEMA };
-    return { status: "UNAVAILABLE", reason: "OBV equals EMA" };
-  }
-
-  if (closedCandles.length < DEPLOYMENT_WATCH_30M_RANGE_CANDLES + 1) {
-    return { status: "UNAVAILABLE", reason: "insufficient 30M history for neutral band" };
-  }
-  const recentOBV = obvSeries.slice(-DEPLOYMENT_WATCH_30M_RANGE_CANDLES);
-  if (recentOBV.length !== DEPLOYMENT_WATCH_30M_RANGE_CANDLES || recentOBV.some(value => !Number.isFinite(value))) {
-    return { status: "UNAVAILABLE", reason: "invalid 30M OBV range" };
-  }
-  const obvRange = Math.max(...recentOBV) - Math.min(...recentOBV);
-  if (!Number.isFinite(obvRange) || obvRange <= 0) {
-    return { status: "UNAVAILABLE", reason: "zero or invalid 30M OBV range" };
-  }
-  const neutralBand = obvRange * DEPLOYMENT_WATCH_30M_NEUTRAL_RANGE_FRACTION;
-  const distance = latestOBV - latestEMA;
-  if (Math.abs(distance) <= neutralBand) {
-    return { status: "NEUTRAL", obv: latestOBV, ema: latestEMA, neutralBand, obvRange };
-  }
-  return {
-    status: distance > 0 ? "BUY" : "SELL",
-    obv: latestOBV,
-    ema: latestEMA,
-    neutralBand,
-    obvRange
-  };
-}
-
-async function getConsolidationDeploymentWatchBias(symbol) {
-  try {
-    const [raw2h, raw30m] = await Promise.all([
-      fetchFuturesKlines(symbol, "2h", 100),
-      fetchFuturesKlines(symbol, "30m", 150)
-    ]);
-    const closed2h = Array.isArray(raw2h) && raw2h.length > 1 ? raw2h.slice(0, -1) : null;
-    const closed30m = Array.isArray(raw30m) && raw30m.length > 1 ? raw30m.slice(0, -1) : null;
-    return {
-      obv2h: getDeploymentWatchOBVStatus(closed2h, false),
-      obv30m: getDeploymentWatchOBVStatus(closed30m, true)
-    };
-  } catch (error) {
-    log(`⚠️ Deployment early-watch OBV check failed for ${symbol}: ${error?.message || error}`);
-    return {
-      obv2h: { status: "UNAVAILABLE", reason: "fetch/calculation error" },
-      obv30m: { status: "UNAVAILABLE", reason: "fetch/calculation error" }
-    };
-  }
-}
-
-async function startConsolidationDeploymentEarlyWatch(symbol, phase) {
-  const bias = await getConsolidationDeploymentWatchBias(symbol);
-  const direction = bias.obv2h.status;
-  if ((direction !== "BUY" && direction !== "SELL") || bias.obv30m.status !== "NEUTRAL") return;
-
-  phase.deploymentWatch = {
-    direction,
-    status: "EARLY_WATCH",
-    startedAt: Date.now()
-  };
-  await sendMessage(
-    `${direction === "BUY" ? "🟢" : "🔴"} *EARLY ${direction === "BUY" ? "BULLISH" : "BEARISH"} DEPLOYMENT WATCH — ${symbol}*\n\n` +
-    `Price action: *15M consolidation detected*\n` +
-    `2H OBV: *${direction}* ( ${OBV_EMA_LENGTH}-EMA )\n` +
-    `30M OBV: *NEUTRAL* (within the approved 5% range band around its ${OBV_EMA_LENGTH}-EMA)\n\n` +
-    `_Early heads-up only. This is not an entry signal and does not activate the robot or change any execution conditions. Wait for the existing strategy's normal setup and entry checks._`
-  );
-}
-
-async function updateConsolidationDeploymentEarlyWatch(symbol, phase) {
-  const watch = phase?.deploymentWatch;
-  if (!watch || watch.status !== "EARLY_WATCH") return;
-
-  const bias = await getConsolidationDeploymentWatchBias(symbol);
-  const twoHour = bias.obv2h.status;
-  const thirtyMinute = bias.obv30m.status;
-  // Missing data is not treated as neutral or as an invalidation.
-  if (twoHour === "UNAVAILABLE" || thirtyMinute === "UNAVAILABLE") return;
-
-  if (twoHour !== watch.direction || thirtyMinute === (watch.direction === "BUY" ? "SELL" : "BUY")) {
-    watch.status = "INVALIDATED";
-    watch.invalidatedAt = Date.now();
-    await sendMessage(
-      `⚪ *EARLY ${watch.direction === "BUY" ? "BULLISH" : "BEARISH"} WATCH INVALIDATED — ${symbol}*\n\n` +
-      `2H OBV: *${twoHour}*\n30M OBV: *${thirtyMinute}*\n` +
-      `_The original early-watch conditions no longer hold. Informational only; trade execution logic is unchanged._`
-    );
-    return;
-  }
-
-  if (thirtyMinute === watch.direction) {
-    watch.status = "CONFIRMED";
-    watch.confirmedAt = Date.now();
-    await sendMessage(
-      `${watch.direction === "BUY" ? "📈" : "📉"} *${watch.direction === "BUY" ? "BULLISH" : "BEARISH"} MOMENTUM CONFIRMATION — ${symbol}*\n\n` +
-      `2H OBV: *${twoHour}*\n30M OBV: *${thirtyMinute}*\n` +
-      `The 30M OBV has moved out of its neutral band and aligned with the 2H bias.\n\n` +
-      `_Informational confirmation only. This does not activate the robot or bypass any existing entry checks._`
-    );
-  }
-}
-
 async function monitorPriceActionDeltaPhases() {
   if (priceActionDeltaPhaseMonitorRunning) return;
   priceActionDeltaPhaseMonitorRunning = true;
@@ -701,14 +569,6 @@ async function monitorPriceActionDeltaPhases() {
         if (!latest || !Number.isFinite(latest.time)) continue;
 
         let phase = priceActionDeltaPhaseState[symbol];
-
-        if (phase && Array.isArray(phase.candles)) {
-          try {
-            await updateConsolidationDeploymentEarlyWatch(symbol, phase);
-          } catch (watchUpdateError) {
-            log(`⚠️ Deployment early-watch update failed for ${symbol}: ${watchUpdateError?.message || watchUpdateError}`);
-          }
-        }
 
         // Early informational alert on the first live price break of an active
         // consolidation boundary. It is one-shot per phase and does not classify
@@ -885,14 +745,6 @@ async function monitorPriceActionDeltaPhases() {
           low: stats.low,
           lastStatusMessageTime: latest.time
         };
-
-        // Add an informational deployment heads-up using the same consolidation trigger.
-        // This does not affect activation, setup qualification, or order execution.
-        try {
-          await startConsolidationDeploymentEarlyWatch(symbol, priceActionDeltaPhaseState[symbol]);
-        } catch (watchStartError) {
-          log(`⚠️ Deployment early-watch start failed for ${symbol}: ${watchStartError?.message || watchStartError}`);
-        }
       } catch (err) {
         log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
       }
@@ -2264,6 +2116,82 @@ async function finalizeScript2ZoneAbsorptionObservation(symbol, now) {
   // Zone-absorption end reports are intentionally disabled.
 
   delete script2ZoneAbsorptionState[symbol];
+}
+
+// =====================================================
+// SCRIPT 2 — OPPOSING ABSORPTION ENTRY PROTECTION
+// =====================================================
+// Strong-only filter: the intended side is aggressively trading, but price
+// makes little progress and leaves a pronounced rejection wick. This is
+// checked on CLOSED 5M candles; it never changes direction or trade sizing.
+const SCRIPT2_OPPOSING_ABSORPTION_VOLUME_MULTIPLE = 2.0;
+const SCRIPT2_OPPOSING_ABSORPTION_MIN_AGGRESSOR_PCT = 60;
+const SCRIPT2_OPPOSING_ABSORPTION_MAX_BODY_RATIO = 0.35;
+const SCRIPT2_OPPOSING_ABSORPTION_MIN_REJECTION_WICK_RATIO = 0.45;
+const script2OpposingAbsorptionAlertState = {};
+
+function detectScript2OpposingAbsorption(closedCandles, intendedDirection) {
+  if (!Array.isArray(closedCandles) || closedCandles.length < 22 || !["BUY", "SELL"].includes(intendedDirection)) {
+    return null;
+  }
+
+  const baseline = closedCandles.slice(-21, -1);
+  const candle = closedCandles[closedCandles.length - 1];
+  const open = Number(candle?.open);
+  const high = Number(candle?.high);
+  const low = Number(candle?.low);
+  const close = Number(candle?.close);
+  const volume = Number(candle?.volume);
+  const takerBuyVolume = Number(candle?.takerBuyVolume);
+
+  if (
+    ![open, high, low, close, volume, takerBuyVolume].every(Number.isFinite) ||
+    volume <= 0 || takerBuyVolume < 0 || takerBuyVolume > volume
+  ) return null;
+
+  const averageVolume = baseline.reduce((sum, item) => {
+    const value = Number(item?.volume);
+    return sum + (Number.isFinite(value) && value > 0 ? value : 0);
+  }, 0) / baseline.length;
+  if (!Number.isFinite(averageVolume) || averageVolume <= 0) return null;
+
+  const range = high - low;
+  if (!(range > 0)) return null;
+
+  const bodyRatio = Math.abs(close - open) / range;
+  const upperWickRatio = (high - Math.max(open, close)) / range;
+  const lowerWickRatio = (Math.min(open, close) - low) / range;
+  const effortRatio = volume / averageVolume;
+  const buySharePct = (takerBuyVolume / volume) * 100;
+  const sellSharePct = 100 - buySharePct;
+
+  // BUY pressure absorbed by sellers: aggressive buyers, weak upward result,
+  // and a pronounced upper rejection wick.
+  const bearishAbsorption = intendedDirection === "BUY" &&
+    buySharePct >= SCRIPT2_OPPOSING_ABSORPTION_MIN_AGGRESSOR_PCT &&
+    effortRatio >= SCRIPT2_OPPOSING_ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= SCRIPT2_OPPOSING_ABSORPTION_MAX_BODY_RATIO &&
+    upperWickRatio >= SCRIPT2_OPPOSING_ABSORPTION_MIN_REJECTION_WICK_RATIO;
+
+  // SELL pressure absorbed by buyers: aggressive sellers, weak downward result,
+  // and a pronounced lower rejection wick.
+  const bullishAbsorption = intendedDirection === "SELL" &&
+    sellSharePct >= SCRIPT2_OPPOSING_ABSORPTION_MIN_AGGRESSOR_PCT &&
+    effortRatio >= SCRIPT2_OPPOSING_ABSORPTION_VOLUME_MULTIPLE &&
+    bodyRatio <= SCRIPT2_OPPOSING_ABSORPTION_MAX_BODY_RATIO &&
+    lowerWickRatio >= SCRIPT2_OPPOSING_ABSORPTION_MIN_REJECTION_WICK_RATIO;
+
+  if (!bearishAbsorption && !bullishAbsorption) return null;
+
+  return {
+    type: bearishAbsorption ? "BEARISH ABSORPTION" : "BULLISH ABSORPTION",
+    opposingSide: bearishAbsorption ? "SELLERS" : "BUYERS",
+    effortRatio,
+    aggressorSharePct: intendedDirection === "BUY" ? buySharePct : sellSharePct,
+    bodyRatio,
+    rejectionWickRatio: intendedDirection === "BUY" ? upperWickRatio : lowerWickRatio,
+    candleKey: getScript2CandleKey(candle, String(closedCandles.length - 1))
+  };
 }
 
 function calculateOneCandleVolumeImbalance(candles) {
@@ -5249,6 +5177,28 @@ if (deltaGateState.confirmed) {
   const direction = deltaGateState.alignmentDirection;
   const existing = script2PendingSetups[symbol];
 
+  // First protective check: do not create a pending setup when strong opposing
+  // absorption is present on the latest CLOSED 5M candle. Reassess on the next
+  // main scan; an absent signal allows the normal setup flow to continue.
+  const setupStageAbsorption = detectScript2OpposingAbsorption(closedCandles5, direction);
+  if (setupStageAbsorption) {
+    const alertKey = `${direction}:${setupStageAbsorption.candleKey}`;
+    if (script2OpposingAbsorptionAlertState[symbol] !== alertKey) {
+      script2OpposingAbsorptionAlertState[symbol] = alertKey;
+      await sendMessage(
+        `🛑 *ENTRY PROTECTION — OPPOSING ABSORPTION* — *${symbol}*\n\n` +
+        `Intended direction: *${direction}*\n` +
+        `Detected: *${setupStageAbsorption.type}* (${setupStageAbsorption.opposingSide})\n` +
+        `5M volume vs 20-bar average: *${setupStageAbsorption.effortRatio.toFixed(2)}x*\n` +
+        `Intended-side aggressive volume: *${setupStageAbsorption.aggressorSharePct.toFixed(1)}%*\n` +
+        `Candle body/range: *${(setupStageAbsorption.bodyRatio * 100).toFixed(1)}%*\n` +
+        `Rejection wick/range: *${(setupStageAbsorption.rejectionWickRatio * 100).toFixed(1)}%*\n\n` +
+        `Pending setup creation is temporarily blocked. Script 2 will reassess on a later scan; no trade was placed.`
+      );
+    }
+    continue;
+  }
+
   // A directional Delta-strength unlock creates a simple pending entry setup.
   // The only remaining market-entry confirmation is >=60% directional volume
   // imbalance on the latest CLOSED 5M candle; liquidity is checked afterward.
@@ -5273,8 +5223,9 @@ if (deltaGateState.confirmed) {
   }
 }
 
-// No 1M three-candle sequence, BOS, retest, ATR-zone, or absorption condition
-// is required for this automatic entry path. Those diagnostics are not entry gates.
+// The dedicated opposing-absorption protection above is an entry gate.
+// Other 1M sequence, BOS, retest and ATR-zone diagnostics are not required
+// for this automatic entry path.
 
 
 // -----------------------------------------------------
@@ -5487,6 +5438,27 @@ async function monitorScript2ExecutionScanner() {
             `Scanner cadence: 10 seconds.`
           );
         }
+
+        // Second protective check: re-evaluate opposing absorption immediately
+        // before the live imbalance/liquidity/order path. A block is temporary;
+        // the pending setup remains available for reassessment on later cycles.
+        const executionStageAbsorption = detectScript2OpposingAbsorption(closedCandles5, direction);
+        if (executionStageAbsorption) {
+          const absorptionBlockKey = `OPPOSING_ABSORPTION:${direction}:${executionStageAbsorption.candleKey}`;
+          if (setup.executionScannerLastAbsorptionBlockKey !== absorptionBlockKey) {
+            setup.executionScannerLastAbsorptionBlockKey = absorptionBlockKey;
+            awaitSendScript2Checkpoint(
+              `🛑 *ENTRY TEMPORARILY BLOCKED — OPPOSING ABSORPTION* — *${symbol}*\n` +
+              `Intended direction: *${direction}*\n` +
+              `Detected: *${executionStageAbsorption.type}* (${executionStageAbsorption.opposingSide})\n` +
+              `5M volume vs 20-bar average: *${executionStageAbsorption.effortRatio.toFixed(2)}x*\n` +
+              `Intended-side aggressive volume: *${executionStageAbsorption.aggressorSharePct.toFixed(1)}%*\n` +
+              `The pending setup is retained. The scanner will reassess after the next closed 5M candle; no order was placed.`
+            );
+          }
+          continue;
+        }
+        setup.executionScannerLastAbsorptionBlockKey = null;
 
         // Entry confirmation: inspect the CURRENT FORMING 5M candle on every
         // scanner pass. Binance's latest kline is still live until its close time.
