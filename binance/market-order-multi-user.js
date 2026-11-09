@@ -896,8 +896,9 @@ const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 // is measured against either the current-day or previous-day high/low.
 const SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR = 0.20;
 
-// 5M ATR-band calculations are retained only for existing trade-progress context.
-// ATR contraction/expansion is NOT an entry condition.
+// 5M ATR bands are also used as a closed-candle entry-direction/expansion gate.
+// BUY: upper band rising AND total band width expanding.
+// SELL: upper band falling AND total band width expanding.
 const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
@@ -5459,6 +5460,67 @@ async function monitorScript2ExecutionScanner() {
           continue;
         }
         setup.executionScannerLastAbsorptionBlockKey = null;
+
+        // ATR-band entry gate: calculate exclusively from CLOSED 5M candles.
+        // A BUY requires the upper band to rise while total band width expands.
+        // A SELL requires the upper band to fall while total band width expands.
+        // If either condition fails, retain the pending setup and reassess after
+        // each newly closed 5M candle; never use the still-forming 5M candle.
+        const closed5mBands = calculate5MATRBands(closedCandles5);
+        if (!closed5mBands?.current || !closed5mBands?.previous) {
+          const atrWarnKey = `ATR_BANDS_DATA_PENDING:${candleKey}`;
+          if (setup.executionScannerLastATRBandBlockKey !== atrWarnKey) {
+            setup.executionScannerLastATRBandBlockKey = atrWarnKey;
+            awaitSendScript2Checkpoint(
+              `⏳ *5M ATR BANDS PENDING* — *${symbol}*\n` +
+              `Direction: *${direction}*\n` +
+              `Insufficient closed-5M-candle history to calculate the ATR bands. Setup retained; no order placed.`
+            );
+          }
+          continue;
+        }
+
+        const currentATRUpper = Number(closed5mBands.current.upper);
+        const previousATRUpper = Number(closed5mBands.previous.upper);
+        const currentATRWidth = Number(closed5mBands.current.width);
+        const previousATRWidth = Number(closed5mBands.previous.width);
+        const atrUpperRising = currentATRUpper > previousATRUpper;
+        const atrUpperFalling = currentATRUpper < previousATRUpper;
+        const atrBandsExpanding = currentATRWidth > previousATRWidth;
+        const atrDirectionPassed = direction === "BUY" ? atrUpperRising : atrUpperFalling;
+        const atrBandsPassed = atrDirectionPassed && atrBandsExpanding;
+        const atrBandCandleKey = getScript2CandleKey(
+          closed5mBands.current,
+          `CLOSED_5M_ATR_${closed5mBands.current.time ?? candleKey}`
+        );
+
+        if (!atrBandsPassed) {
+          const atrBlockKey = `ATR_BANDS_PENDING:${atrBandCandleKey}:${direction}:${atrUpperRising}:${atrUpperFalling}:${atrBandsExpanding}`;
+          if (setup.executionScannerLastATRBandBlockKey !== atrBlockKey) {
+            setup.executionScannerLastATRBandBlockKey = atrBlockKey;
+            const directionText = direction === "BUY" ? "upper ATR band must be rising" : "upper ATR band must be falling";
+            awaitSendScript2Checkpoint(
+              `⏳ *5M ATR BANDS FILTER PENDING* — *${symbol}*\n` +
+              `Direction: *${direction}*\n` +
+              `Upper band: *${atrUpperRising ? "RISING" : atrUpperFalling ? "FALLING" : "FLAT"}* (required: ${directionText}).\n` +
+              `Band width: *${atrBandsExpanding ? "EXPANDING" : "NOT EXPANDING"}* (expansion required).\n` +
+              `Latest completed 5M candle did not pass both conditions. Setup retained; no order placed.`
+            );
+          }
+          setup.atrBandsNotified = false;
+          continue;
+        }
+
+        setup.executionScannerLastATRBandBlockKey = null;
+        if (!setup.atrBandsNotified || setup.atrBandsPassedCandleKey !== atrBandCandleKey) {
+          setup.atrBandsNotified = true;
+          setup.atrBandsPassedCandleKey = atrBandCandleKey;
+          awaitSendScript2Checkpoint(
+            `✅ *5M ATR BANDS FILTER PASSED* — *${symbol}*\n` +
+            `Direction: *${direction}* | Upper band: *${direction === "BUY" ? "RISING" : "FALLING"}* | Band width: *EXPANDING*.\n` +
+            `Confirmed using the latest completed 5M candle.`
+          );
+        }
 
         // Entry confirmation: inspect the CURRENT FORMING 5M candle on every
         // scanner pass. Binance's latest kline is still live until its close time.
