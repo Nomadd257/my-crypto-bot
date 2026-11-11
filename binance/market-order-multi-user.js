@@ -1899,16 +1899,15 @@ async function monitor4HLiquidityZoneVolume(symbol, closedCandles4H, currentPric
   })).filter(level => level.distancePercent <= FOUR_H_LIQUIDITY_ZONE_TOLERANCE_PERCENT)
     .sort((a, b) => a.distancePercent - b.distancePercent);
 
-  if (!nearby.length) {
-    fourHLiquidityReportState[symbol] = { ...(fourHLiquidityReportState[symbol] || {}), inZone: false };
-    return;
-  }
+  if (!nearby.length) return;
   const zone = nearby[0];
-  const zoneKey = `${zone.type}|${Number(zone.price).toPrecision(12)}`;
-  const prior = fourHLiquidityReportState[symbol];
-  if (prior?.inZone && prior.zoneKey === zoneKey) return;
-
   const candle = closedCandles4H[closedCandles4H.length - 1];
+  // At most one report per symbol for each newly completed 4H candle,
+  // even if the monitor checks repeatedly or price leaves/re-enters the zone.
+  const candleKey = String(candle?.time ?? '');
+  if (!candleKey) return;
+  const prior = fourHLiquidityReportState[symbol];
+  if (prior?.lastReportedCandleKey === candleKey) return;
   const totalVolume = Number(candle?.volume);
   const takerBuyVolume = Number(candle?.takerBuyVolume);
   if (!Number.isFinite(totalVolume) || totalVolume <= 0 ||
@@ -1920,20 +1919,16 @@ async function monitor4HLiquidityZoneVolume(symbol, closedCandles4H, currentPric
   const delta = takerBuyVolume - sellVolume;
   const dominant = buyPct > sellPct ? 'BUYERS' : sellPct > buyPct ? 'SELLERS' : 'BALANCED';
   const message =
-    `📊 *4H LIQUIDITY ZONE — TAKER VOLUME REPORT*\n\n` +
-    `🪙 Symbol: *${symbol}*\n` +
-    `📍 Zone: *${zone.type}*\n` +
-    `🎯 Zone Price: *${zone.price}*\n` +
-    `💰 Current Price: *${Number(currentPrice)}*\n` +
-    `↔️ Distance: *${zone.distancePercent.toFixed(4)}%*\n\n` +
-    `⏱️ Volume source: *Latest CLOSED 4H candle*\n` +
-    `🟢 Buying (Binance taker buy): *${buyPct.toFixed(2)}%*\n` +
-    `🔴 Selling (total minus taker buy): *${sellPct.toFixed(2)}%*\n` +
-    `⚖️ Net Delta: *${delta.toLocaleString(undefined, { maximumFractionDigits: 4 })}*\n` +
-    `📌 Dominant pressure: *${dominant}*\n\n` +
-    `ℹ️ Informational only. This report does not activate the coin or trigger a trade.`;
+    `📊 *4H LIQUIDITY — ${symbol}*\n` +
+    `Zone: *${zone.type} @ ${zone.price}*\n` +
+    `🟢 Buy: *${buyPct.toFixed(1)}%* | 🔴 Sell: *${sellPct.toFixed(1)}%*\n` +
+    `Delta: *${delta.toLocaleString(undefined, { maximumFractionDigits: 3 })}* | *${dominant}*`;
   await sendMessage(message);
-  fourHLiquidityReportState[symbol] = { zoneKey, inZone: true, reportedAt: Date.now() };
+  fourHLiquidityReportState[symbol] = {
+    lastReportedCandleKey: candleKey,
+    zoneKey: `${zone.type}|${Number(zone.price).toPrecision(12)}`,
+    reportedAt: Date.now()
+  };
   log(`📊 4H liquidity volume report ${symbol}: ${zone.type} @ ${zone.price}, buy=${buyPct.toFixed(2)}%, sell=${sellPct.toFixed(2)}%`);
 }
 
@@ -2895,20 +2890,14 @@ async function monitor5MLiquidityZoneVolume(symbol, closedCandles5M, currentPric
   });
   if (!delta || delta.touchedCandles === 0 || delta.totalVolume <= 0) return;
 
+  const netDelta = delta.bullishVolume - delta.bearishVolume;
+  const dominant = delta.bullishPct > delta.bearishPct
+    ? "BUYERS" : delta.bearishPct > delta.bullishPct ? "SELLERS" : "BALANCED";
   const message =
-    `📊 *5M LIQUIDITY ZONE — TAKER VOLUME REPORT*\n\n` +
-    `🪙 Symbol: *${symbol}*\n` +
-    `📍 Zone: *${zone.type}*\n` +
-    `🎯 Zone Price: *${Number(zone.price)}*\n` +
-    `💰 Current Price: *${Number(currentPrice)}*\n` +
-    `↔️ Distance: *${zone.distancePercent.toFixed(4)}%*\n\n` +
-    `⏱️ Volume source: *Closed 5M candles overlapping the zone*\n` +
-    `🟢 Binance taker-buy: *${delta.bullishPct.toFixed(2)}%*\n` +
-    `🔴 Binance taker-sell: *${delta.bearishPct.toFixed(2)}%*\n` +
-    `⚖️ Net Delta: *${(delta.bullishVolume - delta.bearishVolume).toLocaleString(undefined, { maximumFractionDigits: 6 })}*\n` +
-    `📌 Pressure: *${delta.bias}*\n` +
-    `🕯️ Overlapping candles: *${delta.touchedCandles}*\n\n` +
-    `ℹ️ Informational only. This report does not create or execute a trade.`;
+    `📊 *5M LIQUIDITY — ${symbol}*\n` +
+    `Zone: *${zone.type} @ ${Number(zone.price)}*\n` +
+    `🟢 Buy: *${delta.bullishPct.toFixed(1)}%* | 🔴 Sell: *${delta.bearishPct.toFixed(1)}%*\n` +
+    `Delta: *${netDelta.toLocaleString(undefined, { maximumFractionDigits: 3 })}* | *${dominant}*`;
 
   await sendMessage(message);
   fiveMLiquidityReportState[symbol] = { zoneKey, inZone: true, reportedAt: Date.now() };
