@@ -1881,6 +1881,63 @@ function detectScript2Absorption(candles, zone) {
 
 
 // =====================================================
+// INDEPENDENT 4H LIQUIDITY-ZONE TAKER-VOLUME REPORT
+// Runs for all configured symbols, including symbols not activated for trading.
+// Closed 4H candles supply liquidity levels and Binance taker volume;
+// live mark price is used only to detect arrival at a zone. Informational only.
+// =====================================================
+const fourHLiquidityReportState = {};
+const FOUR_H_LIQUIDITY_ZONE_TOLERANCE_PERCENT = SL_LIQUIDITY_EQUAL_LEVEL_PERCENT;
+
+async function monitor4HLiquidityZoneVolume(symbol, closedCandles4H, currentPrice) {
+  if (!Array.isArray(closedCandles4H) || closedCandles4H.length < 20 ||
+      !Number.isFinite(Number(currentPrice)) || Number(currentPrice) <= 0) return;
+  const levels = detectPotentialLiquidityLevels(closedCandles4H);
+  const nearby = levels.map(level => ({
+    ...level,
+    distancePercent: percentDistance(Number(currentPrice), Number(level.price))
+  })).filter(level => level.distancePercent <= FOUR_H_LIQUIDITY_ZONE_TOLERANCE_PERCENT)
+    .sort((a, b) => a.distancePercent - b.distancePercent);
+
+  if (!nearby.length) {
+    fourHLiquidityReportState[symbol] = { ...(fourHLiquidityReportState[symbol] || {}), inZone: false };
+    return;
+  }
+  const zone = nearby[0];
+  const zoneKey = `${zone.type}|${Number(zone.price).toPrecision(12)}`;
+  const prior = fourHLiquidityReportState[symbol];
+  if (prior?.inZone && prior.zoneKey === zoneKey) return;
+
+  const candle = closedCandles4H[closedCandles4H.length - 1];
+  const totalVolume = Number(candle?.volume);
+  const takerBuyVolume = Number(candle?.takerBuyVolume);
+  if (!Number.isFinite(totalVolume) || totalVolume <= 0 ||
+      !Number.isFinite(takerBuyVolume) || takerBuyVolume < 0 || takerBuyVolume > totalVolume) return;
+
+  const buyPct = takerBuyVolume / totalVolume * 100;
+  const sellVolume = totalVolume - takerBuyVolume;
+  const sellPct = sellVolume / totalVolume * 100;
+  const delta = takerBuyVolume - sellVolume;
+  const dominant = buyPct > sellPct ? 'BUYERS' : sellPct > buyPct ? 'SELLERS' : 'BALANCED';
+  const message =
+    `📊 *4H LIQUIDITY ZONE — TAKER VOLUME REPORT*\n\n` +
+    `🪙 Symbol: *${symbol}*\n` +
+    `📍 Zone: *${zone.type}*\n` +
+    `🎯 Zone Price: *${zone.price}*\n` +
+    `💰 Current Price: *${Number(currentPrice)}*\n` +
+    `↔️ Distance: *${zone.distancePercent.toFixed(4)}%*\n\n` +
+    `⏱️ Volume source: *Latest CLOSED 4H candle*\n` +
+    `🟢 Buying (Binance taker buy): *${buyPct.toFixed(2)}%*\n` +
+    `🔴 Selling (total minus taker buy): *${sellPct.toFixed(2)}%*\n` +
+    `⚖️ Net Delta: *${delta.toLocaleString(undefined, { maximumFractionDigits: 4 })}*\n` +
+    `📌 Dominant pressure: *${dominant}*\n\n` +
+    `ℹ️ Informational only. This report does not activate the coin or trigger a trade.`;
+  await sendMessage(message);
+  fourHLiquidityReportState[symbol] = { zoneKey, inZone: true, reportedAt: Date.now() };
+  log(`📊 4H liquidity volume report ${symbol}: ${zone.type} @ ${zone.price}, buy=${buyPct.toFixed(2)}%, sell=${sellPct.toFixed(2)}%`);
+}
+
+// =====================================================
 // SCRIPT 2 — LIQUIDITY-ZONE ABSORPTION OBSERVATION
 // =====================================================
 // Observation only. This tracker does NOT approve, delay, block, or trigger
@@ -2734,11 +2791,9 @@ function formatScript2Zone(zone) {
   return `${zone.type}: ${Number(zone.price).toPrecision(8)}`;
 }
 
-// Flux Charts-style volume-delta estimate, applied ONLY to Script 2's
-// already-detected liquidity/order-block zone. Uses closed 5M candles so it
-// does not add Binance requests or change the existing 15M/5M delta unlock.
-// Candle volume is classified by candle direction, matching the indicator's
-// documented chart-timeframe method (not true exchange aggressor-side volume).
+// 5M zone taker-volume report. Uses Binance Futures kline taker-buy
+// base volume; sell volume is total base volume minus taker-buy volume.
+// Only CLOSED 5M candles whose traded range overlaps the reported zone count.
 const SCRIPT2_ZONE_DELTA_DOMINANCE_PCT = 55;
 
 function calculateScript2ZoneVolumeDelta(candles, zone) {
@@ -2746,7 +2801,6 @@ function calculateScript2ZoneVolumeDelta(candles, zone) {
 
   let zoneLow;
   let zoneHigh;
-
   if (zone.kind === "ORDER_BLOCK") {
     zoneLow = Number(zone.low);
     zoneHigh = Number(zone.high);
@@ -2757,67 +2811,36 @@ function calculateScript2ZoneVolumeDelta(candles, zone) {
     zoneLow = level - tolerance;
     zoneHigh = level + tolerance;
   }
-
-  if (!Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh) || zoneHigh < zoneLow) {
-    return null;
-  }
+  if (!Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh) || zoneHigh < zoneLow) return null;
 
   let bullishVolume = 0;
   let bearishVolume = 0;
   let touchedCandles = 0;
-
-  // Use the same recent closed 5M candle window used by zone discovery.
   for (const candle of candles.slice(-SCRIPT2_ZONE_LOOKBACK_CANDLES)) {
-    const open = Number(candle?.open);
-    const close = Number(candle?.close);
     const high = Number(candle?.high);
     const low = Number(candle?.low);
     const volume = Number(candle?.volume);
-
-    if (![open, close, high, low, volume].every(Number.isFinite) || volume < 0) continue;
-    // A candle contributes when its traded range overlaps the active zone band.
+    const takerBuyVolume = Number(candle?.takerBuyVolume);
+    if (![high, low, volume, takerBuyVolume].every(Number.isFinite) ||
+        volume <= 0 || takerBuyVolume < 0 || takerBuyVolume > volume) continue;
     if (high < zoneLow || low > zoneHigh) continue;
-
     touchedCandles += 1;
-    if (close > open) bullishVolume += volume;
-    else if (close < open) bearishVolume += volume;
-    else {
-      bullishVolume += volume / 2;
-      bearishVolume += volume / 2;
-    }
+    bullishVolume += takerBuyVolume;
+    bearishVolume += volume - takerBuyVolume;
   }
 
   const totalVolume = bullishVolume + bearishVolume;
   if (touchedCandles === 0 || totalVolume <= 0) {
-    return {
-      bullishVolume,
-      bearishVolume,
-      totalVolume,
-      touchedCandles,
-      bullishPct: 0,
-      bearishPct: 0,
-      bias: "MIXED",
-      dominantPct: 0
-    };
+    return { bullishVolume, bearishVolume, totalVolume, touchedCandles,
+      bullishPct: 0, bearishPct: 0, bias: "MIXED", dominantPct: 0 };
   }
-
-  const bullishPct = (bullishVolume / totalVolume) * 100;
-  const bearishPct = (bearishVolume / totalVolume) * 100;
+  const bullishPct = bullishVolume / totalVolume * 100;
+  const bearishPct = bearishVolume / totalVolume * 100;
   const dominantPct = Math.max(bullishPct, bearishPct);
   const bias = dominantPct < SCRIPT2_ZONE_DELTA_DOMINANCE_PCT
-    ? "MIXED"
-    : bullishPct > bearishPct ? "BUY-SIDE DOMINANT" : "SELL-SIDE DOMINANT";
-
-  return {
-    bullishVolume,
-    bearishVolume,
-    totalVolume,
-    touchedCandles,
-    bullishPct,
-    bearishPct,
-    bias,
-    dominantPct
-  };
+    ? "MIXED" : bullishPct > bearishPct ? "BUY-SIDE DOMINANT" : "SELL-SIDE DOMINANT";
+  return { bullishVolume, bearishVolume, totalVolume, touchedCandles,
+    bullishPct, bearishPct, bias, dominantPct };
 }
 
 function formatScript2ZoneVolumeDelta(delta) {
@@ -2830,11 +2853,66 @@ function formatScript2ZoneVolumeDelta(delta) {
     ? `MIXED (no side reached ${SCRIPT2_ZONE_DELTA_DOMINANCE_PCT}%)`
     : `${delta.bias} (${delta.dominantPct.toFixed(1)}%)`;
 
-  return `📊 *ZONE VOLUME DELTA — 5M*\n` +
-    `🟢 Bullish volume: *${delta.bullishPct.toFixed(1)}%*\n` +
-    `🔴 Bearish volume: *${delta.bearishPct.toFixed(1)}%*\n` +
+  return `📊 *ZONE TAKER VOLUME — 5M (BINANCE)*\n` +
+    `🟢 Taker-buy volume: *${delta.bullishPct.toFixed(1)}%*\n` +
+    `🔴 Taker-sell volume: *${delta.bearishPct.toFixed(1)}%*\n` +
     `🧭 Pressure: *${biasText}*\n` +
     `🕯️ Zone-overlapping candles: *${delta.touchedCandles}*`;
+}
+
+// =====================================================
+// INDEPENDENT 5M LIQUIDITY-ZONE TAKER-VOLUME REPORT
+// Active symbols only. Runs independently of SL diagnostics and trade entry.
+// Zone levels come from completed 5M candles; Binance taker volume is
+// aggregated from completed 5M candles overlapping the zone.
+// =====================================================
+const fiveMLiquidityReportState = {};
+const FIVE_M_LIQUIDITY_ZONE_TOLERANCE_PERCENT = SCRIPT2_ZONE_TOLERANCE_PERCENT;
+
+async function monitor5MLiquidityZoneVolume(symbol, closedCandles5M, currentPrice) {
+  if (!Array.isArray(closedCandles5M) || closedCandles5M.length < 20 ||
+      !Number.isFinite(Number(currentPrice)) || Number(currentPrice) <= 0) return;
+
+  const levels = detectPotentialLiquidityLevels(closedCandles5M);
+  const nearby = levels.map(level => ({
+    ...level,
+    distancePercent: percentDistance(Number(currentPrice), Number(level.price))
+  })).filter(level => level.distancePercent <= FIVE_M_LIQUIDITY_ZONE_TOLERANCE_PERCENT)
+    .sort((a, b) => a.distancePercent - b.distancePercent);
+
+  if (!nearby.length) {
+    fiveMLiquidityReportState[symbol] = { ...(fiveMLiquidityReportState[symbol] || {}), inZone: false };
+    return;
+  }
+
+  const zone = nearby[0];
+  const zoneKey = `${zone.type}|${Number(zone.price).toPrecision(12)}`;
+  const prior = fiveMLiquidityReportState[symbol];
+  if (prior?.inZone && prior.zoneKey === zoneKey) return;
+
+  const delta = calculateScript2ZoneVolumeDelta(closedCandles5M, {
+    kind: "LIQUIDITY", price: Number(zone.price), type: zone.type
+  });
+  if (!delta || delta.touchedCandles === 0 || delta.totalVolume <= 0) return;
+
+  const message =
+    `📊 *5M LIQUIDITY ZONE — TAKER VOLUME REPORT*\n\n` +
+    `🪙 Symbol: *${symbol}*\n` +
+    `📍 Zone: *${zone.type}*\n` +
+    `🎯 Zone Price: *${Number(zone.price)}*\n` +
+    `💰 Current Price: *${Number(currentPrice)}*\n` +
+    `↔️ Distance: *${zone.distancePercent.toFixed(4)}%*\n\n` +
+    `⏱️ Volume source: *Closed 5M candles overlapping the zone*\n` +
+    `🟢 Binance taker-buy: *${delta.bullishPct.toFixed(2)}%*\n` +
+    `🔴 Binance taker-sell: *${delta.bearishPct.toFixed(2)}%*\n` +
+    `⚖️ Net Delta: *${(delta.bullishVolume - delta.bearishVolume).toLocaleString(undefined, { maximumFractionDigits: 6 })}*\n` +
+    `📌 Pressure: *${delta.bias}*\n` +
+    `🕯️ Overlapping candles: *${delta.touchedCandles}*\n\n` +
+    `ℹ️ Informational only. This report does not create or execute a trade.`;
+
+  await sendMessage(message);
+  fiveMLiquidityReportState[symbol] = { zoneKey, inZone: true, reportedAt: Date.now() };
+  log(`📊 5M liquidity volume report ${symbol}: ${zone.type} @ ${zone.price}, buy=${delta.bullishPct.toFixed(2)}%, sell=${delta.bearishPct.toFixed(2)}%`);
 }
 
 function hasEntryVolumeImbalance(candles, direction) {
@@ -3830,6 +3908,7 @@ async function sendStopLossLiquidityReport(symbol, direction, entryPrice) {
     message += `\n\n📍 POC: *N/A*`;
   }
 
+
   await sendMessage(message);
 }
 
@@ -4798,7 +4877,34 @@ setInterval(async () => {
       const candles4HForAbsorption = await fetchFuturesKlines(symbol, "4h", 60);
       if (candles4HForAbsorption && candles4HForAbsorption.length >= 26) {
         const closedCandles4HForAbsorption = candles4HForAbsorption.slice(0, -1);
+        // Independent report runs before activation/trading gates.
+        let liveMarkPrice = Number(closes1H[closes1H.length - 1]);
+        try {
+          const markRes = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
+          if (markRes.ok) {
+            const markData = await markRes.json();
+            const parsedMark = Number(markData?.markPrice);
+            if (Number.isFinite(parsedMark) && parsedMark > 0) liveMarkPrice = parsedMark;
+          }
+        } catch {}
+        await monitor4HLiquidityZoneVolume(symbol, closedCandles4HForAbsorption, liveMarkPrice);
         await monitor4HAbsorptionContext(symbol, closedCandles4HForAbsorption, closedCandles1H);
+
+        // Independent 5M liquidity report is restricted to active coins.
+        // It runs before trading gates, but never for inactive symbols.
+        if (isActive) {
+          const candles5MForLiquidity = await fetchFuturesKlines(symbol, "5m", 100);
+          if (candles5MForLiquidity && candles5MForLiquidity.length > 20) {
+            const closedCandles5MForLiquidity = candles5MForLiquidity.slice(0, -1);
+            await monitor5MLiquidityZoneVolume(symbol, closedCandles5MForLiquidity, liveMarkPrice);
+          }
+        } else {
+          // If a coin is inactive, it cannot emit a 5M report. Reset its
+          // interaction latch so activation while still at a zone can report.
+          fiveMLiquidityReportState[symbol] = {
+            ...(fiveMLiquidityReportState[symbol] || {}), inZone: false
+          };
+        }
       }
 
       // =============================
