@@ -1789,6 +1789,112 @@ function calculateOBVSeries(candles) {
 
 
 // =====================================================
+// 2H OBV / EMA FRESH-CROSS AUTO-ACTIVATION MONITOR
+// Uses completed 2H candles only. Separation is normalized
+// by the mean absolute OBV over the 20 candles preceding
+// the crossover candle to avoid division by a near-zero EMA.
+// =====================================================
+const OBV_AUTO_ACTIVATION_SEPARATION = 0.15;
+const OBV_AUTO_ACTIVATION_BASELINE_CANDLES = 20;
+const obvAutoActivationLastProcessed = {};
+const obvAutoActivationPendingCross = {};
+let obvAutoActivationMonitorRunning = false;
+
+async function monitorTwoHourObvEmaAutoActivation() {
+  if (obvAutoActivationMonitorRunning) return;
+  obvAutoActivationMonitorRunning = true;
+
+  try {
+    for (const symbol of COIN_LIST) {
+      try {
+        const candles = await fetchFuturesKlines(symbol, "2h", 100);
+        if (!Array.isArray(candles) || candles.length < OBV_EMA_LENGTH + OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 3) continue;
+
+        // Binance returns the currently forming candle last; exclude it.
+        const closed = candles.slice(0, -1);
+        const latest = closed[closed.length - 1];
+        const previous = closed[closed.length - 2];
+        if (!latest || !previous || !Number.isFinite(Number(latest.time))) continue;
+
+        // Process each newly completed 2H candle at most once per symbol.
+        if (obvAutoActivationLastProcessed[symbol] === latest.time) continue;
+        obvAutoActivationLastProcessed[symbol] = latest.time;
+
+        const obv = calculateOBVSeries(closed);
+        if (!Array.isArray(obv) || obv.length !== closed.length) continue;
+        const obvCandles = obv.map((value) => ({ close: value }));
+        const ema = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
+        if (!Array.isArray(ema) || ema.length !== obv.length) continue;
+
+        const last = obv.length - 1;
+        const priorObv = Number(obv[last - 1]);
+        const priorEma = Number(ema[last - 1]);
+        const currentObv = Number(obv[last]);
+        const currentEma = Number(ema[last]);
+        if (![priorObv, priorEma, currentObv, currentEma].every(Number.isFinite)) continue;
+
+        const crossedUp = priorObv <= priorEma && currentObv > currentEma;
+        const crossedDown = priorObv >= priorEma && currentObv < currentEma;
+
+        // Remember a fresh crossover even when its initial separation is below
+        // 15%. Keep watching completed 2H candles while OBV remains on the
+        // crossover side of its EMA.
+        if (crossedUp) {
+          obvAutoActivationPendingCross[symbol] = { direction: "BULLISH", time: latest.time };
+        } else if (crossedDown) {
+          obvAutoActivationPendingCross[symbol] = { direction: "BEARISH", time: latest.time };
+        }
+
+        const pending = obvAutoActivationPendingCross[symbol];
+        if (!pending) continue;
+
+        const directionStillValid =
+          (pending.direction === "BULLISH" && currentObv > currentEma) ||
+          (pending.direction === "BEARISH" && currentObv < currentEma);
+        if (!directionStillValid) {
+          delete obvAutoActivationPendingCross[symbol];
+          continue;
+        }
+
+        // Normalize separation using the 20 completed OBV observations
+        // immediately before the candle currently being evaluated.
+        const baseline = obv.slice(-(OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 1), -1);
+        if (baseline.length !== OBV_AUTO_ACTIVATION_BASELINE_CANDLES) continue;
+        const averageAbsoluteObv = baseline.reduce((sum, value) => sum + Math.abs(Number(value)), 0) / baseline.length;
+        if (!Number.isFinite(averageAbsoluteObv) || averageAbsoluteObv <= 0) continue;
+
+        const separation = Math.abs(currentObv - currentEma) / averageAbsoluteObv;
+        if (!Number.isFinite(separation) || separation < OBV_AUTO_ACTIVATION_SEPARATION) continue;
+
+        const direction = pending.direction;
+        const wasActive = symbolActive[symbol] === true;
+        // Same symbol state change performed by the admin /activate command.
+        symbolActive[symbol] = true;
+        delete obvAutoActivationPendingCross[symbol];
+        const separationPct = (separation * 100).toFixed(2);
+        const message =
+          `🔔 *2H OBV–EMA CROSSOVER ACTIVATION*\n\n` +
+          `🪙 Symbol: *${symbol}*\n` +
+          `📈 Direction: *${direction}*\n` +
+          `📏 OBV/EMA separation: *${separationPct}%*\n` +
+          `📊 Required: *15.00%* of average absolute OBV (20 prior closed 2H candles)\n` +
+          `🕒 Crossover candle: *${pending.time}*\n` +
+          (wasActive
+            ? `ℹ️ *${symbol}* was already active; activation state unchanged.`
+            : `✅ *${symbol}* automatically ACTIVATED for trading (same state change as /activate ${symbol}).`);
+        await sendMessage(message);
+        log(`2H OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; ${wasActive ? "already active" : "activated"}.`);
+      } catch (err) {
+        log(`❌ 2H OBV auto-activation monitor error ${symbol}: ${err?.message || err}`);
+      }
+    }
+  } finally {
+    obvAutoActivationMonitorRunning = false;
+  }
+}
+
+
+// =====================================================
 // SCRIPT 2 — ZONE + 1-CANDLE VOLUME IMBALANCE
 // =====================================================
 // Entry begins only after price reaches a detected liquidity
@@ -4752,6 +4858,10 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 let symbolActive = {};
 
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
+
+// Scan all configured symbols independently of their current activation state.
+// A fresh qualifying completed-2H OBV/EMA crossover can activate an inactive symbol.
+setInterval(monitorTwoHourObvEmaAutoActivation, 60 * 1000);
 
 // =====================================================
 // PRICE ACTIVATION MONITOR
