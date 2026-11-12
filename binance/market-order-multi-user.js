@@ -1794,7 +1794,7 @@ function calculateOBVSeries(candles) {
 // by the mean absolute OBV over the 20 candles preceding
 // the crossover candle to avoid division by a near-zero EMA.
 // =====================================================
-const OBV_AUTO_ACTIVATION_SEPARATION = 0.15;
+const OBV_AUTO_ACTIVATION_SEPARATION = 0.10;
 const OBV_AUTO_ACTIVATION_BASELINE_CANDLES = 20;
 const obvAutoActivationLastProcessed = {};
 const obvAutoActivationPendingCross = {};
@@ -1837,7 +1837,7 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const crossedDown = priorObv >= priorEma && currentObv < currentEma;
 
         // Remember a fresh crossover even when its initial separation is below
-        // 15%. Keep watching completed 2H candles while OBV remains on the
+        // 10%. Keep watching completed 2H candles while OBV remains on the
         // crossover side of its EMA.
         if (crossedUp) {
           obvAutoActivationPendingCross[symbol] = { direction: "BULLISH", time: latest.time };
