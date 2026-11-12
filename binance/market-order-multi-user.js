@@ -1837,7 +1837,7 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const crossedDown = priorObv >= priorEma && currentObv < currentEma;
 
         // Remember a fresh crossover even when its initial separation is below
-        // 10%. Keep watching completed 2H candles while OBV remains on the
+        // 15%. Keep watching completed 2H candles while OBV remains on the
         // crossover side of its EMA.
         if (crossedUp) {
           obvAutoActivationPendingCross[symbol] = { direction: "BULLISH", time: latest.time };
@@ -1877,7 +1877,7 @@ async function monitorTwoHourObvEmaAutoActivation() {
           `🪙 Symbol: *${symbol}*\n` +
           `📈 Direction: *${direction}*\n` +
           `📏 OBV/EMA separation: *${separationPct}%*\n` +
-          `📊 Required: *15.00%* of average absolute OBV (20 prior closed 2H candles)\n` +
+          `📊 Required: *10.00%* of average absolute OBV (20 prior closed 2H candles)\n` +
           `🕒 Crossover candle: *${pending.time}*\n` +
           (wasActive
             ? `ℹ️ *${symbol}* was already active; activation state unchanged.`
@@ -4662,6 +4662,25 @@ async function monitorPositions() {
               `Favorable price move: *+${move.toFixed(2)}%*\n` +
               `Monitoring for a return to entry. If price returns to entry, the /close ${symbol} routine will be triggered.`
             );
+          }
+
+          // 30-minute entry protection: if the existing +1% favorable
+          // break-even threshold has not been reached within 30 minutes,
+          // use the same shared symbol-wide close routine as /close SYMBOL.
+          // Once breakEvenActive is set, this timeout no longer applies.
+          const openedAt = Number(pos.openedAt);
+          const entryTimeoutMs = 30 * 60 * 1000;
+          if (
+            pos.breakEvenActive !== true &&
+            Number.isFinite(openedAt) &&
+            openedAt > 0 &&
+            Date.now() - openedAt >= entryTimeoutMs
+          ) {
+            await closeTrackedSymbolPositions(
+              symbol,
+              `30-minute protection: +${BREAK_EVEN_ACTIVATION_PCT.toFixed(2)}% break-even threshold was not reached within 30 minutes`
+            );
+            break;
           }
         }
 
