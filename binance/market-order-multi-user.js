@@ -1,4 +1,4 @@
-// v64: uses 2H+30M closed-candle OBV alignment; signed 5M Delta strength unlocks; requires 60% directional imbalance on a CLOSED 5M candle before liquidity and execution.
+// v76: removes the 5M ATR-bands execution gate; changes break-even timeout to 1 hour; uses live 2H OBV/EMA crossover with 10% separation; adds a 0.5% runner trailing stop after +3% profit.
 // =====================================================
 // FULL AUTO MULTI-USER MARKET ORDER BOT - BINANCE FUTURES (USDT-PERP)
 // v59 baseline: historical OBV and Delta strategy notes; current automatic setup unlock is defined in v63 above.
@@ -49,7 +49,7 @@ const LEVERAGE = 20;
 const BREAK_EVEN_ACTIVATION_PCT = 1; // Favorable price move from entry before break-even monitoring starts.
 const RUNNER_ACTIVATION_PCT = 2;
 const RUNNER_POST_ACTIVATION_EXTRA_PCT = 1;
-const RUNNER_POST_ACTIVATION_TIMEOUT_MS = 30 * 60 * 1000;
+const RUNNER_TRAILING_STOP_PCT = 0.5; // Runner trailing stop distance from the best live price.
 const SL_PCT = 1.8;
 const TRAILING_STOP_PCT = 5;
 const MONITOR_INTERVAL_MS = 5000;
@@ -896,9 +896,8 @@ const SCRIPT2_ZONE_LOOKBACK_CANDLES = 36;
 // is measured against either the current-day or previous-day high/low.
 const SCRIPT2_ATR_LOCATION_MAX_DISTANCE_ATR = 0.20;
 
-// 5M ATR bands are also used as a closed-candle entry-direction/expansion gate.
-// BUY: upper band rising AND total band width expanding.
-// SELL: upper band falling AND total band width expanding.
+// 5M ATR bands remain available for informational trade-progress reporting only.
+// They are not an entry or execution filter.
 const ATR_BAND_EMA_LENGTH = 20;
 const ATR_BAND_ATR_LENGTH = 14;
 const ATR_BAND_MULTIPLIER = 1;
@@ -1790,14 +1789,12 @@ function calculateOBVSeries(candles) {
 
 // =====================================================
 // 2H OBV / EMA FRESH-CROSS AUTO-ACTIVATION MONITOR
-// Uses completed 2H candles only. Separation is normalized
-// by the mean absolute OBV over the 20 candles preceding
-// the crossover candle to avoid division by a near-zero EMA.
+// Uses the live, currently forming 2H candle. Separation is normalized
+// by the mean absolute OBV over the 20 completed candles before it.
 // =====================================================
 const OBV_AUTO_ACTIVATION_SEPARATION = 0.10;
 const OBV_AUTO_ACTIVATION_BASELINE_CANDLES = 20;
-const obvAutoActivationLastProcessed = {};
-const obvAutoActivationPendingCross = {};
+const obvAutoActivationLastTriggeredCandle = {};
 let obvAutoActivationMonitorRunning = false;
 
 async function monitorTwoHourObvEmaAutoActivation() {
@@ -1810,18 +1807,14 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const candles = await fetchFuturesKlines(symbol, "2h", 100);
         if (!Array.isArray(candles) || candles.length < OBV_EMA_LENGTH + OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 3) continue;
 
-        // Binance returns the currently forming candle last; exclude it.
+        // Binance returns the currently forming 2H candle last. Include it
+        // so OBV/EMA and the crossover are recalculated from live volume/price.
+        const forming = candles[candles.length - 1];
         const closed = candles.slice(0, -1);
-        const latest = closed[closed.length - 1];
-        const previous = closed[closed.length - 2];
-        if (!latest || !previous || !Number.isFinite(Number(latest.time))) continue;
+        if (!forming || !closed.length || !Number.isFinite(Number(forming.time))) continue;
 
-        // Process each newly completed 2H candle at most once per symbol.
-        if (obvAutoActivationLastProcessed[symbol] === latest.time) continue;
-        obvAutoActivationLastProcessed[symbol] = latest.time;
-
-        const obv = calculateOBVSeries(closed);
-        if (!Array.isArray(obv) || obv.length !== closed.length) continue;
+        const obv = calculateOBVSeries(candles);
+        if (!Array.isArray(obv) || obv.length !== candles.length) continue;
         const obvCandles = obv.map((value) => ({ close: value }));
         const ema = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
         if (!Array.isArray(ema) || ema.length !== obv.length) continue;
@@ -1835,29 +1828,8 @@ async function monitorTwoHourObvEmaAutoActivation() {
 
         const crossedUp = priorObv <= priorEma && currentObv > currentEma;
         const crossedDown = priorObv >= priorEma && currentObv < currentEma;
+        if (!crossedUp && !crossedDown) continue;
 
-        // Remember a fresh crossover even when its initial separation is below
-        // 15%. Keep watching completed 2H candles while OBV remains on the
-        // crossover side of its EMA.
-        if (crossedUp) {
-          obvAutoActivationPendingCross[symbol] = { direction: "BULLISH", time: latest.time };
-        } else if (crossedDown) {
-          obvAutoActivationPendingCross[symbol] = { direction: "BEARISH", time: latest.time };
-        }
-
-        const pending = obvAutoActivationPendingCross[symbol];
-        if (!pending) continue;
-
-        const directionStillValid =
-          (pending.direction === "BULLISH" && currentObv > currentEma) ||
-          (pending.direction === "BEARISH" && currentObv < currentEma);
-        if (!directionStillValid) {
-          delete obvAutoActivationPendingCross[symbol];
-          continue;
-        }
-
-        // Normalize separation using the 20 completed OBV observations
-        // immediately before the candle currently being evaluated.
         const baseline = obv.slice(-(OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 1), -1);
         if (baseline.length !== OBV_AUTO_ACTIVATION_BASELINE_CANDLES) continue;
         const averageAbsoluteObv = baseline.reduce((sum, value) => sum + Math.abs(Number(value)), 0) / baseline.length;
@@ -1866,24 +1838,26 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const separation = Math.abs(currentObv - currentEma) / averageAbsoluteObv;
         if (!Number.isFinite(separation) || separation < OBV_AUTO_ACTIVATION_SEPARATION) continue;
 
-        const direction = pending.direction;
+        if (obvAutoActivationLastTriggeredCandle[symbol] === forming.time) continue;
+
+        const direction = crossedUp ? "BULLISH" : "BEARISH";
         const wasActive = symbolActive[symbol] === true;
+        obvAutoActivationLastTriggeredCandle[symbol] = forming.time;
         // Same symbol state change performed by the admin /activate command.
         symbolActive[symbol] = true;
-        delete obvAutoActivationPendingCross[symbol];
         const separationPct = (separation * 100).toFixed(2);
         const message =
-          `🔔 *2H OBV–EMA CROSSOVER ACTIVATION*\n\n` +
+          `🔔 *2H OBV–EMA LIVE CROSSOVER ACTIVATION*\n\n` +
           `🪙 Symbol: *${symbol}*\n` +
           `📈 Direction: *${direction}*\n` +
           `📏 OBV/EMA separation: *${separationPct}%*\n` +
           `📊 Required: *10.00%* of average absolute OBV (20 prior closed 2H candles)\n` +
-          `🕒 Crossover candle: *${pending.time}*\n` +
+          `🕒 Forming 2H candle: *${forming.time}*\n` +
           (wasActive
             ? `ℹ️ *${symbol}* was already active; activation state unchanged.`
             : `✅ *${symbol}* automatically ACTIVATED for trading (same state change as /activate ${symbol}).`);
         await sendMessage(message);
-        log(`2H OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; ${wasActive ? "already active" : "activated"}.`);
+        log(`2H live OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; ${wasActive ? "already active" : "activated"}.`);
       } catch (err) {
         log(`❌ 2H OBV auto-activation monitor error ${symbol}: ${err?.message || err}`);
       }
@@ -4140,8 +4114,7 @@ async function executeMarketOrderForAllUsers(symbol, direction) {
 // It does NOT replace or modify the existing:
 // • SL
 // • pre-runner trailing stop
-// • +2% runner activation
-// • 30-minute post-activation runner timeout
+// • +2% runner activation and the post-activation 0.5% trailing stop
 //
 // The monitor combines the same market context already used
 // by the bot: 4H trend/quality, 1H momentum + STC, 15M ATR
@@ -4664,12 +4637,12 @@ async function monitorPositions() {
             );
           }
 
-          // 30-minute entry protection: if the existing +1% favorable
-          // break-even threshold has not been reached within 30 minutes,
+          // 1-hour entry protection: if the existing +1% favorable
+          // break-even threshold has not been reached within 1 hour,
           // use the same shared symbol-wide close routine as /close SYMBOL.
           // Once breakEvenActive is set, this timeout no longer applies.
           const openedAt = Number(pos.openedAt);
-          const entryTimeoutMs = 30 * 60 * 1000;
+          const entryTimeoutMs = 60 * 60 * 1000;
           if (
             pos.breakEvenActive !== true &&
             Number.isFinite(openedAt) &&
@@ -4678,7 +4651,7 @@ async function monitorPositions() {
           ) {
             await closeTrackedSymbolPositions(
               symbol,
-              `30-minute protection: +${BREAK_EVEN_ACTIVATION_PCT.toFixed(2)}% break-even threshold was not reached within 30 minutes`
+              `1-hour protection: +${BREAK_EVEN_ACTIVATION_PCT.toFixed(2)}% break-even threshold was not reached within 1 hour`
             );
             break;
           }
@@ -4693,7 +4666,7 @@ async function monitorPositions() {
           pos.runnerActive = true;
           pos.runnerActivatedAt = Date.now();
           pos.runnerActivationMove = move;
-          pos.runnerTargetMove = move + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+          pos.runnerTargetMove = RUNNER_ACTIVATION_PCT + RUNNER_POST_ACTIVATION_EXTRA_PCT;
           pos.runnerTargetReached = false;
           saveActivePositions();
 
@@ -4705,78 +4678,121 @@ async function monitorPositions() {
               `💰 Profit: +${move.toFixed(2)}%\n` +
               `🎯 Activation: +${RUNNER_ACTIVATION_PCT.toFixed(2)}%\n\n` +
               `📊 Runner Mode: ACTIVE\n` +
-              `🎯 Runner Rule: +1% more within 30 minutes\n\n` +
+              `🎯 Runner Rule: at +${(RUNNER_ACTIVATION_PCT + RUNNER_POST_ACTIVATION_EXTRA_PCT).toFixed(2)}%, activate a ${RUNNER_TRAILING_STOP_PCT.toFixed(2)}% trailing stop.\n\n` +
               `👥 All users' ${symbol} positions are now in runner mode.`
             );
           }
         }
 
         // =====================================================
-        // RUNNER POST-ACTIVATION TARGET / TIMEOUT
-        // After runner activation at +2%, price must achieve an additional
-        // +1 percentage point of trade profit within 30 minutes.
-        // Example: activation at +2.00% -> target +3.00%.
-        // Once the target is reached, this timeout condition is permanently
-        // satisfied for the current position.
+        // RUNNER 30-MINUTE PROTECTION + TARGET + PROFIT-TRAILING STOP
+        // Runner activates at +2%. If +3% is not reached within 30 minutes
+        // of activation, close all users' positions for this symbol.
+        // If +3% is reached first, trail the best live price by 0.5%.
+        // Both exits invoke the full shared /close SYMBOL path.
         // =====================================================
         if (pos.runnerActive) {
-          // Backward-compatible recovery for positions saved before this
-          // runner timeout feature existed.
-          if (!Number.isFinite(Number(pos.runnerActivatedAt))) {
+          // Preserve the 30-minute runner protection: if the runner has not
+          // reached its +3% trailing activation target within 30 minutes of
+          // the +2% runner activation, close every user's position for this
+          // symbol through the same shared routine used by /close SYMBOL.
+          if (!Number.isFinite(Number(pos.runnerActivatedAt)) || Number(pos.runnerActivatedAt) <= 0) {
             pos.runnerActivatedAt = Date.now();
-            pos.runnerActivationMove = Number.isFinite(Number(pos.runnerActivationMove))
-              ? Number(pos.runnerActivationMove)
-              : Math.max(move, RUNNER_ACTIVATION_PCT);
-            pos.runnerTargetMove = pos.runnerActivationMove + RUNNER_POST_ACTIVATION_EXTRA_PCT;
-            pos.runnerTargetReached = false;
+            saveActivePositions();
+          }
+
+          const runnerProtectionTimeoutMs = 30 * 60 * 1000;
+          if (
+            pos.runnerTargetReached !== true &&
+            Date.now() - Number(pos.runnerActivatedAt) >= runnerProtectionTimeoutMs
+          ) {
+            await closeTrackedSymbolPositions(
+              symbol,
+              `30-minute runner protection: +${Number(pos.runnerTargetMove || (RUNNER_ACTIVATION_PCT + RUNNER_POST_ACTIVATION_EXTRA_PCT)).toFixed(2)}% target was not reached within 30 minutes; full /close ${symbol} behavior executed for all users`
+            );
+            break;
+          }
+
+          if (!Number.isFinite(Number(pos.runnerActivationMove))) {
+            pos.runnerActivationMove = RUNNER_ACTIVATION_PCT;
             saveActivePositions();
           }
 
           if (!Number.isFinite(Number(pos.runnerTargetMove))) {
-            pos.runnerTargetMove =
-              (Number.isFinite(Number(pos.runnerActivationMove))
-                ? Number(pos.runnerActivationMove)
-                : RUNNER_ACTIVATION_PCT) + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+            pos.runnerTargetMove = RUNNER_ACTIVATION_PCT + RUNNER_POST_ACTIVATION_EXTRA_PCT;
+            saveActivePositions();
+          }
+
+          // Migrate positions saved by the previous runner-target logic:
+          // if the +1% extension was already recorded as reached, start the
+          // new trailing stop from the current live price rather than leaving
+          // the legacy runner position without an exit rule.
+          if (pos.runnerTargetReached === true && pos.runnerTrailingActive !== true) {
+            pos.runnerTrailingActive = true;
+            pos.runnerTrailingExtreme = mark;
+            pos.runnerTrailingStop = pos.side === "BUY"
+              ? mark * (1 - RUNNER_TRAILING_STOP_PCT / 100)
+              : mark * (1 + RUNNER_TRAILING_STOP_PCT / 100);
             saveActivePositions();
           }
 
           if (move >= Number(pos.runnerTargetMove)) {
             if (!pos.runnerTargetReached) {
               pos.runnerTargetReached = true;
+              pos.runnerTrailingActive = true;
+              pos.runnerTrailingExtreme = mark;
+              pos.runnerTrailingStop = pos.side === "BUY"
+                ? mark * (1 - RUNNER_TRAILING_STOP_PCT / 100)
+                : mark * (1 + RUNNER_TRAILING_STOP_PCT / 100);
               saveActivePositions();
 
               await sendMessage(
-                `🎯 RUNNER TARGET REACHED: *${symbol}* ${pos.side}\n` +
+                `🎯 RUNNER TRAILING ACTIVATED: *${symbol}* ${pos.side}\n` +
                 `Profit: +${move.toFixed(2)}%\n` +
                 `Target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
-                `30-minute runner extension requirement satisfied.`
+                `Trailing distance: ${RUNNER_TRAILING_STOP_PCT.toFixed(2)}% from market price.`
               );
+            } else {
+              pos.runnerTrailingActive = true;
+              const previousExtreme = Number(pos.runnerTrailingExtreme);
+              if (pos.side === "BUY") {
+                pos.runnerTrailingExtreme = Number.isFinite(previousExtreme)
+                  ? Math.max(previousExtreme, mark) : mark;
+                const nextStop = pos.runnerTrailingExtreme * (1 - RUNNER_TRAILING_STOP_PCT / 100);
+                if (!Number.isFinite(Number(pos.runnerTrailingStop)) || nextStop > Number(pos.runnerTrailingStop)) {
+                  pos.runnerTrailingStop = nextStop;
+                  saveActivePositions();
+                }
+              } else {
+                pos.runnerTrailingExtreme = Number.isFinite(previousExtreme)
+                  ? Math.min(previousExtreme, mark) : mark;
+                const nextStop = pos.runnerTrailingExtreme * (1 + RUNNER_TRAILING_STOP_PCT / 100);
+                if (!Number.isFinite(Number(pos.runnerTrailingStop)) || nextStop < Number(pos.runnerTrailingStop)) {
+                  pos.runnerTrailingStop = nextStop;
+                  saveActivePositions();
+                }
+              }
             }
-          } else if (!pos.runnerTargetReached &&
-                     Date.now() - Number(pos.runnerActivatedAt) >= RUNNER_POST_ACTIVATION_TIMEOUT_MS) {
-            // Use the exact same close-order path as /close SYMBOL.
-            // Only this timed-out user's position is removed from tracking.
-            await closeTrackedPositionOrder(client, symbol, pos);
+          }
 
-            delete activePositions[symbol][userId];
-            saveActivePositions();
-
-            await sendMessage(
-              `⏱️ RUNNER TIMEOUT EXIT: *${symbol}* ${pos.side}\n` +
-              `Current Profit: ${move.toFixed(2)}%\n` +
-              `Runner activated at: +${Number(pos.runnerActivationMove || RUNNER_ACTIVATION_PCT).toFixed(2)}%\n` +
-              `Required target: +${Number(pos.runnerTargetMove).toFixed(2)}%\n` +
-              `The extra +${RUNNER_POST_ACTIVATION_EXTRA_PCT.toFixed(2)}% was not reached within 30 minutes.`
-            );
-
-            continue;
+          if (pos.runnerTrailingActive === true && Number.isFinite(Number(pos.runnerTrailingStop))) {
+            const runnerStopHit = pos.side === "BUY"
+              ? mark <= Number(pos.runnerTrailingStop)
+              : mark >= Number(pos.runnerTrailingStop);
+            if (runnerStopHit) {
+              await closeTrackedSymbolPositions(
+                symbol,
+                `Runner trailing stop hit (${RUNNER_TRAILING_STOP_PCT.toFixed(2)}% trailing distance); full /close ${symbol} behavior executed for all users`
+              );
+              break;
+            }
           }
         }
 
         // =====================================================
         // TRAILING STOP
-        // Active only before runner mode.
-        // Once runner mode activates, the post-activation runner timer/target applies.
+        // Existing 5% trailing stop remains active only before runner mode.
+        // Runner positions use the separate 0.5% trailing stop above.
         // =====================================================
         if (!pos.runnerActive && pos.side === "BUY") {
           pos.highest = Math.max(pos.highest, mark);
@@ -4822,9 +4838,8 @@ async function monitorPositions() {
 
         // =====================================================
         // RUNNER EXIT
-        // The runner has NO Delta-based exit. After activation, the
-        // only runner-management exit is the post-activation target
-        // requirement: an additional +1 percentage point within 30 minutes.
+        // Runner exits are managed by the 30-minute protection timeout
+        // before +3%, or by the 0.5% trailing stop after +3%.
         // =====================================================
         // =====================================================
         // STOP LOSS REMAINS ACTIVE
@@ -4879,7 +4894,7 @@ let symbolActive = {};
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
 
 // Scan all configured symbols independently of their current activation state.
-// A fresh qualifying completed-2H OBV/EMA crossover can activate an inactive symbol.
+// A fresh qualifying live-forming-2H OBV/EMA crossover can activate an inactive symbol.
 setInterval(monitorTwoHourObvEmaAutoActivation, 60 * 1000);
 
 // =====================================================
@@ -5685,66 +5700,8 @@ async function monitorScript2ExecutionScanner() {
         }
         setup.executionScannerLastAbsorptionBlockKey = null;
 
-        // ATR-band entry gate: calculate exclusively from CLOSED 5M candles.
-        // A BUY requires the upper band to rise while total band width expands.
-        // A SELL requires the upper band to fall while total band width expands.
-        // If either condition fails, retain the pending setup and reassess after
-        // each newly closed 5M candle; never use the still-forming 5M candle.
-        const closed5mBands = calculate5MATRBands(closedCandles5);
-        if (!closed5mBands?.current || !closed5mBands?.previous) {
-          const atrWarnKey = `ATR_BANDS_DATA_PENDING:${candleKey}`;
-          if (setup.executionScannerLastATRBandBlockKey !== atrWarnKey) {
-            setup.executionScannerLastATRBandBlockKey = atrWarnKey;
-            awaitSendScript2Checkpoint(
-              `⏳ *5M ATR BANDS PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}*\n` +
-              `Insufficient closed-5M-candle history to calculate the ATR bands. Setup retained; no order placed.`
-            );
-          }
-          continue;
-        }
-
-        const currentATRUpper = Number(closed5mBands.current.upper);
-        const previousATRUpper = Number(closed5mBands.previous.upper);
-        const currentATRWidth = Number(closed5mBands.current.width);
-        const previousATRWidth = Number(closed5mBands.previous.width);
-        const atrUpperRising = currentATRUpper > previousATRUpper;
-        const atrUpperFalling = currentATRUpper < previousATRUpper;
-        const atrBandsExpanding = currentATRWidth > previousATRWidth;
-        const atrDirectionPassed = direction === "BUY" ? atrUpperRising : atrUpperFalling;
-        const atrBandsPassed = atrDirectionPassed && atrBandsExpanding;
-        const atrBandCandleKey = getScript2CandleKey(
-          closed5mBands.current,
-          `CLOSED_5M_ATR_${closed5mBands.current.time ?? candleKey}`
-        );
-
-        if (!atrBandsPassed) {
-          const atrBlockKey = `ATR_BANDS_PENDING:${atrBandCandleKey}:${direction}:${atrUpperRising}:${atrUpperFalling}:${atrBandsExpanding}`;
-          if (setup.executionScannerLastATRBandBlockKey !== atrBlockKey) {
-            setup.executionScannerLastATRBandBlockKey = atrBlockKey;
-            const directionText = direction === "BUY" ? "upper ATR band must be rising" : "upper ATR band must be falling";
-            awaitSendScript2Checkpoint(
-              `⏳ *5M ATR BANDS FILTER PENDING* — *${symbol}*\n` +
-              `Direction: *${direction}*\n` +
-              `Upper band: *${atrUpperRising ? "RISING" : atrUpperFalling ? "FALLING" : "FLAT"}* (required: ${directionText}).\n` +
-              `Band width: *${atrBandsExpanding ? "EXPANDING" : "NOT EXPANDING"}* (expansion required).\n` +
-              `Latest completed 5M candle did not pass both conditions. Setup retained; no order placed.`
-            );
-          }
-          setup.atrBandsNotified = false;
-          continue;
-        }
-
-        setup.executionScannerLastATRBandBlockKey = null;
-        if (!setup.atrBandsNotified || setup.atrBandsPassedCandleKey !== atrBandCandleKey) {
-          setup.atrBandsNotified = true;
-          setup.atrBandsPassedCandleKey = atrBandCandleKey;
-          awaitSendScript2Checkpoint(
-            `✅ *5M ATR BANDS FILTER PASSED* — *${symbol}*\n` +
-            `Direction: *${direction}* | Upper band: *${direction === "BUY" ? "RISING" : "FALLING"}* | Band width: *EXPANDING*.\n` +
-            `Confirmed using the latest completed 5M candle.`
-          );
-        }
+        // The 5M ATR-bands condition has been removed from execution.
+        // All other existing entry confirmations and safeguards remain active.
 
         // Entry confirmation: inspect the CURRENT FORMING 5M candle on every
         // scanner pass. Binance's latest kline is still live until its close time.
