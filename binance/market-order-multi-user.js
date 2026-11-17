@@ -1,4 +1,4 @@
-// v80: adds closed-30M OBV/EMA crossover auto-activation aligned with live 2H OBV bias and a persistent per-symbol BUY/SELL-only lock.
+// v81: removes the 30M crossover lock; a qualifying 2H OBV/EMA crossover now sets the per-symbol BUY/SELL-only direction lock.
 // v79: lowers minimum 24H quote volume to 3M USDT and absolute book depth to 15K USDT; preserves all other liquidity settings.
 // v78: adds live 2H directional buying/selling volume confirmation against separate 10-candle averages; preserves v77 protections.
 // v76: removes the 5M ATR-bands execution gate; changes break-even timeout to 1 hour; uses live 2H OBV/EMA crossover with 10% separation; adds a 0.5% runner trailing stop after +3% profit.
@@ -1887,6 +1887,8 @@ async function monitorTwoHourObvEmaAutoActivation() {
         if (!volumeConfirmed) continue;
 
         const direction = pending.direction;
+        const tradeDirection = direction === "BULLISH" ? "BUY" : "SELL";
+        const previousDirection = symbolAutoTradeDirection[symbol] || null;
         const separation = pending.separation;
         const separationPct = (separation * 100).toFixed(2);
         const liveDirectionalVolume = direction === "BULLISH" ? liveBuyVolume : liveSellVolume;
@@ -1894,6 +1896,9 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const wasActive = symbolActive[symbol] === true;
         obvAutoActivationLastTriggeredCandle[symbol] = forming.time;
         delete obvAutoActivationPendingCrossover[symbol];
+        // A valid 2H OBV/EMA crossover (10% separation + directional volume
+        // confirmation) sets or replaces the symbol's BUY-only / SELL-only lock.
+        symbolAutoTradeDirection[symbol] = tradeDirection;
         // Same symbol state change performed by the admin /activate command.
         symbolActive[symbol] = true;
         const message =
@@ -1904,130 +1909,22 @@ async function monitorTwoHourObvEmaAutoActivation() {
           `📊 Directional volume: *${liveDirectionalVolume.toFixed(4)}* vs MA 10 *${directionalVolumeMA.toFixed(4)}*\n` +
           `📊 Required: directional live volume above its 10 completed 2H candle average\n` +
           `🕒 Forming 2H candle: *${forming.time}*\n` +
-          (wasActive
-            ? `ℹ️ *${symbol}* was already active; activation state unchanged.`
-            : `✅ *${symbol}* automatically ACTIVATED for trading (same state change as /activate ${symbol}).`);
+          `🔒 Trade direction lock: *${tradeDirection}-ONLY* until the next qualifying 2H OBV/EMA crossover\n` +
+          (previousDirection && previousDirection !== tradeDirection
+            ? `🔄 Previous lock *${previousDirection}-ONLY* replaced.`
+            : previousDirection === tradeDirection
+              ? `ℹ️ Existing *${tradeDirection}-ONLY* lock reaffirmed.`
+              : wasActive
+                ? `ℹ️ *${symbol}* was already active; direction lock applied.`
+                : `✅ *${symbol}* automatically ACTIVATED for trading.`);
         await sendMessage(message);
-        log(`2H live OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; directional live volume ${liveDirectionalVolume} > MA10 ${directionalVolumeMA}; ${wasActive ? "already active" : "activated"}.`);
+        log(`2H live OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; directional live volume ${liveDirectionalVolume} > MA10 ${directionalVolumeMA}; direction lock set to ${tradeDirection}; ${wasActive ? "already active" : "activated"}.`);
       } catch (err) {
         log(`❌ 2H OBV auto-activation monitor error ${symbol}: ${err?.message || err}`);
       }
     }
   } finally {
     obvAutoActivationMonitorRunning = false;
-  }
-}
-
-
-// =====================================================
-// 30M CLOSED-CANDLE OBV / EMA FRESH-CROSS AUTO-ACTIVATION
-// A fresh, fully CLOSED 30M crossover must agree with the LIVE 2H OBV/EMA
-// direction and meet the same 10% normalized separation threshold. A valid
-// signal activates the symbol and locks automatic entries to that direction
-// until another valid 30M crossover changes the lock.
-// =====================================================
-const OBV_30M_AUTO_ACTIVATION_SEPARATION = 0.10;
-const OBV_30M_AUTO_ACTIVATION_BASELINE_CANDLES = 20;
-const obv30mAutoActivationLastTriggeredCandle = {};
-let obv30mAutoActivationMonitorRunning = false;
-
-async function monitorThirtyMinuteObvEmaAutoActivation() {
-  if (obv30mAutoActivationMonitorRunning) return;
-  obv30mAutoActivationMonitorRunning = true;
-
-  try {
-    for (const symbol of COIN_LIST) {
-      try {
-        const [candles30m, candles2h] = await Promise.all([
-          fetchFuturesKlines(symbol, "30m", 100),
-          fetchFuturesKlines(symbol, "2h", 100)
-        ]);
-        if (!Array.isArray(candles30m) || candles30m.length < OBV_EMA_LENGTH + OBV_30M_AUTO_ACTIVATION_BASELINE_CANDLES + 3) continue;
-        if (!Array.isArray(candles2h) || candles2h.length < OBV_EMA_LENGTH + 3) continue;
-
-        // 30M signal is evaluated ONLY on the latest completed candle.
-        const closed30m = candles30m.slice(0, -1);
-        const latestClosed30m = closed30m[closed30m.length - 1];
-        if (!latestClosed30m || !Number.isFinite(Number(latestClosed30m.time))) continue;
-        if (obv30mAutoActivationLastTriggeredCandle[symbol] === latestClosed30m.time) continue;
-
-        const obv30m = calculateOBVSeries(closed30m);
-        if (!Array.isArray(obv30m) || obv30m.length !== closed30m.length) continue;
-        const obv30mCandles = obv30m.map(value => ({ close: value }));
-        const ema30m = calculateEMASeries(obv30mCandles, OBV_EMA_LENGTH);
-        if (!Array.isArray(ema30m) || ema30m.length !== obv30m.length) continue;
-
-        const last30 = obv30m.length - 1;
-        const priorObv30 = Number(obv30m[last30 - 1]);
-        const priorEma30 = Number(ema30m[last30 - 1]);
-        const currentObv30 = Number(obv30m[last30]);
-        const currentEma30 = Number(ema30m[last30]);
-        if (![priorObv30, priorEma30, currentObv30, currentEma30].every(Number.isFinite)) continue;
-
-        const crossedUp30 = priorObv30 <= priorEma30 && currentObv30 > currentEma30;
-        const crossedDown30 = priorObv30 >= priorEma30 && currentObv30 < currentEma30;
-        if (!crossedUp30 && !crossedDown30) continue;
-
-        // Normalize separation against the mean absolute OBV of the 20
-        // completed 30M candles immediately preceding the crossover candle.
-        const baseline30 = obv30m.slice(-(OBV_30M_AUTO_ACTIVATION_BASELINE_CANDLES + 1), -1);
-        if (baseline30.length !== OBV_30M_AUTO_ACTIVATION_BASELINE_CANDLES) continue;
-        const averageAbsoluteObv30 = baseline30.reduce((sum, value) => sum + Math.abs(Number(value)), 0) / baseline30.length;
-        if (!Number.isFinite(averageAbsoluteObv30) || averageAbsoluteObv30 <= 0) continue;
-        const separation30 = Math.abs(currentObv30 - currentEma30) / averageAbsoluteObv30;
-        if (!Number.isFinite(separation30) || separation30 < OBV_30M_AUTO_ACTIVATION_SEPARATION) continue;
-
-        // 2H direction uses the currently forming 2H candle, matching the
-        // existing live 2H OBV/EMA monitor. No 2H crossover is required.
-        const obv2h = calculateOBVSeries(candles2h);
-        if (!Array.isArray(obv2h) || obv2h.length !== candles2h.length) continue;
-        const obv2hCandles = obv2h.map(value => ({ close: value }));
-        const ema2h = calculateEMASeries(obv2hCandles, OBV_EMA_LENGTH);
-        if (!Array.isArray(ema2h) || ema2h.length !== obv2h.length) continue;
-        const last2h = obv2h.length - 1;
-        const currentObv2h = Number(obv2h[last2h]);
-        const currentEma2h = Number(ema2h[last2h]);
-        if (![currentObv2h, currentEma2h].every(Number.isFinite) || currentObv2h === currentEma2h) continue;
-        const bias2h = currentObv2h > currentEma2h ? "BUY" : "SELL";
-        const crossoverDirection = crossedUp30 ? "BUY" : "SELL";
-
-        // An opposite 30M crossover is invalid and does not change the prior lock.
-        if (crossoverDirection !== bias2h) {
-          obv30mAutoActivationLastTriggeredCandle[symbol] = latestClosed30m.time;
-          log(`30M OBV crossover ignored for ${symbol}: ${crossoverDirection} conflicts with live 2H OBV bias ${bias2h}.`);
-          continue;
-        }
-
-        const previousDirection = symbolAutoTradeDirection[symbol] || null;
-        const wasActive = symbolActive[symbol] === true;
-        obv30mAutoActivationLastTriggeredCandle[symbol] = latestClosed30m.time;
-        symbolAutoTradeDirection[symbol] = crossoverDirection;
-        symbolActive[symbol] = true;
-
-        const separationPct = (separation30 * 100).toFixed(2);
-        await sendMessage(
-          `🔔 *30M CLOSED OBV–EMA CROSSOVER AUTO-ACTIVATION*\n\n` +
-          `🪙 Symbol: *${symbol}*\n` +
-          `📈 Direction: *${crossoverDirection}*\n` +
-          `📏 OBV/EMA separation: *${separationPct}%* (minimum 10%)\n` +
-          `🧭 Live 2H OBV bias: *${bias2h}* — aligned\n` +
-          `🕒 Latest CLOSED 30M candle: *${latestClosed30m.time}*\n` +
-          `🔒 Direction lock: *${crossoverDirection}-ONLY* until the next valid 30M crossover\n` +
-          (previousDirection && previousDirection !== crossoverDirection
-            ? `🔄 Previous lock *${previousDirection}-ONLY* replaced.`
-            : previousDirection === crossoverDirection
-              ? `ℹ️ Existing *${crossoverDirection}-ONLY* lock reaffirmed.`
-              : wasActive
-                ? `ℹ️ Symbol was already active; directional lock applied.`
-                : `✅ Symbol automatically activated for trading.`)
-        );
-        log(`30M CLOSED OBV ${crossoverDirection} crossover ${symbol}; separation ${separationPct}%; live 2H bias ${bias2h}; direction lock set to ${crossoverDirection}.`);
-      } catch (err) {
-        log(`❌ 30M OBV auto-activation monitor error ${symbol}: ${err?.message || err}`);
-      }
-    }
-  } finally {
-    obv30mAutoActivationMonitorRunning = false;
   }
 }
 
@@ -5054,8 +4951,8 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
-// Direction lock set only by a valid, aligned CLOSED-30M OBV/EMA crossover.
-// null/undefined means no 30M direction restriction is currently active.
+// Direction lock set by a qualifying 2H OBV/EMA crossover with existing
+// 10% separation and directional-volume confirmation. Undefined means unlocked.
 let symbolAutoTradeDirection = {};
 
 COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
@@ -5063,7 +4960,6 @@ COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols a
 // Scan all configured symbols independently of their current activation state.
 // A fresh qualifying live-forming-2H OBV/EMA crossover can activate an inactive symbol.
 setInterval(monitorTwoHourObvEmaAutoActivation, 60 * 1000);
-setInterval(monitorThirtyMinuteObvEmaAutoActivation, 30 * 1000);
 
 // =====================================================
 // PRICE ACTIVATION MONITOR
@@ -5792,11 +5688,11 @@ async function monitorScript2ExecutionScanner() {
 
         const autoDirectionLock = symbolAutoTradeDirection[symbol];
         if (autoDirectionLock && direction !== autoDirectionLock) {
-          const directionLockKey = `30M_DIRECTION_LOCK:${candleKey}:${autoDirectionLock}:${direction}`;
+          const directionLockKey = `2H_DIRECTION_LOCK:${candleKey}:${autoDirectionLock}:${direction}`;
           if (setup.executionScannerLastDirectionLockKey !== directionLockKey) {
             setup.executionScannerLastDirectionLockKey = directionLockKey;
             awaitSendScript2Checkpoint(
-              `🔒 *30M DIRECTION LOCK — ENTRY BLOCKED* — *${symbol}*\n` +
+              `🔒 *2H DIRECTION LOCK — ENTRY BLOCKED* — *${symbol}*\n` +
               `Current lock: *${autoDirectionLock}-ONLY*\n` +
               `Pending setup direction: *${direction}*\n` +
               `The setup is retained, but no opposite-direction order will be placed.`
@@ -8642,7 +8538,7 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
     const direction = direction15;
     const manualDirectionLock = symbolAutoTradeDirection[symbol];
     if (manualDirectionLock && direction !== manualDirectionLock) {
-      await reply(`⛔ *${symbol}* manual trade cancelled: the active 30M crossover lock is *${manualDirectionLock}-ONLY*; requested direction was *${direction}*.`);
+      await reply(`⛔ *${symbol}* manual trade cancelled: the active 2H crossover lock is *${manualDirectionLock}-ONLY*; requested direction was *${direction}*.`);
       return;
     }
     await reply(
