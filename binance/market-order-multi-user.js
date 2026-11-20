@@ -1,3 +1,4 @@
+// v82: continuously tracks live 2H OBV/EMA side; matching live directional taker volume above prior-10-closed-candle MA10 activates the coin and confirms its direction lock. No fresh crossover or 10% separation required.
 // v81: removes the 30M crossover lock; a qualifying 2H OBV/EMA crossover now sets the per-symbol BUY/SELL-only direction lock.
 // v79: lowers minimum 24H quote volume to 3M USDT and absolute book depth to 15K USDT; preserves all other liquidity settings.
 // v78: adds live 2H directional buying/selling volume confirmation against separate 10-candle averages; preserves v77 protections.
@@ -1791,17 +1792,14 @@ function calculateOBVSeries(candles) {
 
 
 // =====================================================
-// 2H OBV / EMA FRESH-CROSS + LIVE DIRECTIONAL VOLUME MA10 AUTO-ACTIVATION MONITOR
-// Uses the live, currently forming 2H candle. Separation is normalized
-// by the mean absolute OBV over the 20 completed candles before it.
+// 2H LIVE OBV BIAS + INDEPENDENT DIRECTIONAL VOLUME MA10 AUTO-ACTIVATION
+// OBV side continuously sets the direction lock. Matching live taker volume
+// above its MA10 activates the symbol. No fresh crossover or 10% separation
+// is required. If OBV flips sides, entries pause until the new side confirms.
 // =====================================================
-const OBV_AUTO_ACTIVATION_SEPARATION = 0.10;
-const OBV_AUTO_ACTIVATION_BASELINE_CANDLES = 20;
 const OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES = 10;
-const obvAutoActivationLastTriggeredCandle = {};
-// A qualifying OBV/EMA crossover remains pending only for its own forming
-// 2H candle while its directional taker volume catches up with Volume MA 10.
-const obvAutoActivationPendingCrossover = {};
+const obvAutoActivationBias = {};
+const obvAutoActivationVolumeConfirmed = {};
 let obvAutoActivationMonitorRunning = false;
 
 async function monitorTwoHourObvEmaAutoActivation() {
@@ -1812,13 +1810,12 @@ async function monitorTwoHourObvEmaAutoActivation() {
     for (const symbol of COIN_LIST) {
       try {
         const candles = await fetchFuturesKlines(symbol, "2h", 100);
-        if (!Array.isArray(candles) || candles.length < OBV_EMA_LENGTH + OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 3) continue;
+        if (!Array.isArray(candles) || candles.length < OBV_EMA_LENGTH + OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES + 3) continue;
 
-        // Binance returns the currently forming 2H candle last. Include it
-        // so OBV/EMA and the crossover are recalculated from live volume/price.
+        // Use the live forming 2H candle for both OBV direction and directional volume.
         const forming = candles[candles.length - 1];
         const closed = candles.slice(0, -1);
-        if (!forming || !closed.length || !Number.isFinite(Number(forming.time))) continue;
+        if (!forming || !Number.isFinite(Number(forming.time))) continue;
 
         const obv = calculateOBVSeries(candles);
         if (!Array.isArray(obv) || obv.length !== candles.length) continue;
@@ -1826,49 +1823,50 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const ema = calculateEMASeries(obvCandles, OBV_EMA_LENGTH);
         if (!Array.isArray(ema) || ema.length !== obv.length) continue;
 
-        const last = obv.length - 1;
-        const priorObv = Number(obv[last - 1]);
-        const priorEma = Number(ema[last - 1]);
-        const currentObv = Number(obv[last]);
-        const currentEma = Number(ema[last]);
-        if (![priorObv, priorEma, currentObv, currentEma].every(Number.isFinite)) continue;
+        const currentObv = Number(obv[obv.length - 1]);
+        const currentEma = Number(ema[ema.length - 1]);
+        if (![currentObv, currentEma].every(Number.isFinite)) continue;
 
-        const crossedUp = priorObv <= priorEma && currentObv > currentEma;
-        const crossedDown = priorObv >= priorEma && currentObv < currentEma;
-
-        // Expire any unconfirmed crossover as soon as a new 2H candle starts.
-        let pending = obvAutoActivationPendingCrossover[symbol];
-        if (pending && pending.candleTime !== forming.time) {
-          delete obvAutoActivationPendingCrossover[symbol];
-          pending = null;
+        const bias = currentObv > currentEma
+          ? "BULLISH"
+          : currentObv < currentEma
+            ? "BEARISH"
+            : null;
+        if (!bias) {
+          // Exact equality provides no directional bias; suspend fresh entries.
+          if (obvAutoActivationBias[symbol] !== null) {
+            obvAutoActivationBias[symbol] = null;
+            obvAutoActivationVolumeConfirmed[symbol] = false;
+            symbolActive[symbol] = false;
+            delete symbolAutoTradeDirection[symbol];
+            await sendMessage(
+              `⏸️ *2H OBV DIRECTION NEUTRAL* — *${symbol}*\n\n` +
+              `2H OBV is equal to its EMA. New entries are paused until a clear side and matching directional-volume confirmation appear.`
+            );
+          }
+          continue;
         }
 
-        if (obvAutoActivationLastTriggeredCandle[symbol] === forming.time) continue;
-
-        // Capture the crossover once it satisfies the existing 10% separation.
-        // It can then wait for live directional volume confirmation during this candle.
-        if (!pending && (crossedUp || crossedDown)) {
-          const baseline = obv.slice(-(OBV_AUTO_ACTIVATION_BASELINE_CANDLES + 1), -1);
-          if (baseline.length !== OBV_AUTO_ACTIVATION_BASELINE_CANDLES) continue;
-          const averageAbsoluteObv = baseline.reduce((sum, value) => sum + Math.abs(Number(value)), 0) / baseline.length;
-          if (!Number.isFinite(averageAbsoluteObv) || averageAbsoluteObv <= 0) continue;
-
-          const separation = Math.abs(currentObv - currentEma) / averageAbsoluteObv;
-          if (!Number.isFinite(separation) || separation < OBV_AUTO_ACTIVATION_SEPARATION) continue;
-
-          pending = {
-            candleTime: forming.time,
-            direction: crossedUp ? "BULLISH" : "BEARISH",
-            separation
-          };
-          obvAutoActivationPendingCrossover[symbol] = pending;
+        const tradeDirection = bias === "BULLISH" ? "BUY" : "SELL";
+        const previousBias = obvAutoActivationBias[symbol];
+        const directionChanged = previousBias !== bias;
+        if (directionChanged) {
+          obvAutoActivationBias[symbol] = bias;
+          obvAutoActivationVolumeConfirmed[symbol] = false;
+          // Immediately replace the direction lock and suspend entries while
+          // the new direction waits for matching volume confirmation.
+          symbolAutoTradeDirection[symbol] = tradeDirection;
+          symbolActive[symbol] = false;
+          await sendMessage(
+            `🧭 *2H OBV DIRECTION UPDATED* — *${symbol}*\n\n` +
+            `OBV is now *${bias}* ( ${tradeDirection}-ONLY ).\n` +
+            `The previous direction is blocked. Waiting for matching taker-${bias === "BULLISH" ? "buy" : "sell"} volume to exceed its MA10 before activating the coin.`
+          );
+          log(`2H OBV bias changed for ${symbol}: ${previousBias || "UNSET"} -> ${bias}; direction lock immediately set to ${tradeDirection}; entries paused pending volume confirmation.`);
         }
 
-        if (!pending || pending.candleTime !== forming.time) continue;
-
-        // Directional volume bars use Binance taker-buy volume and its remainder
-        // (total minus taker-buy) as aggressive selling volume. Compare the live
-        // forming bar against the MA of the previous 10 completed 2H bars.
+        // Compare live forming-candle taker volume with the average of the
+        // previous 10 completed 2H candles, independently for buy and sell.
         const volumeBaseline = closed.slice(-OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES);
         if (volumeBaseline.length !== OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES) continue;
         const baselineBuyVolumes = volumeBaseline.map(c => Number(c.takerBuyVolume));
@@ -1881,46 +1879,37 @@ async function monitorTwoHourObvEmaAutoActivation() {
         const liveSellVolume = Number(forming.volume) - liveBuyVolume;
         if (![liveBuyVolume, liveSellVolume, buyVolumeMA, sellVolumeMA].every(Number.isFinite)) continue;
 
-        const volumeConfirmed = pending.direction === "BULLISH"
-          ? liveBuyVolume > buyVolumeMA
-          : liveSellVolume > sellVolumeMA;
-        if (!volumeConfirmed) continue;
+        const directionalVolume = bias === "BULLISH" ? liveBuyVolume : liveSellVolume;
+        const directionalVolumeMA = bias === "BULLISH" ? buyVolumeMA : sellVolumeMA;
+        const volumeConfirmed = directionalVolume > directionalVolumeMA;
+        if (!volumeConfirmed) {
+          obvAutoActivationVolumeConfirmed[symbol] = false;
+          // If this is a new direction, symbolActive was already set false above.
+          // Do not deactivate an already activated coin merely because live
+          // volume fluctuates after the activation trigger has been met.
+          continue;
+        }
 
-        const direction = pending.direction;
-        const tradeDirection = direction === "BULLISH" ? "BUY" : "SELL";
-        const previousDirection = symbolAutoTradeDirection[symbol] || null;
-        const separation = pending.separation;
-        const separationPct = (separation * 100).toFixed(2);
-        const liveDirectionalVolume = direction === "BULLISH" ? liveBuyVolume : liveSellVolume;
-        const directionalVolumeMA = direction === "BULLISH" ? buyVolumeMA : sellVolumeMA;
         const wasActive = symbolActive[symbol] === true;
-        obvAutoActivationLastTriggeredCandle[symbol] = forming.time;
-        delete obvAutoActivationPendingCrossover[symbol];
-        // A valid 2H OBV/EMA crossover (10% separation + directional volume
-        // confirmation) sets or replaces the symbol's BUY-only / SELL-only lock.
+        const wasConfirmed = obvAutoActivationVolumeConfirmed[symbol] === true;
+        obvAutoActivationVolumeConfirmed[symbol] = true;
         symbolAutoTradeDirection[symbol] = tradeDirection;
-        // Same symbol state change performed by the admin /activate command.
         symbolActive[symbol] = true;
-        const message =
-          `🔔 *2H OBV–EMA LIVE CROSSOVER ACTIVATION*\n\n` +
-          `🪙 Symbol: *${symbol}*\n` +
-          `📈 Direction: *${direction}*\n` +
-          `📏 OBV/EMA separation: *${separationPct}%*\n` +
-          `📊 Directional volume: *${liveDirectionalVolume.toFixed(4)}* vs MA 10 *${directionalVolumeMA.toFixed(4)}*\n` +
-          `📊 Required: directional live volume above its 10 completed 2H candle average\n` +
-          `🕒 Forming 2H candle: *${forming.time}*\n` +
-          `🔒 Trade direction lock: *${tradeDirection}-ONLY* until the next qualifying 2H OBV/EMA crossover\n` +
-          (previousDirection && previousDirection !== tradeDirection
-            ? `🔄 Previous lock *${previousDirection}-ONLY* replaced.`
-            : previousDirection === tradeDirection
-              ? `ℹ️ Existing *${tradeDirection}-ONLY* lock reaffirmed.`
-              : wasActive
-                ? `ℹ️ *${symbol}* was already active; direction lock applied.`
-                : `✅ *${symbol}* automatically ACTIVATED for trading.`);
-        await sendMessage(message);
-        log(`2H live OBV ${direction} crossover ${symbol}; normalized separation ${separationPct}%; directional live volume ${liveDirectionalVolume} > MA10 ${directionalVolumeMA}; direction lock set to ${tradeDirection}; ${wasActive ? "already active" : "activated"}.`);
+
+        if (!wasActive || !wasConfirmed || directionChanged) {
+          await sendMessage(
+            `✅ *2H OBV + DIRECTIONAL VOLUME ACTIVATION* — *${symbol}*\n\n` +
+            `📈 OBV direction: *${bias}*\n` +
+            `📊 Matching live taker volume: *${directionalVolume.toFixed(4)}*\n` +
+            `📊 Previous 10 completed 2H candles MA10: *${directionalVolumeMA.toFixed(4)}*\n` +
+            `🔒 Direction lock: *${tradeDirection}-ONLY*\n` +
+            `🕒 Forming 2H candle: *${forming.time}*\n` +
+            `✅ Coin is now *ACTIVE* for the confirmed direction.`
+          );
+          log(`2H OBV + directional volume activated ${symbol}: bias=${bias}, live=${directionalVolume}, MA10=${directionalVolumeMA}, lock=${tradeDirection}.`);
+        }
       } catch (err) {
-        log(`❌ 2H OBV auto-activation monitor error ${symbol}: ${err?.message || err}`);
+        log(`❌ 2H OBV/directional-volume monitor error ${symbol}: ${err?.message || err}`);
       }
     }
   } finally {
@@ -4951,14 +4940,14 @@ setInterval(monitorPositions, MONITOR_INTERVAL_MS);
 let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
-// Direction lock set by a qualifying 2H OBV/EMA crossover with existing
-// 10% separation and directional-volume confirmation. Undefined means unlocked.
+// Direction lock continuously follows the live 2H OBV/EMA side. A symbol is
+// activated only after matching live directional taker volume exceeds its MA10.
 let symbolAutoTradeDirection = {};
 
-COIN_LIST.forEach((s) => (symbolActive[s] = true)); // By default, all symbols active
+COIN_LIST.forEach((s) => (symbolActive[s] = false)); // Await 2H OBV-side + matching-volume activation
 
 // Scan all configured symbols independently of their current activation state.
-// A fresh qualifying live-forming-2H OBV/EMA crossover can activate an inactive symbol.
+// OBV side updates the lock immediately; matching directional volume activates.
 setInterval(monitorTwoHourObvEmaAutoActivation, 60 * 1000);
 
 // =====================================================
