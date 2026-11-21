@@ -1,3 +1,4 @@
+// v83: replaces only the standalone 15M consolidation/expansion monitor with an informational 2H directional-volume MA10 monitor.
 // v82: continuously tracks live 2H OBV/EMA side; matching live directional taker volume above prior-10-closed-candle MA10 activates the coin and confirms its direction lock. No fresh crossover or 10% separation required.
 // v81: removes the 30M crossover lock; a qualifying 2H OBV/EMA crossover now sets the per-symbol BUY/SELL-only direction lock.
 // v79: lowers minimum 24H quote volume to 3M USDT and absolute book depth to 15K USDT; preserves all other liquidity settings.
@@ -225,9 +226,9 @@ let script2CheckpointState = {}; // per-symbol Telegram checkpoint state
 let script2MomentumRegimeState = {}; // per-symbol market-regime checkpoint state
 let script2DeltaGateState = {}; // per-symbol 15M/5M delta alignment and confirmation state
 let script2ObvAlignmentNotified = {}; // last 2H/30M OBV direction announced per symbol
-// Independent price-action consolidation detector; delta is measured only after phase completion.
-let priceActionDeltaPhaseState = {}; // per-symbol active consolidation phase and cooldown state
-let priceActionDeltaPhaseMonitorRunning = false;
+// Independent 2H directional-volume monitor state; informational only.
+let directionalVolumeMonitorState = {}; // per-symbol live potential and last confirmed 2H candle
+let directionalVolumeMonitorRunning = false;
 // Informational-only higher-timeframe absorption context. This state never gates entries.
 let higherTimeframeAbsorptionState = {}; // per-symbol active 4H absorption range and 1H confirmation status
 let higherTimeframeAbsorptionLastProcessed4H = {}; // prevents reprocessing the same closed 4H candle
@@ -340,433 +341,138 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
 }
 
 // ======================================================
-// PRICE-ACTION CONSOLIDATION PHASE + AGGRESSOR DELTA REPORT
+// 2H DIRECTIONAL-VOLUME MONITOR
+// Informational only: separate from OBV auto-activation, coin reports,
+// market-regime analysis, and all trade-entry/position-management logic.
+// Buy and sell volume are compared independently with their prior-10-closed-
+// candle MA10 baselines. Polling detects live potential; candle close confirms.
 // ======================================================
-// This detector is independent of the 15M/5M setup-unlock logic.
-// Price action defines the consolidation; Binance taker-buy volume
-// is used to estimate aggressive buy/sell volume inside that phase.
-// A phase is reported only when a CLOSED 15M candle closes beyond the
-// established range by the breakout buffer. The breakout candle itself
-// is excluded from the phase-volume totals.
-// ======================================================
-const PA_DELTA_PHASE_MIN_CANDLES = 6;             // six closed 15M candles (90 minutes)
-const PA_DELTA_PHASE_MAX_RANGE_PCT = 1.20;        // initial 6-candle compression range
-const PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT = 0.15;  // close must clear range by this %
-const PA_DELTA_PHASE_COOLDOWN_MS = 15 * 60 * 1000;
-const PA_DELTA_PHASE_MONITOR_MS = 60 * 1000;
+const DIRECTIONAL_VOLUME_MA_CANDLES = 10;
+const DIRECTIONAL_VOLUME_MONITOR_INTERVAL_MS = 60 * 1000;
 
-// ======================================================
-// POST-CONSOLIDATION EXPANSION VS NOISE CLASSIFIER
-// Informational only: does not change consolidation detection or trade entries.
-// Uses the closed 5M candle inside the 15M breakout candle and compares it
-// with the prior 20 closed 5M candles for volatility and volume baselines.
-// ======================================================
-const EXPANSION_BASELINE_CANDLES = 20;
-const EXPANSION_MIN_RANGE_TO_ATR = 1.20;
-const EXPANSION_MIN_VOLUME_MULTIPLE = 1.50;
-const EXPANSION_MIN_BODY_TO_RANGE = 0.55;
-const EXPANSION_CLOSE_EDGE_FRACTION = 0.25;
-const EXPANSION_MIN_SCORE = 3;
+function getDirectionalVolumeMetrics(candles) {
+  if (!Array.isArray(candles) || candles.length !== DIRECTIONAL_VOLUME_MA_CANDLES) return null;
 
-function getCandleTrueRange(candle, previousClose) {
-  if (!candle || !Number.isFinite(candle.high) || !Number.isFinite(candle.low) || !Number.isFinite(previousClose)) return null;
-  return Math.max(candle.high - candle.low, Math.abs(candle.high - previousClose), Math.abs(candle.low - previousClose));
-}
-
-async function classifyPostConsolidationExpansion(symbol, breakout15mCandle, direction, phaseStats) {
-  const raw5m = await fetchFuturesKlines(symbol, "5m", 100);
-  if (!Array.isArray(raw5m) || raw5m.length < EXPANSION_BASELINE_CANDLES + 5) {
-    await sendMessage(
-      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
-      `The consolidation breakout was detected as *${direction}*, but there was insufficient 5M candle data to separate expansion from noise.\n` +
-      `_The consolidation detector is unchanged; no trade was triggered by this classifier._`
-    );
-    return null;
-  }
-
-  const closed5m = raw5m.slice(0, -1); // never classify with a forming candle
-  const breakoutStart = breakout15mCandle.time;
-  const breakoutEnd = breakoutStart + 15 * 60 * 1000;
-  const windowCandles = closed5m.filter(c => c.time >= breakoutStart && c.time < breakoutEnd);
-  const breakoutCandle = windowCandles[windowCandles.length - 1];
-
-  if (!breakoutCandle || !Number.isFinite(breakoutCandle.close)) {
-    await sendMessage(
-      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
-      `Could not identify a closed 5M candle inside the detected 15M breakout window. No classification was guessed.`
-    );
-    return null;
-  }
-
-  const prior = closed5m.filter(c => c.time < breakoutCandle.time).slice(-EXPANSION_BASELINE_CANDLES);
-  if (prior.length < EXPANSION_BASELINE_CANDLES) {
-    await sendMessage(
-      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
-      `The consolidation breakout was detected as *${direction}*, but only ${prior.length}/${EXPANSION_BASELINE_CANDLES} prior closed 5M candles were available for the baseline. No classification was guessed.\n` +
-      `_The consolidation detector and trade-entry logic are unchanged._`
-    );
-    return null;
-  }
-
-  const priorRanges = [];
-  for (let i = 0; i < prior.length; i++) {
-    const priorIndex = closed5m.indexOf(prior[i]);
-    const prevClose = i > 0 ? prior[i - 1].close : closed5m[priorIndex - 1]?.close;
-    const tr = getCandleTrueRange(prior[i], prevClose);
-    if (Number.isFinite(tr)) priorRanges.push(tr);
-  }
-  if (priorRanges.length < EXPANSION_BASELINE_CANDLES - 1) {
-    await sendMessage(
-      `⚠️ *EXPANSION CLASSIFICATION UNAVAILABLE — ${symbol}*\n\n` +
-      `The consolidation breakout was detected as *${direction}*, but only ${priorRanges.length}/${EXPANSION_BASELINE_CANDLES - 1} valid prior true-range values were available for the baseline. No classification was guessed.\n` +
-      `_The consolidation detector and trade-entry logic are unchanged._`
-    );
-    return null;
-  }
-
-  const baselineAtr = priorRanges.reduce((sum, value) => sum + value, 0) / priorRanges.length;
-  const breakoutTrueRange = getCandleTrueRange(breakoutCandle, prior[prior.length - 1].close);
-  const atrMultiple = baselineAtr > 0 && Number.isFinite(breakoutTrueRange) ? breakoutTrueRange / baselineAtr : 0;
-  const averageVolume = prior.reduce((sum, c) => sum + Math.max(0, c.volume || 0), 0) / prior.length;
-  const volumeMultiple = averageVolume > 0 ? breakoutCandle.volume / averageVolume : 0;
-  const candleRange = breakoutCandle.high - breakoutCandle.low;
-  const bodyToRange = candleRange > 0 ? Math.abs(breakoutCandle.close - breakoutCandle.open) / candleRange : 0;
-  const closePosition = candleRange > 0 ? (breakoutCandle.close - breakoutCandle.low) / candleRange : 0.5;
-  const directionalClosePassed = direction === "UPWARD"
-    ? closePosition >= 1 - EXPANSION_CLOSE_EDGE_FRACTION
-    : closePosition <= EXPANSION_CLOSE_EDGE_FRACTION;
-  const rangePassed = atrMultiple >= EXPANSION_MIN_RANGE_TO_ATR;
-  const volumePassed = volumeMultiple >= EXPANSION_MIN_VOLUME_MULTIPLE;
-  const bodyPassed = bodyToRange >= EXPANSION_MIN_BODY_TO_RANGE;
-  const checksPassed = [rangePassed, volumePassed, bodyPassed, directionalClosePassed].filter(Boolean).length;
-  // Require 3 of 4 confirmations and at least one of the two activity measures.
-  const isRealExpansion = checksPassed >= EXPANSION_MIN_SCORE && (rangePassed || volumePassed);
-  const classification = isRealExpansion ? "REAL EXPANSION" : "MARKET NOISE / UNCONFIRMED BREAKOUT";
-  const emoji = isRealExpansion ? "🚀" : "⚠️";
-  const fmt = value => Number.isFinite(value) ? value.toFixed(2) : "N/A";
-  const rangeText = phaseStats && Number.isFinite(phaseStats.low) && Number.isFinite(phaseStats.high)
-    ? `${phaseStats.low} – ${phaseStats.high}`
-    : "N/A";
-
-  await sendMessage(
-    `${emoji} *${classification} — ${symbol}*\n\n` +
-    `15M breakout direction: *${direction}*\n` +
-    `Breakout candle close: *${breakoutCandle.close}*\n` +
-    `Prior consolidation range: *${rangeText}*\n\n` +
-    `• 5M range / baseline ATR: *${fmt(atrMultiple)}x* ${rangePassed ? "✅" : "❌"} (need ≥ ${EXPANSION_MIN_RANGE_TO_ATR.toFixed(2)}x)\n` +
-    `• 5M volume / prior average: *${fmt(volumeMultiple)}x* ${volumePassed ? "✅" : "❌"} (need ≥ ${EXPANSION_MIN_VOLUME_MULTIPLE.toFixed(2)}x)\n` +
-    `• Candle body / range: *${(bodyToRange * 100).toFixed(1)}%* ${bodyPassed ? "✅" : "❌"} (need ≥ ${(EXPANSION_MIN_BODY_TO_RANGE * 100).toFixed(0)}%)\n` +
-    `• Close near ${direction === "UPWARD" ? "high" : "low"}: *${(closePosition * 100).toFixed(1)}% from candle low* ${directionalClosePassed ? "✅" : "❌"}\n` +
-    `• Confirmations: *${checksPassed}/4*\n\n` +
-    (isRealExpansion
-      ? `_Volatility, participation and candle structure support genuine expansion. This is a classifier, not a guarantee of continuation._`
-      : `_The move lacks enough confirmation and is classified as noise/unconfirmed. Avoid treating this alert alone as an entry signal._`)
-  );
-
-  return { isRealExpansion, checksPassed, atrMultiple, volumeMultiple, bodyToRange, directionalClosePassed };
-}
-
-function getPriceActionPhaseStats(candles) {
-  if (!Array.isArray(candles) || !candles.length) return null;
-
-  let high = -Infinity;
-  let low = Infinity;
-  let totalVolume = 0;
-  let aggressiveBuyVolume = 0;
-
-  for (const candle of candles) {
-    if (
-      !Number.isFinite(candle.high) ||
-      !Number.isFinite(candle.low) ||
-      !Number.isFinite(candle.volume) ||
-      !Number.isFinite(candle.takerBuyVolume)
-    ) return null;
-
-    high = Math.max(high, candle.high);
-    low = Math.min(low, candle.low);
-    totalVolume += Math.max(0, candle.volume);
-    aggressiveBuyVolume += Math.min(
-      Math.max(0, candle.volume),
-      Math.max(0, candle.takerBuyVolume)
-    );
-  }
-
-  const aggressiveSellVolume = Math.max(0, totalVolume - aggressiveBuyVolume);
-  const netDelta = aggressiveBuyVolume - aggressiveSellVolume;
-  const totalAggressorVolume = aggressiveBuyVolume + aggressiveSellVolume;
+  const buyVolumes = candles.map(c => Number(c.takerBuyVolume));
+  const sellVolumes = candles.map(c => Number(c.volume) - Number(c.takerBuyVolume));
+  if (![...buyVolumes, ...sellVolumes].every(Number.isFinite)) return null;
 
   return {
-    high,
-    low,
-    totalVolume,
-    aggressiveBuyVolume,
-    aggressiveSellVolume,
-    netDelta,
-    buySharePct: totalAggressorVolume > 0
-      ? (aggressiveBuyVolume / totalAggressorVolume) * 100
-      : 0,
-    rangePct: low > 0 ? ((high - low) / low) * 100 : 0
+    buyMA: buyVolumes.reduce((sum, value) => sum + Math.max(0, value), 0) / DIRECTIONAL_VOLUME_MA_CANDLES,
+    sellMA: sellVolumes.reduce((sum, value) => sum + Math.max(0, value), 0) / DIRECTIONAL_VOLUME_MA_CANDLES
   };
 }
 
-async function classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDirection) {
-  // Informational only: this helper is called by the all-COIN_LIST price-action
-  // monitor, not by the activated-symbol trade-entry path.
-  try {
-    const [raw2h, raw30m] = await Promise.all([
-      fetchFuturesKlines(symbol, "2h", 100),
-      fetchFuturesKlines(symbol, "30m", 150)
-    ]);
-    const closed2h = Array.isArray(raw2h) && raw2h.length > 1 ? raw2h.slice(0, -1) : null;
-    const closed30m = Array.isArray(raw30m) && raw30m.length > 1 ? raw30m.slice(0, -1) : null;
-    const obv2h = calculateOBVBiasDirection(closed2h);
-    const obv30m = calculateOBVBiasDirection(closed30m);
+function classifyDirectionalVolume(candle, baseline) {
+  if (!candle || !baseline) return null;
+  const buyVolume = Number(candle.takerBuyVolume);
+  const sellVolume = Number(candle.volume) - buyVolume;
+  if (![buyVolume, sellVolume, baseline.buyMA, baseline.sellMA].every(Number.isFinite)) return null;
 
-    if (!obv2h || !obv30m || obv2h !== obv30m) {
-      return {
-        label: "HTF BIAS UNCLEAR — BREAKOUT UNCLASSIFIED",
-        emoji: "⚪",
-        obv2h: obv2h || "UNAVAILABLE",
-        obv30m: obv30m || "UNAVAILABLE",
-        alignedBias: null
-      };
-    }
+  const buyMultiple = baseline.buyMA > 0 ? buyVolume / baseline.buyMA : (buyVolume > 0 ? Infinity : 0);
+  const sellMultiple = baseline.sellMA > 0 ? sellVolume / baseline.sellMA : (sellVolume > 0 ? Infinity : 0);
+  const buyAbove = buyVolume > baseline.buyMA;
+  const sellAbove = sellVolume > baseline.sellMA;
 
-    const breakoutDirection = liveDirection === "UPWARD" ? "BUY" : "SELL";
-    const isWithTrend = breakoutDirection === obv2h;
-    return {
-      label: isWithTrend
-        ? "POTENTIAL TREND CONTINUATION EXTENSION"
-        : "POTENTIAL TREND RETRACEMENT",
-      emoji: isWithTrend ? "📈" : "↩️",
-      obv2h: obv2h,
-      obv30m: obv30m,
-      alignedBias: obv2h
-    };
-  } catch (error) {
-    log(`⚠️ Higher-timeframe OBV classification failed for ${symbol}: ${error?.message || error}`);
-    return {
-      label: "HTF BIAS UNCLEAR — BREAKOUT UNCLASSIFIED",
-      emoji: "⚪",
-      obv2h: "UNAVAILABLE",
-      obv30m: "UNAVAILABLE",
-      alignedBias: null
-    };
+  if (!buyAbove && !sellAbove) {
+    return { highVolume: false, direction: null, buyVolume, sellVolume, buyMultiple, sellMultiple };
   }
+
+  // If both sides exceed their own baselines, report the side with the
+  // stronger relative expansion rather than using candle colour as a proxy.
+  const direction = buyAbove && (!sellAbove || buyMultiple >= sellMultiple) ? 'UP' : 'DOWN';
+  return { highVolume: true, direction, buyVolume, sellVolume, buyMultiple, sellMultiple };
 }
 
-async function monitorPriceActionDeltaPhases() {
-  if (priceActionDeltaPhaseMonitorRunning) return;
-  priceActionDeltaPhaseMonitorRunning = true;
+function formatDirectionalVolume(value) {
+  return Number.isFinite(value) ? value.toFixed(4) : 'N/A';
+}
+
+async function monitorTwoHourDirectionalVolume() {
+  if (directionalVolumeMonitorRunning) return;
+  directionalVolumeMonitorRunning = true;
 
   try {
     for (const symbol of COIN_LIST) {
       try {
-        const rawCandles = await fetchFuturesKlines(symbol, "15m", 60);
-        if (!Array.isArray(rawCandles) || rawCandles.length < PA_DELTA_PHASE_MIN_CANDLES + 2) {
-          continue;
-        }
+        const candles = await fetchFuturesKlines(symbol, '2h', 30);
+        if (!Array.isArray(candles) || candles.length < DIRECTIONAL_VOLUME_MA_CANDLES + 2) continue;
 
-        // Ignore the currently forming candle; decisions use closed 15M candles only.
-        const closedCandles = rawCandles.slice(0, -1);
-        const latest = closedCandles[closedCandles.length - 1];
-        if (!latest || !Number.isFinite(latest.time)) continue;
+        const forming = candles[candles.length - 1];
+        const latestClosed = candles[candles.length - 2];
+        if (!forming || !latestClosed || !Number.isFinite(Number(forming.time)) || !Number.isFinite(Number(latestClosed.time))) continue;
 
-        let phase = priceActionDeltaPhaseState[symbol];
-
-        // Early informational alert on the first live price break of an active
-        // consolidation boundary. It is one-shot per phase and does not classify
-        // expansion or trigger a trade; classification still waits for closed 15M.
-        if (phase && Array.isArray(phase.candles) && !phase.potentialBreakoutNotified) {
-          try {
-            const livePriceRes = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
-            if (livePriceRes.ok) {
-              const livePriceData = await livePriceRes.json();
-              const livePrice = Number(livePriceData?.price);
-              const upperLiveBreak = phase.high * (1 + PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
-              const lowerLiveBreak = phase.low * (1 - PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
-              if (Number.isFinite(livePrice) && livePrice > 0 && (livePrice > upperLiveBreak || livePrice < lowerLiveBreak)) {
-                const liveDirection = livePrice > upperLiveBreak ? "UPWARD" : "DOWNWARD";
-                // Classify against closed-candle 2H and 30M OBV for every symbol
-                // scanned by this monitor, whether activated for trading or not.
-                // This only changes the alert text; it does not affect execution.
-                const trendClassification = await classifyPotentialBreakoutAgainstHigherTimeframeOBV(symbol, liveDirection);
-                phase.potentialBreakoutNotified = true;
-                phase.potentialBreakoutDirection = liveDirection;
-                await sendMessage(
-                  `${trendClassification.emoji} *${trendClassification.label} — ${symbol}*\n\n` +
-                  `First live price break detected: *${liveDirection}*\n` +
-                  `2H OBV bias: *${trendClassification.obv2h}*\n` +
-                  `30M OBV bias: *${trendClassification.obv30m}*\n` +
-                  `Higher-timeframe bias: *${trendClassification.alignedBias || "UNCLEAR / UNAVAILABLE"}*\n` +
-                  `Live price: *${livePrice}*\n` +
-                  `Consolidation boundary: *${liveDirection === "UPWARD" ? upperLiveBreak : lowerLiveBreak}*\n\n` +
-                  `_Informational classification only. A counter-trend break may be a retracement or a genuine reversal; this is not a confirmed breakout or entry signal. Trade execution logic is unchanged._`
-                );
-              }
-            }
-          } catch (potentialBreakoutError) {
-            log(`⚠️ Potential breakout check failed for ${symbol}: ${potentialBreakoutError?.message || potentialBreakoutError}`);
-          }
-        }
-
-        if (phase && latest.time <= phase.lastCandleTime) {
-          continue; // this closed candle has already been processed
-        }
-
-        if (phase && Array.isArray(phase.candles)) {
-          const newCandles = closedCandles.filter(c => c.time > phase.lastCandleTime);
-          let ended = false;
-
-          for (const candle of newCandles) {
-            const upperBreak = phase.high * (1 + PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
-            const lowerBreak = phase.low * (1 - PA_DELTA_PHASE_BREAKOUT_BUFFER_PCT / 100);
-
-            if (candle.close > upperBreak || candle.close < lowerBreak) {
-              const direction = candle.close > upperBreak ? "UPWARD" : "DOWNWARD";
-              const stats = getPriceActionPhaseStats(phase.candles);
-              const durationMinutes = Math.max(
-                15,
-                Math.round((phase.candles[phase.candles.length - 1].time - phase.startTime) / 60000) + 15
-              );
-
-              if (stats) {
-                const fmt = n => Number(n).toLocaleString("en-US", {
-                  maximumFractionDigits: 4
-                });
-                await sendMessage(
-                  `📦 *CONSOLIDATION PHASE COMPLETED — ${symbol}*\n\n` +
-                  `Price-action breakout: *${direction}*\n` +
-                  `Phase duration: *${durationMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
-                  `Range: *${fmt(stats.low)} – ${fmt(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
-                  `Total traded volume: *${fmt(stats.totalVolume)}*\n\n` +
-                  `Aggressive buy volume: *${fmt(stats.aggressiveBuyVolume)}*\n` +
-                  `Aggressive sell volume: *${fmt(stats.aggressiveSellVolume)}*\n` +
-                  `Net delta (buy − sell): *${fmt(stats.netDelta)}*\n` +
-                  `Buy share: *${stats.buySharePct.toFixed(1)}%*\n\n` +
-                  `_Measured from Binance 15M taker-buy volume during the price-action-defined phase. This report does not unlock, block, or alter trade entries._`
-                );
-              }
-
-              // Classify the breakout separately. This is informational only and
-              // deliberately does not modify the consolidation detector or entries.
-              try {
-                await classifyPostConsolidationExpansion(symbol, candle, direction, stats);
-              } catch (classificationError) {
-                log(`❌ Expansion/noise classification failed for ${symbol}: ${classificationError?.message || classificationError}`);
-                await sendMessage(
-                  `⚠️ *EXPANSION CLASSIFICATION ERROR — ${symbol}*\n\n` +
-                  `The consolidation breakout was detected as *${direction}*, but the expansion/noise classifier encountered an error. The consolidation detector remains unchanged.`
-                );
-              }
-
-              priceActionDeltaPhaseState[symbol] = {
-                cooldownUntil: candle.time + PA_DELTA_PHASE_COOLDOWN_MS,
-                lastCandleTime: candle.time
-              };
-              ended = true;
-              break; // the breakout candle is not included in phase totals
-            }
-
-            // Still consolidating: add the candle and let the observed range
-            // evolve with price, while the breakout check uses the prior range.
-            phase.candles.push(candle);
-            phase.lastCandleTime = candle.time;
-            phase.high = Math.max(phase.high, candle.high);
-            phase.low = Math.min(phase.low, candle.low);
-
-            // Send a progress update once per newly closed 15M candle while the phase remains
-            // active. The monitor still runs every minute, but only closed 15M candles
-            // advance the phase and notification schedule.
-            const lastStatusTime = Number.isFinite(phase.lastStatusMessageTime)
-              ? phase.lastStatusMessageTime
-              : phase.startTime;
-            if (candle.time - lastStatusTime >= 15 * 60 * 1000) {
-              const statusStats = getPriceActionPhaseStats(phase.candles);
-              if (statusStats) {
-                const fmtStatus = n => Number(n).toLocaleString("en-US", {
-                  maximumFractionDigits: 4
-                });
-                const elapsedMinutes = Math.max(
-                  15,
-                  Math.round((candle.time - phase.startTime) / 60000) + 15
-                );
-                await sendMessage(
-                  `⏳ *CONSOLIDATION PHASE UPDATE — ${symbol}*\n\n` +
-                  `Phase duration so far: *${elapsedMinutes} minutes* (${phase.candles.length} closed 15M candles)\n` +
-                  `Current range: *${fmtStatus(statusStats.low)} – ${fmtStatus(statusStats.high)}* (${statusStats.rangePct.toFixed(2)}%)\n` +
-                  `Aggressive buy volume: *${fmtStatus(statusStats.aggressiveBuyVolume)}*\n` +
-                  `Aggressive sell volume: *${fmtStatus(statusStats.aggressiveSellVolume)}*\n` +
-                  `Net delta (buy − sell): *${fmtStatus(statusStats.netDelta)}*\n` +
-                  `Buy share: *${statusStats.buySharePct.toFixed(1)}%*\n\n` +
-                  `_Phase is still active. Monitoring continues; this update does not trigger or change any trade entry._`
-                );
-              }
-              phase.lastStatusMessageTime = candle.time;
-            }
-          }
-
-          if (!ended) {
-            priceActionDeltaPhaseState[symbol] = phase;
-          }
-          continue;
-        }
-
-        // After a reported phase, wait 15 minutes before looking for a new one.
-        const existing = priceActionDeltaPhaseState[symbol];
-        if (existing?.cooldownUntil && latest.time < existing.cooldownUntil) {
-          existing.lastCandleTime = latest.time;
-          continue;
-        }
-
-        const windowCandles = closedCandles.slice(-PA_DELTA_PHASE_MIN_CANDLES);
-        const stats = getPriceActionPhaseStats(windowCandles);
-        if (!stats || stats.rangePct > PA_DELTA_PHASE_MAX_RANGE_PCT) {
-          if (existing?.cooldownUntil && latest.time >= existing.cooldownUntil) {
-            delete priceActionDeltaPhaseState[symbol];
-          }
-          continue;
-        }
-
-        // Candidate qualifies by compressed price range alone; send exactly
-        // one notification when the phase is first detected. The detailed
-        // delta/volume report is sent only when the phase ends in a breakout.
-        const fmtPhasePrice = n => Number(n).toLocaleString("en-US", {
-          maximumFractionDigits: 4
-        });
-        await sendMessage(
-          `📦 *CONSOLIDATION PHASE STARTED — ${symbol}*\n\n` +
-          `Initial range: *${fmtPhasePrice(stats.low)} – ${fmtPhasePrice(stats.high)}* (${stats.rangePct.toFixed(2)}%)\n` +
-          `Detection window: *${PA_DELTA_PHASE_MIN_CANDLES * 15} minutes* (${PA_DELTA_PHASE_MIN_CANDLES} closed 15M candles)\n` +
-          `_Monitoring this phase until a confirmed price breakout. No trade entries or activation settings are changed._`
-        );
-
-        priceActionDeltaPhaseState[symbol] = {
-          startTime: windowCandles[0].time,
-          lastCandleTime: latest.time,
-          candles: windowCandles,
-          high: stats.high,
-          low: stats.low,
-          lastStatusMessageTime: latest.time
+        const state = directionalVolumeMonitorState[symbol] || {
+          lastConfirmedCandleTime: latestClosed.time,
+          potentialNotifiedCandleTime: null
         };
+
+        // Confirm the newly closed 2H candle against the 10 completed candles
+        // immediately preceding it. This emits one close report per candle.
+        if (state.lastConfirmedCandleTime !== latestClosed.time) {
+          const closedBaselineCandles = candles.slice(-12, -2);
+          const closedBaseline = getDirectionalVolumeMetrics(closedBaselineCandles);
+          const closedResult = classifyDirectionalVolume(latestClosed, closedBaseline);
+
+          if (closedResult?.highVolume) {
+            const directionText = closedResult.direction === 'UP' ? 'up' : 'down';
+            await sendMessage(
+              `✅ *Confirmed expansion detected — ${symbol}*\n\n` +
+              `High volume period — price expanding in the *${directionText}* direction.\n` +
+              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
+              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
+              `Closed 2H candle: *${latestClosed.time}*`
+            );
+          } else if (closedResult) {
+            await sendMessage(
+              `🟡 *Low volume period — ${symbol}*\n\n` +
+              `The closed 2H candle's taker-buy and taker-sell volumes were both below their respective MA10 baselines.\n` +
+              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
+              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
+              `Closed 2H candle: *${latestClosed.time}*`
+            );
+          }
+
+          state.lastConfirmedCandleTime = latestClosed.time;
+          state.potentialNotifiedCandleTime = null;
+        }
+
+        // Check the current forming candle against the previous 10 closed 2H
+        // candles. Notify once when either directional volume first exceeds MA10.
+        const liveBaseline = getDirectionalVolumeMetrics(candles.slice(-11, -1));
+        const liveResult = classifyDirectionalVolume(forming, liveBaseline);
+        if (liveResult?.highVolume && state.potentialNotifiedCandleTime !== forming.time) {
+          const directionText = liveResult.direction === 'UP' ? 'up' : 'down';
+          await sendMessage(
+            `⚡ *Potential expansion detected — ${symbol}*\n\n` +
+            `High volume period — price potentially expanding in the *${directionText}* direction.\n` +
+            `Taker-buy volume: *${formatDirectionalVolume(liveResult.buyVolume)}* (MA10: *${formatDirectionalVolume(liveBaseline.buyMA)}*)\n` +
+            `Taker-sell volume: *${formatDirectionalVolume(liveResult.sellVolume)}* (MA10: *${formatDirectionalVolume(liveBaseline.sellMA)}*)\n` +
+            `Forming 2H candle: *${forming.time}*\n` +
+            `_This is a live, unconfirmed volume expansion alert._`
+          );
+          state.potentialNotifiedCandleTime = forming.time;
+        }
+
+        directionalVolumeMonitorState[symbol] = state;
       } catch (err) {
-        log(`❌ Price-action delta phase monitor error ${symbol}: ${err?.message || err}`);
+        log(`❌ 2H directional-volume monitor error ${symbol}: ${err?.message || err}`);
       }
     }
   } finally {
-    priceActionDeltaPhaseMonitorRunning = false;
+    directionalVolumeMonitorRunning = false;
   }
 }
 
 setInterval(() => {
-  monitorPriceActionDeltaPhases().catch(err =>
-    log(`❌ Price-action delta phase scheduler error: ${err?.message || err}`)
+  monitorTwoHourDirectionalVolume().catch(err =>
+    log(`❌ 2H directional-volume monitor scheduler error: ${err?.message || err}`)
   );
-}, PA_DELTA_PHASE_MONITOR_MS);
+}, DIRECTIONAL_VOLUME_MONITOR_INTERVAL_MS);
 
-// Run once on startup, then continue monitoring on the minute.
-monitorPriceActionDeltaPhases().catch(err =>
-  log(`❌ Initial price-action delta phase monitor error: ${err?.message || err}`)
+// Run once on startup, then poll periodically to catch live-candle expansion.
+monitorTwoHourDirectionalVolume().catch(err =>
+  log(`❌ Initial 2H directional-volume monitor error: ${err?.message || err}`)
 );
 
 // --- Proper Schaff Trend Cycle (STC) ---
@@ -4687,12 +4393,12 @@ async function monitorPositions() {
             );
           }
 
-          // 1-hour entry protection: if the existing +1% favorable
-          // break-even threshold has not been reached within 1 hour,
+          // 2-hour entry protection: if the existing +1% favorable
+          // break-even threshold has not been reached within 2 hours,
           // use the same shared symbol-wide close routine as /close SYMBOL.
           // Once breakEvenActive is set, this timeout no longer applies.
           const openedAt = Number(pos.openedAt);
-          const entryTimeoutMs = 60 * 60 * 1000;
+          const entryTimeoutMs = 2 * 60 * 60 * 1000;
           if (
             pos.breakEvenActive !== true &&
             Number.isFinite(openedAt) &&
@@ -4701,7 +4407,7 @@ async function monitorPositions() {
           ) {
             await closeTrackedSymbolPositions(
               symbol,
-              `1-hour protection: +${BREAK_EVEN_ACTIVATION_PCT.toFixed(2)}% break-even threshold was not reached within 1 hour`
+              `2-hour protection: +${BREAK_EVEN_ACTIVATION_PCT.toFixed(2)}% break-even threshold was not reached within 2 hours`
             );
             break;
           }
