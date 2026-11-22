@@ -1,5 +1,5 @@
-// v83: replaces only the standalone 15M consolidation/expansion monitor with an informational 2H directional-volume MA10 monitor.
-// v82: continuously tracks live 2H OBV/EMA side; matching live directional taker volume above prior-10-closed-candle MA10 activates the coin and confirms its direction lock. No fresh crossover or 10% separation required.
+// v86: v85 MA50 logic plus automatic per-symbol deactivation on a closed 2H directional-volume candle below MA50; live volume above MA50 can reactivate immediately.
+// v82: continuously tracks live 2H OBV/EMA side; matching live directional taker volume above prior-50-closed-candle MA50 activates the coin and confirms its direction lock. No fresh crossover or 10% separation required.
 // v81: removes the 30M crossover lock; a qualifying 2H OBV/EMA crossover now sets the per-symbol BUY/SELL-only direction lock.
 // v79: lowers minimum 24H quote volume to 3M USDT and absolute book depth to 15K USDT; preserves all other liquidity settings.
 // v78: adds live 2H directional buying/selling volume confirmation against separate 10-candle averages; preserves v77 protections.
@@ -344,10 +344,10 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
 // 2H DIRECTIONAL-VOLUME MONITOR
 // Informational only: separate from OBV auto-activation, coin reports,
 // market-regime analysis, and all trade-entry/position-management logic.
-// Buy and sell volume are compared independently with their prior-10-closed-
-// candle MA10 baselines. Polling detects live potential; candle close confirms.
+// Buy and sell volume are compared independently with their prior-50-closed-
+// candle MA50 baselines. Polling detects live potential; candle close confirms.
 // ======================================================
-const DIRECTIONAL_VOLUME_MA_CANDLES = 10;
+const DIRECTIONAL_VOLUME_MA_CANDLES = 50;
 const DIRECTIONAL_VOLUME_MONITOR_INTERVAL_MS = 60 * 1000;
 
 function getDirectionalVolumeMetrics(candles) {
@@ -407,10 +407,10 @@ async function monitorTwoHourDirectionalVolume() {
           potentialNotifiedCandleTime: null
         };
 
-        // Confirm the newly closed 2H candle against the 10 completed candles
+        // Confirm the newly closed 2H candle against the 50 completed candles
         // immediately preceding it. This emits one close report per candle.
         if (state.lastConfirmedCandleTime !== latestClosed.time) {
-          const closedBaselineCandles = candles.slice(-12, -2);
+          const closedBaselineCandles = candles.slice(-(DIRECTIONAL_VOLUME_MA_CANDLES + 2), -2);
           const closedBaseline = getDirectionalVolumeMetrics(closedBaselineCandles);
           const closedResult = classifyDirectionalVolume(latestClosed, closedBaseline);
 
@@ -419,16 +419,16 @@ async function monitorTwoHourDirectionalVolume() {
             await sendMessage(
               `✅ *Confirmed expansion detected — ${symbol}*\n\n` +
               `High volume period — price expanding in the *${directionText}* direction.\n` +
-              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
-              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
+              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA50: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
+              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA50: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
               `Closed 2H candle: *${latestClosed.time}*`
             );
           } else if (closedResult) {
             await sendMessage(
               `🟡 *Low volume period — ${symbol}*\n\n` +
-              `The closed 2H candle's taker-buy and taker-sell volumes were both below their respective MA10 baselines.\n` +
-              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
-              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA10: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
+              `The closed 2H candle's taker-buy and taker-sell volumes were both below their respective MA50 baselines.\n` +
+              `Taker-buy volume: *${formatDirectionalVolume(closedResult.buyVolume)}* (MA50: *${formatDirectionalVolume(closedBaseline.buyMA)}*)\n` +
+              `Taker-sell volume: *${formatDirectionalVolume(closedResult.sellVolume)}* (MA50: *${formatDirectionalVolume(closedBaseline.sellMA)}*)\n` +
               `Closed 2H candle: *${latestClosed.time}*`
             );
           }
@@ -437,17 +437,17 @@ async function monitorTwoHourDirectionalVolume() {
           state.potentialNotifiedCandleTime = null;
         }
 
-        // Check the current forming candle against the previous 10 closed 2H
-        // candles. Notify once when either directional volume first exceeds MA10.
-        const liveBaseline = getDirectionalVolumeMetrics(candles.slice(-11, -1));
+        // Check the current forming candle against the previous 50 closed 2H
+        // candles. Notify once when either directional volume first exceeds MA50.
+        const liveBaseline = getDirectionalVolumeMetrics(candles.slice(-(DIRECTIONAL_VOLUME_MA_CANDLES + 1), -1));
         const liveResult = classifyDirectionalVolume(forming, liveBaseline);
         if (liveResult?.highVolume && state.potentialNotifiedCandleTime !== forming.time) {
           const directionText = liveResult.direction === 'UP' ? 'up' : 'down';
           await sendMessage(
             `⚡ *Potential expansion detected — ${symbol}*\n\n` +
             `High volume period — price potentially expanding in the *${directionText}* direction.\n` +
-            `Taker-buy volume: *${formatDirectionalVolume(liveResult.buyVolume)}* (MA10: *${formatDirectionalVolume(liveBaseline.buyMA)}*)\n` +
-            `Taker-sell volume: *${formatDirectionalVolume(liveResult.sellVolume)}* (MA10: *${formatDirectionalVolume(liveBaseline.sellMA)}*)\n` +
+            `Taker-buy volume: *${formatDirectionalVolume(liveResult.buyVolume)}* (MA50: *${formatDirectionalVolume(liveBaseline.buyMA)}*)\n` +
+            `Taker-sell volume: *${formatDirectionalVolume(liveResult.sellVolume)}* (MA50: *${formatDirectionalVolume(liveBaseline.sellMA)}*)\n` +
             `Forming 2H candle: *${forming.time}*\n` +
             `_This is a live, unconfirmed volume expansion alert._`
           );
@@ -1498,14 +1498,15 @@ function calculateOBVSeries(candles) {
 
 
 // =====================================================
-// 2H LIVE OBV BIAS + INDEPENDENT DIRECTIONAL VOLUME MA10 AUTO-ACTIVATION
+// 2H LIVE OBV BIAS + INDEPENDENT DIRECTIONAL VOLUME MA50 AUTO-ACTIVATION
 // OBV side continuously sets the direction lock. Matching live taker volume
-// above its MA10 activates the symbol. No fresh crossover or 10% separation
+// above its MA50 activates the symbol. No fresh crossover or 10% separation
 // is required. If OBV flips sides, entries pause until the new side confirms.
 // =====================================================
-const OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES = 10;
+const OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES = 50;
 const obvAutoActivationBias = {};
 const obvAutoActivationVolumeConfirmed = {};
+const obvAutoActivationLastClosedVolumeCandleTime = {};
 let obvAutoActivationMonitorRunning = false;
 
 async function monitorTwoHourObvEmaAutoActivation() {
@@ -1566,13 +1567,48 @@ async function monitorTwoHourObvEmaAutoActivation() {
           await sendMessage(
             `🧭 *2H OBV DIRECTION UPDATED* — *${symbol}*\n\n` +
             `OBV is now *${bias}* ( ${tradeDirection}-ONLY ).\n` +
-            `The previous direction is blocked. Waiting for matching taker-${bias === "BULLISH" ? "buy" : "sell"} volume to exceed its MA10 before activating the coin.`
+            `The previous direction is blocked. Waiting for matching taker-${bias === "BULLISH" ? "buy" : "sell"} volume to exceed its MA50 before activating the coin.`
           );
           log(`2H OBV bias changed for ${symbol}: ${previousBias || "UNSET"} -> ${bias}; direction lock immediately set to ${tradeDirection}; entries paused pending volume confirmation.`);
         }
 
+        // A completed 2H candle below the matching directional-volume MA50
+        // deactivates this symbol. Process each completed candle only once.
+        const latestClosedVolumeCandle = closed[closed.length - 1];
+        if (latestClosedVolumeCandle && Number.isFinite(Number(latestClosedVolumeCandle.time))) {
+          const latestClosedTime = latestClosedVolumeCandle.time;
+          if (obvAutoActivationLastClosedVolumeCandleTime[symbol] === undefined) {
+            // Establish a startup baseline; only act on closes observed after
+            // this monitor starts, rather than replaying an old candle event.
+            obvAutoActivationLastClosedVolumeCandleTime[symbol] = latestClosedTime;
+          } else if (obvAutoActivationLastClosedVolumeCandleTime[symbol] !== latestClosedTime) {
+            const priorClosedCandles = closed.slice(-(OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES + 1), -1);
+            if (priorClosedCandles.length === OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES) {
+              const priorBuyVolumes = priorClosedCandles.map(c => Number(c.takerBuyVolume));
+              const priorSellVolumes = priorClosedCandles.map(c => Number(c.volume) - Number(c.takerBuyVolume));
+              const closedBuyVolume = Number(latestClosedVolumeCandle.takerBuyVolume);
+              const closedSellVolume = Number(latestClosedVolumeCandle.volume) - closedBuyVolume;
+              if ([...priorBuyVolumes, ...priorSellVolumes, closedBuyVolume, closedSellVolume].every(Number.isFinite)) {
+                const closedBuyMA = priorBuyVolumes.reduce((sum, value) => sum + Math.max(0, value), 0) / OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES;
+                const closedSellMA = priorSellVolumes.reduce((sum, value) => sum + Math.max(0, value), 0) / OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES;
+                const closedDirectionalVolume = bias === "BULLISH" ? closedBuyVolume : closedSellVolume;
+                const closedDirectionalMA = bias === "BULLISH" ? closedBuyMA : closedSellMA;
+
+                if (closedDirectionalVolume < closedDirectionalMA) {
+                  obvAutoActivationVolumeConfirmed[symbol] = false;
+                  if (symbolActive[symbol] === true) {
+                    await deactivateSymbol(symbol, true);
+                    log(`2H directional-volume MA50 deactivated ${symbol}: closed ${tradeDirection} volume=${closedDirectionalVolume}, MA50=${closedDirectionalMA}, candle=${latestClosedTime}.`);
+                  }
+                }
+              }
+            }
+            obvAutoActivationLastClosedVolumeCandleTime[symbol] = latestClosedTime;
+          }
+        }
+
         // Compare live forming-candle taker volume with the average of the
-        // previous 10 completed 2H candles, independently for buy and sell.
+        // previous 50 completed 2H candles, independently for buy and sell.
         const volumeBaseline = closed.slice(-OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES);
         if (volumeBaseline.length !== OBV_AUTO_ACTIVATION_VOLUME_MA_CANDLES) continue;
         const baselineBuyVolumes = volumeBaseline.map(c => Number(c.takerBuyVolume));
@@ -1607,12 +1643,12 @@ async function monitorTwoHourObvEmaAutoActivation() {
             `✅ *2H OBV + DIRECTIONAL VOLUME ACTIVATION* — *${symbol}*\n\n` +
             `📈 OBV direction: *${bias}*\n` +
             `📊 Matching live taker volume: *${directionalVolume.toFixed(4)}*\n` +
-            `📊 Previous 10 completed 2H candles MA10: *${directionalVolumeMA.toFixed(4)}*\n` +
+            `📊 Previous 50 completed 2H candles MA50: *${directionalVolumeMA.toFixed(4)}*\n` +
             `🔒 Direction lock: *${tradeDirection}-ONLY*\n` +
             `🕒 Forming 2H candle: *${forming.time}*\n` +
             `✅ Coin is now *ACTIVE* for the confirmed direction.`
           );
-          log(`2H OBV + directional volume activated ${symbol}: bias=${bias}, live=${directionalVolume}, MA10=${directionalVolumeMA}, lock=${tradeDirection}.`);
+          log(`2H OBV + directional volume activated ${symbol}: bias=${bias}, live=${directionalVolume}, MA50=${directionalVolumeMA}, lock=${tradeDirection}.`);
         }
       } catch (err) {
         log(`❌ 2H OBV/directional-volume monitor error ${symbol}: ${err?.message || err}`);
@@ -4647,7 +4683,7 @@ let MANUAL_CYCLE_BY_SYMBOL = {}; // e.g., { BTCUSDT: "BULL", ETHUSDT: "BEAR" }
 
 let symbolActive = {};
 // Direction lock continuously follows the live 2H OBV/EMA side. A symbol is
-// activated only after matching live directional taker volume exceeds its MA10.
+// activated only after matching live directional taker volume exceeds its MA50.
 let symbolAutoTradeDirection = {};
 
 COIN_LIST.forEach((s) => (symbolActive[s] = false)); // Await 2H OBV-side + matching-volume activation
