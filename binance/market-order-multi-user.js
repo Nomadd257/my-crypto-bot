@@ -1,3 +1,4 @@
+// v87: v86 plus 15M expansion-exhaustion/contraction entry protection for automatic and /manualtrade entries.
 // v86: v85 MA50 logic plus automatic per-symbol deactivation on a closed 2H directional-volume candle below MA50; live volume above MA50 can reactivate immediately.
 // v82: continuously tracks live 2H OBV/EMA side; matching live directional taker volume above prior-50-closed-candle MA50 activates the coin and confirms its direction lock. No fresh crossover or 10% separation required.
 // v81: removes the 30M crossover lock; a qualifying 2H OBV/EMA crossover now sets the per-symbol BUY/SELL-only direction lock.
@@ -338,6 +339,163 @@ async function fetchFuturesKlines(symbol, interval = "15m", limit = 100) {
     log(`❌ fetchFuturesKlines error for ${symbol}: ${err?.message || err}`);
     return null;
   }
+}
+
+// ======================================================
+// 15M EXPANSION EXHAUSTION / CONTRACTION ENTRY PROTECTION
+// Independent entry lock: it never changes the 2H OBV direction lock,
+// symbol activation, or management of already-open positions.
+// ======================================================
+const SCRIPT2_EXHAUSTION_STATE = {};
+const SCRIPT2_EXHAUSTION_EMA_LENGTH = 20;
+const SCRIPT2_EXHAUSTION_ATR_EXTENSION = 1.8;
+const SCRIPT2_EXHAUSTION_RANGE_CONTRACTION = 0.75;
+const SCRIPT2_EXHAUSTION_RECOVERY_CANDLES = 2;
+
+function getScript2DayExtremeContext(price, dailyCandle, atr15) {
+  const high = Number(dailyCandle?.high);
+  const low = Number(dailyCandle?.low);
+  if (![price, high, low].every(Number.isFinite) || high <= 0 || low <= 0 || high < low) {
+    return { label: "CURRENT-DAY HIGH/LOW UNAVAILABLE", high: null, low: null, dayKey: dailyCandle?.time ?? null };
+  }
+  const atThreshold = Math.max(price * 0.0005, (Number(atr15) || 0) * 0.05);
+  const nearThreshold = Math.max(price * 0.0015, (Number(atr15) || 0) * 0.25);
+  const toHigh = Math.max(0, high - price);
+  const toLow = Math.max(0, price - low);
+  if (toHigh <= atThreshold) return { label: "AT CURRENT-DAY HIGH", high, low, distance: toHigh, dayKey: dailyCandle?.time ?? null };
+  if (toLow <= atThreshold) return { label: "AT CURRENT-DAY LOW", high, low, distance: toLow, dayKey: dailyCandle?.time ?? null };
+  if (toHigh <= nearThreshold) return { label: "CLOSE TO CURRENT-DAY HIGH", high, low, distance: toHigh, dayKey: dailyCandle?.time ?? null };
+  if (toLow <= nearThreshold) return { label: "CLOSE TO CURRENT-DAY LOW", high, low, distance: toLow, dayKey: dailyCandle?.time ?? null };
+  return { label: "NOT CLOSE TO CURRENT-DAY HIGH/LOW", high, low, distance: Math.min(toHigh, toLow), dayKey: dailyCandle?.time ?? null };
+}
+
+function evaluateScript2ExpansionExhaustion(symbol, direction, candles15, dailyCandle, currentPrice) {
+  if (!Array.isArray(candles15) || candles15.length < SCRIPT2_EXHAUSTION_EMA_LENGTH + 16) {
+    return { available: false, blocked: SCRIPT2_EXHAUSTION_STATE[symbol]?.direction === direction && SCRIPT2_EXHAUSTION_STATE[symbol]?.blocked === true, reason: "insufficient 15M candles" };
+  }
+  const closed = candles15.slice(0, -1);
+  const emaSeries = calculateEMASeries(closed, SCRIPT2_EXHAUSTION_EMA_LENGTH);
+  const ema = Number(emaSeries[emaSeries.length - 1]);
+  const atr = calculateATR(closed, 14);
+  const price = Number(currentPrice || closed[closed.length - 1]?.close);
+  if (!Number.isFinite(ema) || !Number.isFinite(atr) || atr <= 0 || !Number.isFinite(price) || price <= 0) {
+    return { available: false, blocked: SCRIPT2_EXHAUSTION_STATE[symbol]?.direction === direction && SCRIPT2_EXHAUSTION_STATE[symbol]?.blocked === true, reason: "15M metrics unavailable" };
+  }
+
+  const last3 = closed.slice(-3);
+  const prior3 = closed.slice(-6, -3);
+  const prior5 = closed.slice(-8, -3);
+  const avgRange = list => list.reduce((sum, c) => sum + (Number(c.high) - Number(c.low)), 0) / list.length;
+  const latestRange = avgRange(last3);
+  const priorRange = avgRange(prior5);
+  const contracting = priorRange > 0 && latestRange <= priorRange * SCRIPT2_EXHAUSTION_RANGE_CONTRACTION;
+  const directionalMove = list => {
+    if (list.length < 2) return 0;
+    const first = Number(list[0].open);
+    const last = Number(list[list.length - 1].close);
+    return direction === "BUY" ? last - first : first - last;
+  };
+  const recentDirectionalMove = directionalMove(last3);
+  const priorDirectionalMove = directionalMove(prior3);
+  const momentumWeakening = priorDirectionalMove > 0 && recentDirectionalMove < priorDirectionalMove * 0.65;
+  const extension = direction === "BUY" ? (price - ema) / atr : (ema - price) / atr;
+  const overextended = extension >= SCRIPT2_EXHAUSTION_ATR_EXTENSION;
+  const exhausted = overextended && momentumWeakening && contracting;
+  const latestClosed = closed[closed.length - 1];
+  const candleKey = String(latestClosed.time);
+  const dayContext = getScript2DayExtremeContext(price, dailyCandle, atr);
+
+  let state = SCRIPT2_EXHAUSTION_STATE[symbol];
+  if (!state || state.direction !== direction) {
+    state = SCRIPT2_EXHAUSTION_STATE[symbol] = { direction, blocked: false, lastProcessedCandle: null, recoveryCount: 0, lastLocationLabel: null };
+  }
+
+  let transition = null;
+  if (state.lastProcessedCandle !== candleKey) {
+    state.lastProcessedCandle = candleKey;
+    if (exhausted) {
+      state.recoveryCount = 0;
+      if (!state.blocked) {
+        state.blocked = true;
+        transition = "BLOCKED";
+      }
+    } else if (state.blocked) {
+      const latestIsDirectional = direction === "BUY"
+        ? Number(latestClosed.close) > Number(latestClosed.open)
+        : Number(latestClosed.close) < Number(latestClosed.open);
+      const momentumRecovered = recentDirectionalMove > 0 && recentDirectionalMove >= Math.max(0, priorDirectionalMove) * 0.8;
+      if (latestIsDirectional && !contracting && momentumRecovered && extension < SCRIPT2_EXHAUSTION_ATR_EXTENSION * 1.15) {
+        state.recoveryCount += 1;
+      } else {
+        state.recoveryCount = 0;
+      }
+      if (state.recoveryCount >= SCRIPT2_EXHAUSTION_RECOVERY_CANDLES) {
+        state.blocked = false;
+        state.recoveryCount = 0;
+        transition = "CLEARED";
+      }
+    }
+  }
+
+  const locationChanged = state.lastLocationLabel !== dayContext.label || state.lastDayKey !== dayContext.dayKey;
+  if (locationChanged) { state.lastLocationLabel = dayContext.label; state.lastDayKey = dayContext.dayKey; }
+  return {
+    available: true,
+    blocked: state.blocked,
+    transition,
+    locationChanged,
+    location: dayContext,
+    price,
+    ema,
+    atr,
+    extension,
+    overextended,
+    momentumWeakening,
+    contracting,
+    recoveryCount: state.recoveryCount,
+    candleKey
+  };
+}
+
+function formatScript2ExhaustionLocation(context) {
+  if (!context) return "Current-day high/low: unavailable";
+  const high = Number.isFinite(context.high) ? context.high.toPrecision(8) : "N/A";
+  const low = Number.isFinite(context.low) ? context.low.toPrecision(8) : "N/A";
+  return `📍 Price location: *${context.label}*\n📈 Current-day high: *${high}*\n📉 Current-day low: *${low}*`;
+}
+
+async function applyScript2ExhaustionEntryGate(symbol, direction, candles15, dailyCandle, currentPrice, notify = true) {
+  const result = evaluateScript2ExpansionExhaustion(symbol, direction, candles15, dailyCandle, currentPrice);
+  if (!result.available) {
+    if (notify) log(`⚠️ ${symbol}: 15M exhaustion gate unavailable (${result.reason}); failing closed for new entries.`);
+    return { ...result, blocked: true };
+  }
+  if (result.transition === "BLOCKED" && notify) {
+    await sendMessage(
+      `🛑 *15M EXPANSION EXHAUSTION — ENTRIES TEMPORARILY BLOCKED*\n\n` +
+      `🪙 Symbol: *${symbol}*\nDirection: *${direction}*\n` +
+      `Price extension: *${result.extension.toFixed(2)} ATR* from 15M EMA${SCRIPT2_EXHAUSTION_EMA_LENGTH}\n` +
+      `Momentum weakening: *YES*\n15M range contraction: *YES*\n\n` +
+      `${formatScript2ExhaustionLocation(result.location)}\n\n` +
+      `The underlying direction and 2H MA50 status are unchanged. New entries, including /manualtrade, are paused. Existing positions and their break-even/runner management continue normally.`
+    );
+  } else if (result.transition === "CLEARED" && notify) {
+    await sendMessage(
+      `🔓 *15M EXHAUSTION PROTECTION CLEARED*\n\n` +
+      `🪙 Symbol: *${symbol}*\nDirection: *${direction}*\n` +
+      `Directional momentum and 15M expansion have recovered for ${SCRIPT2_EXHAUSTION_RECOVERY_CANDLES} consecutive closed candles.\n\n` +
+      `${formatScript2ExhaustionLocation(result.location)}\n\n` +
+      `The exhaustion lock is cleared. All existing OBV, 2H MA50, 5M confirmation and liquidity requirements still apply.`
+    );
+  } else if (result.locationChanged && notify && (result.location.label.includes("CLOSE TO") || result.location.label.includes("AT CURRENT-DAY"))) {
+    await sendMessage(
+      `📍 *CURRENT-DAY EXTREME PROXIMITY — ${symbol}*\n\n` +
+      `${formatScript2ExhaustionLocation(result.location)}\n` +
+      `15M exhaustion lock: *${result.blocked ? "ACTIVE — NEW ENTRIES BLOCKED" : "NOT ACTIVE"}*\n` +
+      `This is a location warning, not by itself a reversal signal.`
+    );
+  }
+  return result;
 }
 
 // ======================================================
@@ -4688,6 +4846,38 @@ let symbolAutoTradeDirection = {};
 
 COIN_LIST.forEach((s) => (symbolActive[s] = false)); // Await 2H OBV-side + matching-volume activation
 
+let script2ExhaustionMonitorRunning = false;
+async function monitorScript2ExpansionExhaustion() {
+  if (script2ExhaustionMonitorRunning) return;
+  script2ExhaustionMonitorRunning = true;
+  try {
+    for (const symbol of COIN_LIST) {
+      const lockedDirection = symbolAutoTradeDirection[symbol];
+      if (!lockedDirection || !["BUY", "SELL"].includes(lockedDirection)) continue;
+      try {
+        const [candles15, dailyCandles, priceResponse] = await Promise.all([
+          fetchFuturesKlines(symbol, "15m", 80),
+          fetchFuturesKlines(symbol, "1d", 2),
+          fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`).catch(() => null)
+        ]);
+        let currentPrice = null;
+        if (priceResponse?.ok) {
+          try { currentPrice = Number((await priceResponse.json())?.price); } catch {}
+        }
+        const dailyCandle = Array.isArray(dailyCandles) && dailyCandles.length
+          ? dailyCandles[dailyCandles.length - 1]
+          : null;
+        await applyScript2ExhaustionEntryGate(symbol, lockedDirection, candles15, dailyCandle, currentPrice, true);
+      } catch (err) {
+        log(`⚠️ 15M exhaustion monitor error ${symbol}: ${err?.message || err}`);
+      }
+    }
+  } finally {
+    script2ExhaustionMonitorRunning = false;
+  }
+}
+setInterval(monitorScript2ExpansionExhaustion, 60 * 1000);
+
 // Scan all configured symbols independently of their current activation state.
 // OBV side updates the lock immediately; matching directional volume activates.
 setInterval(monitorTwoHourObvEmaAutoActivation, 60 * 1000);
@@ -5578,6 +5768,31 @@ async function monitorScript2ExecutionScanner() {
             `Spread, 24H quote volume and top-10 book depth passed.`
           );
         }
+
+        // Independent 15M expansion-exhaustion gate. This blocks only new entries;
+        // it does not alter the 2H direction lock or open-position management.
+        const exhaustionCandles15 = await fetchFuturesKlines(symbol, "15m", 80);
+        const exhaustionDaily = await fetchFuturesKlines(symbol, "1d", 2);
+        const exhaustionDailyCandle = Array.isArray(exhaustionDaily) && exhaustionDaily.length
+          ? exhaustionDaily[exhaustionDaily.length - 1]
+          : null;
+        const exhaustionGate = await applyScript2ExhaustionEntryGate(
+          symbol, direction, exhaustionCandles15, exhaustionDailyCandle, currentPrice, true
+        );
+        if (exhaustionGate.blocked) {
+          const exhaustionBlockKey = `15M_EXHAUSTION:${direction}:${exhaustionGate.candleKey || exhaustionGate.reason || "UNAVAILABLE"}`;
+          if (setup.executionScannerLastExhaustionBlockKey !== exhaustionBlockKey) {
+            setup.executionScannerLastExhaustionBlockKey = exhaustionBlockKey;
+            awaitSendScript2Checkpoint(
+              `⏸️ *ENTRY HELD — 15M EXHAUSTION PROTECTION* — *${symbol}*\n` +
+              `Direction: *${direction}*\n` +
+              `Reason: ${exhaustionGate.reason || "Expansion exhaustion / contraction detected, or 15M data unavailable."}\n` +
+              `Pending setup retained. No order placed.`
+            );
+          }
+          continue;
+        }
+        setup.executionScannerLastExhaustionBlockKey = null;
 
         // Final duplicate-order guard. The lock is per symbol and remains held until order handling finishes.
         if (setup.executionInProgress) continue;
@@ -8289,7 +8504,36 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
       return;
     }
 
-    await reply(`✅ *${symbol} — 5M OBV passed.*\n3️⃣ Checking market liquidity…`);
+    // Apply the same independent 15M exhaustion/contraction protection to manual entries.
+    const [manualDailyCandles, manualPriceResponse] = await Promise.all([
+      fetchFuturesKlines(symbol, "1d", 2),
+      fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`).catch(() => null)
+    ]);
+    let manualCurrentPrice = Number(closed15[closed15.length - 1]?.close);
+    if (manualPriceResponse?.ok) {
+      try {
+        const manualPriceData = await manualPriceResponse.json();
+        const parsedManualPrice = Number(manualPriceData?.price);
+        if (Number.isFinite(parsedManualPrice) && parsedManualPrice > 0) manualCurrentPrice = parsedManualPrice;
+      } catch {}
+    }
+    const manualDailyCandle = Array.isArray(manualDailyCandles) && manualDailyCandles.length
+      ? manualDailyCandles[manualDailyCandles.length - 1]
+      : null;
+    const manualExhaustionGate = await applyScript2ExhaustionEntryGate(
+      symbol, direction, candles15, manualDailyCandle, manualCurrentPrice, true
+    );
+    if (manualExhaustionGate.blocked) {
+      await reply(
+        `⛔ *${symbol}* manual trade cancelled: 15M expansion-exhaustion protection is active.\n` +
+        `Reason: ${manualExhaustionGate.reason || "Price expansion is overextended and momentum is weakening as the market contracts, or 15M data is unavailable."}\n` +
+        `${formatScript2ExhaustionLocation(manualExhaustionGate.location)}\n` +
+        `No order was placed. Wait for the protection to clear before retrying.`
+      );
+      return;
+    }
+
+    await reply(`✅ *${symbol} — 5M OBV and 15M exhaustion protection passed.*\n3️⃣ Checking market liquidity…`);
 
     // Match the normal liquidity gate's estimate of aggregate user order size.
     let estimatedTradeNotional = 0;
@@ -8327,7 +8571,7 @@ bot.onText(/^\/manualtrade(?:@\w+)?\s+([A-Z0-9]{3,20})\s*$/i, async (msg, match)
         `Orders executed: ${executionResult.executed}/${executionResult.attempted}` +
         (executionResult.failed ? `\n⚠️ Failed: ${executionResult.failed}` : "") +
         (executionResult.skipped ? `\n⏭️ Skipped: ${executionResult.skipped}` : "") +
-        `\n\nChecks passed in order: 15M/5M Delta alignment → 5M OBV → liquidity.`;
+        `\n\nChecks passed: 15M/5M Delta alignment → 5M OBV → 15M exhaustion protection → liquidity.`;
       await reply(resultText);
       await sendMessage(resultText);
     } else {
